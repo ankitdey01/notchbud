@@ -1,8 +1,7 @@
-// render.rs — the notch: full island rendered every frame; a DirectComposition
-// clip reveals exactly the idle sliver when retracted and springs open on
-// hover. Content (Atoll home tab): album-art card + title/artist column,
-// progress track, transport row. Motion: Atoll springs (see state.rs)
-// sampled into compositor-side animations.
+// render.rs — the notch: the full island is rendered once; a DComp scale
+// animation (targets from state.rs) drives the idle tab -> swell -> island
+// motion entirely on the compositor thread. Content fades are app-side
+// clocks (content_alpha) repainted by WM_PAINT pumps from main.rs.
 
 use std::cell::RefCell;
 
@@ -13,7 +12,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
     ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory, ID2D1PathGeometry,
     ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
@@ -26,12 +25,14 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice2, IDCompositionAnimation, IDCompositionDevice,
-    IDCompositionRectangleClip, IDCompositionTarget, IDCompositionVisual,
+    IDCompositionRectangleClip, IDCompositionScaleTransform, IDCompositionTarget,
+    IDCompositionVisual,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_METRICS,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -44,9 +45,11 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
 use crate::state::{
-    clip_closed, clip_open, spring_progress, spring_settle, spring_velocity, App, IDLE_RGN_H,
-    IDLE_RGN_HALF_W, ISLAND_H, ISLAND_W, ISLAND_X, SLIVER_H, SLIVER_W, SLIVER_X,
-    SPRING_RESPONSE_CLOSE, SPRING_RESPONSE_OPEN, WINDOW_UNITS_H, WINDOW_UNITS_W,
+    scale_idle, scale_swell, spring_progress, spring_settle, spring_velocity, App,
+    close_progress, close_velocity, CLOSE_DELAY, CONTENT_FADE, IDLE_RGN_H, IDLE_RGN_HALF_W,
+    ISLAND_BOT_R, ISLAND_FLARE_R, ISLAND_H, ISLAND_W, ISLAND_X, OPEN_RESPONSE, OPEN_ZETA,
+    SLIVER_H, SLIVER_W, SLIVER_X, STAGE1_DUR, SWELL_RESPONSE, SWELL_ZETA,
+    WINDOW_UNITS_H, WINDOW_UNITS_W,
 };
 
 // ---------- owner slot + clip geometry ----------
@@ -99,18 +102,6 @@ fn island_bg() -> D2D1_COLOR_F {
 fn text_hi() -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: 0.949, g: 0.949, b: 0.969, a: 1.0 } // #F2F2F7
 }
-fn text_gray() -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r: 0.5, g: 0.5, b: 0.5, a: 1.0 } // SwiftUI .gray
-}
-fn art_bg() -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r: 0.11, g: 0.11, b: 0.118, a: 1.0 } // #1C1C1E idle art tile
-}
-fn track_bg() -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.22 } // slider resting track
-}
-fn note_color() -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.55 } // idle music note
-}
 
 // ---------- renderer ----------
 
@@ -122,7 +113,8 @@ pub struct Renderer {
     // DComp objects must outlive the window binding — dropping the device
     // destroys its targets and the notch goes transparent (seen live).
     dcomp: IDCompositionDevice,
-    clip: IDCompositionRectangleClip,
+    _clip: IDCompositionRectangleClip,
+    ctrl: IDCompositionScaleTransform, // island shell scale (the whole motion)
     island_path: ID2D1PathGeometry,
     _target: IDCompositionTarget,
     _visual: IDCompositionVisual,
@@ -130,28 +122,21 @@ pub struct Renderer {
     pixel_h: f32,
     dpi_scale: f32,
 
-    // ---- Atoll spring state (app-side estimate of compositor values) ----
+    // ---- spring state (app-side estimate of compositor values) ----
     anim_live: bool,
-    anim_dir: bool,            // true = expansion
+    anim_expand: bool,         // true = expansion run was the last one
     anim_start_ms: u64,
     anim_settle: f32,          // seconds until the run anim settles
-    anim_from: [f32; 3],       // edge values where the run anim started
+    anim_from: [f32; 2],       // scale values where the run anim started
 
-    tf_hi: IDWriteTextFormat,   // title: .headline, white
-    tf_sub: IDWriteTextFormat,  // artist: .headline medium, gray
-    tf_note: IDWriteTextFormat, // idle album-art note
-    tf_icon: IDWriteTextFormat, // Segoe MDL2 transport glyphs
+    tf_hi: IDWriteTextFormat, // title: .headline, white
     br_black: ID2D1SolidColorBrush,
     br_text_hi: ID2D1SolidColorBrush,
-    br_gray: ID2D1SolidColorBrush,
-    br_art_bg: ID2D1SolidColorBrush,
-    br_track: ID2D1SolidColorBrush,
-    br_note: ID2D1SolidColorBrush,
 }
 
 // Hermite fit through (t0,v0,m0) -> (t1,v1,m1): returns [D, C, B, A] so that
 // v(x) = A·x³ + B·x² + C·x + D for x measured from the segment start.
-fn hermite(t0: f32, t1: f32, v0: f32, v1: f32, m0: f32, m1: f32) -> [f32; 4] {
+pub fn hermite(t0: f32, t1: f32, v0: f32, v1: f32, m0: f32, m1: f32) -> [f32; 4] {
     let d = t1 - t0;
     let a = (2.0 * v0 + m0 * d - 2.0 * v1 + m1 * d) / (d * d * d);
     let b = (-3.0 * v0 - 2.0 * m0 * d + 3.0 * v1 - m1 * d) / (d * d);
@@ -171,6 +156,18 @@ impl Renderer {
             dpiY: 0.0,
             bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             colorContext: std::mem::ManuallyDrop::new(None),
+        }
+    }
+
+    // DComp's animation-or-scalar parameters (CenterX, ScaleX, ...) accept
+    // an IDCompositionAnimation only in windows-rs — wrap scalars in a flat
+    // cubic with zero slopes; the compositor holds the End value forever.
+    fn scalar_anim(dcomp: &IDCompositionDevice, v: f32) -> Result<IDCompositionAnimation> {
+        unsafe {
+            let a = dcomp.CreateAnimation()?;
+            a.AddCubic(0.0, v, 0.0, 0.0, 0.0)?;
+            a.End(1.0, v)?;
+            Ok(a)
         }
     }
 
@@ -221,17 +218,19 @@ impl Renderer {
             let adapter = dxgi_device.GetAdapter()?;
             let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
 
-            let mut desc = DXGI_SWAP_CHAIN_DESC1::default();
-            desc.Width = w.ceil() as u32;
-            desc.Height = h.ceil() as u32;
-            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            desc.SampleDesc = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
-            desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            desc.BufferCount = 2;
-            desc.Scaling = DXGI_SCALING_STRETCH;
-            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-            desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-            desc.Flags = 0;
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: w.ceil() as u32,
+                Height: h.ceil() as u32,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                Flags: 0,
+                ..Default::default()
+            };
 
             let swap: IDXGISwapChain1 = step(
                 "create_swapchain",
@@ -253,17 +252,24 @@ impl Renderer {
             let visual: IDCompositionVisual = dcomp.CreateVisual()?;
             visual.SetContent(&swap)?;
             target.SetRoot(&visual)?;
-            // compositor-side clip: idle shows only the island's top-center
-            // sliver; hover animates the clip open (runs on the compositor
-            // thread — this is what makes the motion buttery)
+            // compositor-side clip: static — the whole motion is a scale of
+            // the fully-drawn island about the point (center-x, y=0), which
+            // matches Nusa whose overshoot was in the shell size itself.
+            // At idle scale the shell IS the small tab; no clip tricks needed.
             let clip: IDCompositionRectangleClip = step("clip", dcomp.CreateRectangleClip())?;
-            let [cl, cr, cb] = clip_closed(scale);
-            clip.SetLeft2(cl)?;
+            clip.SetLeft2(0.0)?;
             clip.SetTop2(0.0)?;
-            clip.SetRight2(cr)?;
-            clip.SetBottom2(cb)?;
+            clip.SetRight2(w)?;
+            clip.SetBottom2(h)?;
             visual.SetClip(&clip)?;
-            let island_path = Self::build_island_path(&factory, w, h)?;
+            let ctrl: IDCompositionScaleTransform = step("ctrl", dcomp.CreateScaleTransform())?;
+            let idle = scale_idle();
+            step("ctrl_center", ctrl.SetCenterX(&Self::scalar_anim(&dcomp, WINDOW_UNITS_W / 2.0 * scale)?))?;
+            step("ctrl_center", ctrl.SetCenterY(&Self::scalar_anim(&dcomp, 0.0)?))?;
+            step("ctrl_scale", ctrl.SetScaleX(&Self::scalar_anim(&dcomp, idle[0])?))?;
+            step("ctrl_scale", ctrl.SetScaleY(&Self::scalar_anim(&dcomp, idle[1])?))?;
+            visual.SetEffect(&ctrl)?;
+            let island_path = Self::build_island_path(&factory, h, scale)?;
             step("dcomp_commit", dcomp.Commit())?;
 
             let dwrite: IDWriteFactory =
@@ -282,22 +288,16 @@ impl Renderer {
                     w!("en-us"),
                 )
             };
-            // Atoll home tab: title .headline (semibold) white, artist .headline
-            // medium gray; sizes translated to dyland island units.
-            let tf_hi = mk_fmt(w!("Segoe UI"), 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-            let tf_sub = mk_fmt(w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let tf_note = mk_fmt(w!("Segoe UI"), 24.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let tf_icon = mk_fmt(w!("Segoe MDL2 Assets"), 18.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            // Atoll home tab: .headline semibold, translated to dyland island units.
+            // Apple system font; falls back to the default face when SF Pro
+            // isn't installed on this machine.
+            let tf_hi = mk_fmt(w!("SF Pro Text"), 17.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
 
             let mk_brush = |c: D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush> {
                 rt.CreateSolidColorBrush(&c, None)
             };
             let br_black = mk_brush(island_bg())?;
             let br_text_hi = mk_brush(text_hi())?;
-            let br_gray = mk_brush(text_gray())?;
-            let br_art_bg = mk_brush(art_bg())?;
-            let br_track = mk_brush(track_bg())?;
-            let br_note = mk_brush(note_color())?;
 
             Ok(Self {
                 dc,
@@ -305,7 +305,8 @@ impl Renderer {
                 dwrite,
                 swap,
                 dcomp,
-                clip,
+                _clip: clip,
+                ctrl,
                 island_path,
                 _target: target,
                 _visual: visual,
@@ -313,125 +314,239 @@ impl Renderer {
                 pixel_h: h,
                 dpi_scale: scale,
                 anim_live: false,
-                anim_dir: false,
+                anim_expand: false,
                 anim_start_ms: 0,
                 anim_settle: 0.0,
-                anim_from: [cl, cr, cb],
+                anim_from: scale_idle(),
                 tf_hi,
-                tf_sub,
-                tf_note,
-                tf_icon,
                 br_black,
                 br_text_hi,
-                br_gray,
-                br_art_bg,
-                br_track,
-                br_note,
             })
         }
     }
 
-    // island silhouette: top edge flush with the screen edge and both top
-    // corners square; sides straight and vertical; only the two bottom
-    // corners are heavily rounded (symmetric), joining a straight bottom
-    // edge. Bottom radius ≈ 9.6% of the panel width, capped at 20% of the
-    // panel height — the hanging-notch shape.
-    unsafe fn build_island_path(factory: &ID2D1Factory, w: f32, h: f32) -> Result<ID2D1PathGeometry> {
+    // island silhouette, mirrored from Nusa's captured outline — the
+    // top joints are organic pairs of cubic Béziers, the bottom corners
+    // are plain circular arcs:
+    //  * body 420x140.4 u, sides vertical, bottom edge straight;
+    //  * top corners: two cubics blending the top edge into the side.
+    //    The flare crest stays exactly on the old flare line (ix±fr), so
+    //    the silhouette footprint is unchanged; first handles ride the
+    //    top edge (flat, curvature ~0 shoulder), the boundary rises evenly
+    //    to a mid point M on the 45° bisector with a diagonal tangent, and
+    //    the second handles ride the side (vertical arrival, curvature ~0
+    //    blend into it). Corner proportions are canonical fractions of the
+    //    corner radius:
+    //    S=(±1,0) P1=(±0.83,0) P2=(±0.54,0) M=(0.27,0.27) P3'=(0,0.54)
+    //    P4'=(0,0.83) E=(0,1) — the flare keeps its shape at every scale
+    //    the DComp shell animates through (idle tab -> swell -> island).
+    //  * bottom corners: simple circular arcs of radius ISLAND_BOT_R
+    //    (macOS-style pill bottom — no S-profile there).
+    unsafe fn build_island_path(factory: &ID2D1Factory, h_window: f32, s: f32) -> Result<ID2D1PathGeometry> {
         let path = factory.CreatePathGeometry()?;
         let sink = path.Open()?;
-        // bottom radius: 9.6% of panel width, capped at 20% of panel height
-        let rb = (0.096 * w).min(0.20 * h).min(w / 2.0).min(h / 2.0);
-        sink.BeginFigure(
-            D2D_POINT_2F { x: 0.0, y: 0.0 }, // square top-left corner
-            D2D1_FIGURE_BEGIN_FILLED,
-        );
-        sink.AddLine(D2D_POINT_2F { x: w, y: 0.0 }); // straight top edge (squares the top-right corner)
-        sink.AddLine(D2D_POINT_2F { x: w, y: h - rb });
-        sink.AddArc(&windows::Win32::Graphics::Direct2D::D2D1_ARC_SEGMENT {
-            point: D2D_POINT_2F { x: w - rb, y: h },
-            size: D2D_SIZE_F { width: rb, height: rb },
-            rotationAngle: 0.0,
-            sweepDirection: windows::Win32::Graphics::Direct2D::D2D1_SWEEP_DIRECTION_CLOCKWISE,
-            arcSize: windows::Win32::Graphics::Direct2D::D2D1_ARC_SIZE_SMALL,
-        });
-        sink.AddLine(D2D_POINT_2F { x: rb, y: h });
-        sink.AddArc(&windows::Win32::Graphics::Direct2D::D2D1_ARC_SEGMENT {
-            point: D2D_POINT_2F { x: 0.0, y: h - rb },
-            size: D2D_SIZE_F { width: rb, height: rb },
-            rotationAngle: 0.0,
-            sweepDirection: windows::Win32::Graphics::Direct2D::D2D1_SWEEP_DIRECTION_CLOCKWISE,
-            arcSize: windows::Win32::Graphics::Direct2D::D2D1_ARC_SIZE_SMALL,
-        });
-        // figure closes along the vertical left side back to (0,0) — square top-left corner
+        let ix = ISLAND_X * s;
+        let iw = ISLAND_W * s;
+        let ih = (ISLAND_H * s).min(h_window); // keep inside the window
+        let fr = ISLAND_FLARE_R * s;
+        let rb = ISLAND_BOT_R * s;
+        let p = |x: f32, y: f32| D2D_POINT_2F { x, y };
+        let bz = |c1: (f32, f32), c2: (f32, f32), e: (f32, f32)| {
+            windows::Win32::Graphics::Direct2D::Common::D2D1_BEZIER_SEGMENT {
+                point1: p(c1.0, c1.1),
+                point2: p(c2.0, c2.1),
+                point3: p(e.0, e.1),
+            }
+        };
+        let arc = |e: (f32, f32)| {
+            windows::Win32::Graphics::Direct2D::D2D1_ARC_SEGMENT {
+                point: p(e.0, e.1),
+                size: windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_F {
+                    width: rb,
+                    height: rb,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: windows::Win32::Graphics::Direct2D::D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: windows::Win32::Graphics::Direct2D::D2D1_ARC_SIZE_SMALL,
+            }
+        };
+        let cs = 0.27; // canonical midpoint on the 45° bisector
+        let ch = 0.17; // canonical shoulder handle (ch ≈ 0.5 − cs)
+
+
+        sink.BeginFigure(p(ix - fr, 0.0), D2D1_FIGURE_BEGIN_FILLED);
+        // straight top edge between the two flare crests
+        sink.AddLine(p(ix + iw + fr, 0.0));
+        // top-right flare, crest -> side (G2 at both joins):
+        //   handles of C1 ride the top edge, handles of C2 ride the side
+        sink.AddBezier(&bz(
+            (ix + iw + (1.0 - ch) * fr, 0.0),
+            (ix + iw + 2.0 * cs * fr, 0.0),
+            (ix + iw + cs * fr, cs * fr),
+        ));
+        sink.AddBezier(&bz(
+            (ix + iw, 2.0 * cs * fr),
+            (ix + iw, (1.0 - ch) * fr),
+            (ix + iw, fr),
+        ));
+        sink.AddLine(p(ix + iw, ih - rb));
+        // bottom-right corner: plain circular arc, side -> bottom edge
+        sink.AddArc(&arc((ix + iw - rb, ih)));
+        sink.AddLine(p(ix + rb, ih));
+        // bottom-left corner: plain circular arc, bottom edge -> side
+        sink.AddArc(&arc((ix, ih - rb)));
+        // left side into the top-left flare, closing at the crest
+        sink.AddLine(p(ix, fr));
+        // top-left flare, side -> crest (the TL chain traversed backward):
+        // handles ride the side first, then the top edge — same profile
+        sink.AddBezier(&bz(
+            (ix, (1.0 - ch) * fr),
+            (ix, 2.0 * cs * fr),
+            (ix - cs * fr, cs * fr),
+        ));
+        sink.AddBezier(&bz(
+            (ix - 2.0 * cs * fr, 0.0),
+            (ix + (ch - 1.0) * fr, 0.0),
+            (ix - fr, 0.0),
+        ));
         sink.EndFigure(D2D1_FIGURE_END_CLOSED);
         sink.Close()?;
         Ok(path)
     }
 
-    /// Atoll springs, baked into compositor animations.
-    ///
-    /// The critically damped spring x(t)dx = 1 - (1+ωt)e^{-ωt} is sampled every
-    /// dt and each sample interval gets a Hermite cubic segment (exact values
-    /// and slopes at both ends), then the whole polyline is dispatched as
+    /// Springs sampled into compositor animations, mirroring Nusa's motion:
+    /// expand = a 0.19 s swell of the sliver, then the underdamped pop spring
+    /// (response 0.35, zeta 0.65 — the measured ~6% overshoot); retract = a
+    /// critically damped collapse (response 0.21) with the shell's ~60 ms
+    /// reaction delay baked in. Each sample interval gets a Hermite cubic
+    /// segment (exact values and slopes at both ends), dispatched as
     /// IDCompositionAnimation segments — the motion still runs on the
-    /// compositor thread, exactly as fast/slow as SwiftUI's spring.
-    /// Reversing mid-flight starts from the estimated current position, so a
-    /// quick hover-out never snaps.
+    /// compositor thread. Reversing mid-flight starts from the estimated
+    /// current position, so a quick hover-out never snaps.
     pub fn animate_spring(&mut self, expand: bool) -> Result<()> {
-        let scale = self.dpi_scale;
-        let closed = clip_closed(scale);
-        let open = clip_open(scale);
+        // the motion drives the visual SCALE: idle tab -> swell -> full island
+        let idle = scale_idle();
+        let swell = scale_swell();
+        let open = [1.0f32, 1.0f32];
 
         // ---- estimate where the property currently sits ----
         // The previous run animation (if any) is replayed conceptually from
-        // this side: p is its normalized progress now.
+        // this side: `from` is its value now.
         let now = unsafe { GetTickCount64() };
-        let elapsed = (now as f32 - self.anim_start_ms as f32) / 1000.0;
-        let p = if self.anim_live && elapsed < self.anim_settle {
-            let resp = if self.anim_dir { SPRING_RESPONSE_OPEN } else { SPRING_RESPONSE_CLOSE };
-            spring_progress(resp, elapsed)
+        // u64 subtract first: casting both ms values to f32 loses precision
+        // past ~4.7 h uptime and skews the reversal estimate by whole frames
+        let elapsed = (now - self.anim_start_ms) as f32 / 1000.0;
+        let from: [f32; 2] = if !self.anim_live {
+            idle
+        } else if self.anim_expand {
+            if elapsed < STAGE1_DUR {
+                let p = spring_progress(SWELL_RESPONSE, SWELL_ZETA, elapsed);
+                std::array::from_fn(|i| self.anim_from[i] + (swell[i] - self.anim_from[i]) * p)
+            } else {
+                let p = spring_progress(OPEN_RESPONSE, OPEN_ZETA, elapsed - STAGE1_DUR);
+                std::array::from_fn(|i| swell[i] + (open[i] - swell[i]) * p)
+            }
         } else {
-            1.0 // settled at the previous target
+            // close_progress v: 1 = open (== anim_from), 0 = idle; convert to
+            // the canonic from->idle param before interpolating. The whole
+            // shrink runs CLOSE_DELAY late (the greeting hides first), so
+            // the knot clock is delayed by that much from the run start.
+            let p = 1.0 - close_progress(elapsed - CLOSE_DELAY);
+            std::array::from_fn(|i| self.anim_from[i] + (idle[i] - self.anim_from[i]) * p)
         };
-        let prev_final = if self.anim_dir { open } else { closed };
-        let from: [f32; 3] = std::array::from_fn(|i| {
-            self.anim_from[i] + (prev_final[i] - self.anim_from[i]) * p
-        });
 
-        // ---- sample the new spring into Hermite segments ----
-        let resp = if expand { SPRING_RESPONSE_OPEN } else { SPRING_RESPONSE_CLOSE };
-        let settle = spring_settle(resp);
+        // ---- sample the new curve into Hermite segments ----
+        // Segments carry their own canonic from/to values, because an expand
+        // run changes the base at the swell boundary. Coefficients are
+        // normalized x in [0,1]; each track renders as lo + (hi−lo)·x(t).
+        struct Seg {
+            coefs: [f32; 4],
+            t0: f64,
+            lo: [f32; 2],
+            hi: [f32; 2],
+        }
         let dt = 0.016f32;
-        let n = ((settle / dt).ceil().max(1.0)) as usize;
-        let target = if expand { open } else { closed };
-
-        // normalized coefficient table: x(t) = A·t³ + B·t² + C·t + D over each
-        // segment, with x in [0,1]; each edge is D + (target − from)·x.
-        let mut segs: Vec<([f32; 4], f64)> = Vec::with_capacity(n);
-        for k in 0..n {
-            let t0 = k as f32 * dt;
-            let t1 = (k + 1) as f32 * dt;
-            let x0 = spring_progress(resp, t0);
-            let x1 = spring_progress(resp, t1);
-            let m0 = spring_velocity(resp, t0);
-            let m1 = spring_velocity(resp, t1);
-            segs.push((hermite(t0, t1, x0, x1, m0, m1), t0 as f64));
+        let mut segs: Vec<Seg> = Vec::new();
+        let settle;
+        if expand {
+            // stage 1: sliver swell, from -> swell
+            let n1 = ((STAGE1_DUR / dt) + 0.999).ceil() as usize;
+            for k in 0..n1 {
+                let t0 = k as f32 * dt;
+                let t1 = ((k + 1) as f32 * dt).min(STAGE1_DUR);
+                if t1 - t0 <= 0.0 {
+                    continue;
+                }
+                let x0 = spring_progress(SWELL_RESPONSE, SWELL_ZETA, t0);
+                let x1 = spring_progress(SWELL_RESPONSE, SWELL_ZETA, t1);
+                let m0 = spring_velocity(SWELL_RESPONSE, SWELL_ZETA, t0);
+                let m1 = spring_velocity(SWELL_RESPONSE, SWELL_ZETA, t1);
+                segs.push(Seg { coefs: hermite(t0, t1, x0, x1, m0, m1), t0: t0 as f64, lo: from, hi: swell });
+            }
+            // stage 2: pop, swell -> open. Sample count n2 so the last
+            // segment begins before End(settle): settle = STAGE1 + n2*dt.
+            let settle2 = spring_settle(OPEN_RESPONSE, OPEN_ZETA);
+            let n2 = (settle2 / dt).ceil() as usize;
+            for k in 0..n2 {
+                let t0 = STAGE1_DUR + k as f32 * dt;
+                let t1 = t0 + dt;
+                let lt = k as f32 * dt;
+                let x0 = spring_progress(OPEN_RESPONSE, OPEN_ZETA, lt);
+                let x1 = spring_progress(OPEN_RESPONSE, OPEN_ZETA, lt + dt);
+                let m0 = spring_velocity(OPEN_RESPONSE, OPEN_ZETA, lt);
+                let m1 = spring_velocity(OPEN_RESPONSE, OPEN_ZETA, lt + dt);
+                segs.push(Seg { coefs: hermite(t0, t1, x0, x1, m0, m1), t0: t0 as f64, lo: swell, hi: open });
+            }
+            settle = STAGE1_DUR + n2 as f32 * dt;
+        } else {
+            // close: piecewise Hermite straight through Nusa's measured knot
+            // table (t in seconds, v = value fraction; 1 = open, 0 = idle)
+            // v maps directly onto "from + (idle - from)*v", but the press
+            // Hermite convention is x = 0 at the start value -> x = 1 - v
+            for w in crate::state::CLOSE_KNOTS.windows(2) {
+                let (t0, v0) = w[0];
+                let (t1, v1) = w[1];
+                if t1 <= crate::state::CLOSE_SETTLE {
+                    let m0 = -close_velocity(t0);
+                    let m1 = -close_velocity(t1);
+                    segs.push(Seg {
+                        coefs: hermite(t0, t1, 1.0 - v0, 1.0 - v1, m0, m1),
+                        t0: (t0 + CLOSE_DELAY) as f64,
+                        lo: from,
+                        hi: idle,
+                    });
+                }
+            }
+            // flat hold after the last knot: the final cubic must not be
+            // extrapolated between its knot span and End (the polynomial
+            // runs away outside its fitted range and flashes the shell)
+            let last_t = crate::state::CLOSE_KNOTS
+                .iter()
+                .map(|k| k.0)
+                .filter(|&t| t <= crate::state::CLOSE_SETTLE + 1e-6)
+                .fold(0.0f32, f32::max);
+            segs.push(Seg {
+                coefs: [1.0, 0.0, 0.0, 0.0],
+                t0: (last_t + CLOSE_DELAY) as f64,
+                lo: from,
+                hi: idle,
+            });
+            settle = CLOSE_DELAY + crate::state::CLOSE_SETTLE + 0.06; // End sits past the last segment
         }
 
         unsafe {
-            for i in 0..3 {
-                let from_e = from[i];
-                let target_e = target[i];
-                let delta = target_e - from_e;
+            for i in 0..2 {
                 let a = self.dcomp.CreateAnimation()?;
-                for ([d, c, b, q], t0) in &segs {
-                    a.AddCubic(*t0, from_e + delta * d, delta * c, delta * b, delta * q)?;
+                for seg in &segs {
+                    let delta = seg.hi[i] - seg.lo[i];
+                    let [d, c, b, q] = seg.coefs;
+                    a.AddCubic(seg.t0, seg.lo[i] + delta * d, delta * c, delta * b, delta * q)?;
                 }
-                a.End(settle as f64, target_e)?;
-                match i {
-                    0 => self.clip.SetLeft(&a)?,
-                    1 => self.clip.SetRight(&a)?,
-                    _ => self.clip.SetBottom(&a)?,
+                a.End(settle as f64, if expand { open[i] } else { idle[i] })?;
+                if i == 0 {
+                    self.ctrl.SetScaleX(&a)?;
+                } else {
+                    self.ctrl.SetScaleY(&a)?;
                 }
             }
             self.dcomp.Commit()?;
@@ -439,7 +554,7 @@ impl Renderer {
 
         // book-keeping for the next mid-flight reversal estimate
         self.anim_live = true;
-        self.anim_dir = expand;
+        self.anim_expand = expand;
         self.anim_start_ms = now;
         self.anim_settle = settle;
         self.anim_from = from;
@@ -462,10 +577,18 @@ impl Renderer {
             let surface: IDXGISurface = self.swap.GetBuffer(0)?;
             let bitmap: ID2D1Bitmap1 = dc.CreateBitmapFromDxgiSurface(&surface, Some(&Self::bitmap_props()))?;
             dc.SetTarget(&bitmap);
-            // the silhouette's bottom radius is proportional to the panel
-            // size — rebuild the path so it stays correct after a resize
+            // the silhouette is fixed-unit scaled — rebuild on resize so the
+            // flare/bottom radii stay correct after a DPI change, and keep the
+            // scale anchor at (center-x, y=0)
             let factory: ID2D1Factory = self.rt.GetFactory()?;
-            self.island_path = Self::build_island_path(&factory, w, h)?;
+            self.island_path = Self::build_island_path(&factory, h, scale)?;
+            // the clip too: pixel dims follow the DPI change, otherwise the
+            // visual stays clipped to the old window size
+            self._clip.SetRight2(w)?;
+            self._clip.SetBottom2(h)?;
+            self.ctrl.SetCenterX(&Self::scalar_anim(&self.dcomp, WINDOW_UNITS_W / 2.0 * scale)?)?;
+            self.ctrl.SetCenterY(&Self::scalar_anim(&self.dcomp, 0.0)?)?;
+            self.dcomp.Commit()?;
             Ok(())
         }
     }
@@ -475,34 +598,6 @@ impl Renderer {
     unsafe fn layout(&self, s: &str, tf: &IDWriteTextFormat, maxw: f32, maxh: f32) -> Result<IDWriteTextLayout> {
         let utf16: Vec<u16> = s.encode_utf16().collect();
         self.dwrite.CreateTextLayout(&utf16, tf, maxw.max(1.0), maxh.max(1.0))
-    }
-
-    fn text(&self, s: &str, tf: &IDWriteTextFormat, x: f32, y: f32, brush: &ID2D1SolidColorBrush, maxw: f32, maxh: f32) {
-        unsafe {
-            if let Ok(l) = self.layout(s, tf, maxw, maxh) {
-                self.rt.DrawTextLayout(D2D_POINT_2F { x, y }, &l, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-            }
-        }
-    }
-
-    // draw a glyph centered on (cx, cy) — used for transport icons and the
-    // idle album-art note
-    fn glyph(&self, code: u16, tf: &IDWriteTextFormat, cx: f32, cy: f32, brush: &ID2D1SolidColorBrush) {
-        unsafe {
-            let s: String = std::iter::once(code as u32).filter_map(char::from_u32).collect();
-            let utf16: Vec<u16> = s.encode_utf16().collect();
-            if let Ok(l) = self.dwrite.CreateTextLayout(&utf16, tf, 100.0, 100.0) {
-                let mut m = DWRITE_TEXT_METRICS::default();
-                if l.GetMetrics(&mut m).is_ok() {
-                    self.rt.DrawTextLayout(
-                        D2D_POINT_2F { x: cx - m.width / 2.0, y: cy - m.height / 2.0 },
-                        &l,
-                        brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
-            }
-        }
     }
 
     // ---------- frame ----------
@@ -535,7 +630,13 @@ impl Renderer {
             // full island always rendered; the DComp clip reveals/retracts it
             self.rt.FillGeometry(&self.island_path, &self.br_black, None);
 
-            if app.expanded {
+            // content choreography: hidden until the island is fully open
+            // (fades in after the pop settles), gone before the visible
+            // shrink begins (fades out over CLOSE_DELAY, and the shrink's
+            // knots start that late for exactly that window)
+            let alpha = self.content_alpha(app.expanded);
+            if alpha > 0.0 {
+                self.br_text_hi.SetOpacity(alpha);
                 self.draw_home(ix, iw, ih, s);
             }
 
@@ -553,18 +654,54 @@ impl Renderer {
         }
     }
 
+    // content alpha: 0 while the island is still opening, ramps to 1 after
+    // the pop settles; on a retract it drops over CLOSE_DELAY — the shrink
+    // curve is shifted by that window so the text hides BEFORE the collapse
+    fn content_alpha(&self, expanded: bool) -> f32 {
+        if !self.anim_live {
+            return 0.0;
+        }
+        let now = unsafe { GetTickCount64() };
+        let t = (now - self.anim_start_ms) as f32 / 1000.0;
+        if !self.anim_expand {
+            if expanded {
+                // stale close state with expanded=true only ever shows up
+                // in the launch frame of a fresh expand (draw follows the
+                // animate() clock) — nothing should show there yet
+                return 0.0;
+            }
+            // retract: the greeting fades out ahead of the visible shrink
+            return (1.0 - t / CLOSE_DELAY).max(0.0);
+        }
+        if !expanded {
+            return 0.0;
+        }
+        if t < self.anim_settle {
+            0.0 // island not fully open yet — inside stays empty
+        } else {
+            ((t - self.anim_settle) / CONTENT_FADE).min(1.0)
+        }
+    }
+
     // Expanded island content: greeting only.
-    unsafe fn draw_home(&self, ix: f32, iw: f32, ih: f32, s: f32) {
-        let width = 180.0 * s;
-        let height = 34.0 * s;
-        self.text(
-            "Hello Ankit",
-            &self.tf_hi,
-            ix + (iw - width) / 2.0,
-            (ih - height) / 2.0,
-            &self.br_text_hi,
-            width,
-            height,
-        );
+    unsafe fn draw_home(&self, ix: f32, iw: f32, ih: f32, _s: f32) {
+        let text = "Hello Ankit";
+        if let Ok(l) = self.layout(text, &self.tf_hi, iw, ih) {
+            // center on the real measured text, not a guessed box
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let (tw, th) = match l.GetMetrics(&mut m) {
+                Ok(()) => (m.width, m.height),
+                Err(_) => (iw, ih), // fallback keeps it on-island
+            };
+            self.rt.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: ix + (iw - tw) / 2.0,
+                    y: (ih - th) / 2.0,
+                },
+                &l,
+                &self.br_text_hi,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
     }
 }

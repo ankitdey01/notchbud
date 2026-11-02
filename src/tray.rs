@@ -7,7 +7,7 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuItem, CreatePopupMenu, GetCursorPos, LoadIconW, PostMessageW,
+    AppendMenuW, CheckMenuItem, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, PostMessageW,
     TrackPopupMenu, HMENU, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_BYCOMMAND,
     MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RETURNCMD, WM_NULL,
 };
@@ -23,13 +23,15 @@ fn wide(s: &str) -> Vec<u16> {
 
 pub unsafe fn add_tray(hwnd: HWND) -> windows::core::Result<()> {
     let hicon = LoadIconW(None, IDI_APPLICATION)?;
-    let mut nid = NOTIFYICONDATAW::default();
-    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.hWnd = hwnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = TRAY_CALLBACK;
-    nid.hIcon = hicon;
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: TRAY_CALLBACK,
+        hIcon: hicon,
+        ..Default::default()
+    };
     let tip = wide("Dyland");
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
@@ -39,10 +41,12 @@ pub unsafe fn add_tray(hwnd: HWND) -> windows::core::Result<()> {
 }
 
 pub unsafe fn remove_tray(hwnd: HWND) {
-    let mut nid = NOTIFYICONDATAW::default();
-    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.hWnd = hwnd;
-    nid.uID = 1;
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        ..Default::default()
+    };
     let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
@@ -79,6 +83,8 @@ pub unsafe fn popup_menu(hwnd: HWND) -> usize {
         None,
     ); // RETURNCMD: loword = command (0 = dismissed)
     let _ = PostMessageW(hwnd, WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    // the handle is ours to free — without this every right-click leaks an HMENU
+    let _ = DestroyMenu(hmenu);
     chosen.0.max(0) as usize
 }
 
