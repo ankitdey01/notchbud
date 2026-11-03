@@ -8,8 +8,7 @@ mod tray;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows::core::{w, Result};
-use windows::Win32::Foundation::{
+use windows::core::{w, Result};use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
@@ -17,7 +16,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForSystem, SetProcessDpiAwarenessContext,
@@ -44,16 +42,6 @@ const TIMER_FADE: usize = 2;      // 16 ms repaint pump while the text alpha ani
 const TIMER_IDLE_RGN: usize = 3;  // one-shot: region swap after the close settles
 const FADE_STEP_MS: u32 = 16;
 
-// TEMPORARY flap-diagnosis trace; reads DYLAND_LOG=<path>, silent otherwise
-unsafe fn dlog(s: &str) {
-    use std::io::Write;
-    if let Ok(path) = std::env::var("DYLAND_LOG") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{} {}", GetTickCount64(), s);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // wndproc
 // ---------------------------------------------------------------------------
@@ -79,11 +67,7 @@ unsafe fn apply_window_region(app: &state::App) {
 
 // region + visuals must follow every expanded/sliver transition
 fn after_state_change(app: &state::App) {
-    unsafe {
-        let a = app.rgn_area;
-        dlog(&format!("  apply_region rgn=({:.0},{:.0},{:.0},{:.0})", a[0], a[1], a[2], a[3]));
-        apply_window_region(app)
-    };
+    unsafe { apply_window_region(app) };
 }
 
 // content-choreography pump: the silhouette scale animates on the DComp
@@ -114,7 +98,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     let Some(app) = app_from(hwnd) else {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     };
-    dlog(&format!("msg=0x{:04x} wp=0x{:x} lp=0x{:x} exp={} ins={}", msg, wparam.0, lparam.0, app.expanded as u8, app.mouse_inside as u8));
 
     match msg {
         WM_NCHITTEST => {
@@ -128,7 +111,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let y = pt.y as f32;
             let a = app.bar_area;
             let in_bar = x >= a[0] && x < a[2] && y >= a[1] && y < a[3];
-            dlog(&format!("  hit pt=({},{}) urn=({:.0},{:.0},{:.0},{:.0}) -> HT{}", x, y, a[0], a[1], a[2], a[3], if in_bar {"CLIENT"} else {"TRANS"}));
             if in_bar {
                 LRESULT(HTCLIENT as isize)
             } else {
@@ -139,7 +121,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => {
             if !app.mouse_inside {
                 app.mouse_inside = true;
-                dlog("  >>> mouse_enter");
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -163,7 +144,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSELEAVE => {
             app.mouse_inside = false;
             app.expanded = false;
-            dlog("  >>> mouse_leave");
             // animation clock first so the painted frame fades the text out
             // starting at alpha 1; it is fully gone before the shrink starts
             render::animate(false);
@@ -195,7 +175,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 TIMER_IDLE_RGN => {
                     KillTimer(hwnd, TIMER_IDLE_RGN).ok();
-                    dlog("  >>> idle_rgn timer -> region swap");
                     after_state_change(app);
                 }
                 _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -245,13 +224,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
                 LRESULT(0)
-            } else if TASKBAR_MSG.load(Ordering::Relaxed) != 0
-                && msg == TASKBAR_MSG.load(Ordering::Relaxed)
-            {
-                let _ = tray::add_tray(hwnd); // explorer restarted — re-register
-                LRESULT(0)
             } else {
-                DefWindowProcW(hwnd, msg, wparam, lparam)
+                let taskbar_msg = TASKBAR_MSG.load(Ordering::Relaxed);
+                if taskbar_msg != 0 && msg == taskbar_msg {
+                    let _ = tray::add_tray(hwnd); // explorer restarted — re-register
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
             }
         }
     }
@@ -316,14 +296,11 @@ fn dpi_scale() -> f32 {
 }
 
 fn main() -> Result<()> {
-    let step = |s: &str| eprintln!("[step] {s}");
     unsafe {
         // --- DPI awareness (PER_MONITOR_AWARE_V2) ---
-        step("dpi");
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
 
         // --- single instance: Local\Dyland.SingleInstance (env dev override) ---
-        step("mutex");
         let mut name_wide: Vec<u16> = match std::env::var("DYLAND_MUTEX_NAME") {
             Ok(s) => format!(r"Local\{s}").encode_utf16().collect(),
             Err(_) => r"Local\Dyland.SingleInstance".encode_utf16().collect(),
@@ -337,7 +314,6 @@ fn main() -> Result<()> {
         let hmodule = GetModuleHandleW(None)?;
         let hinstance = HINSTANCE(hmodule.0);
         let scale = dpi_scale();
-        step("scale");
 
         // --- class "NotchWindow" + our wndproc ---
         let wc = WNDCLASSEXW {
@@ -349,7 +325,6 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         RegisterClassExW(&wc);
-        step("class");
 
         // --- 640×190 layout-units × DPI scale, centered top of the primary screen ---
         let width = (scale * state::WINDOW_UNITS_W).round() as i32;
@@ -376,7 +351,6 @@ fn main() -> Result<()> {
         app.win_x = x;
         app.win_y = 0;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
-        step("app");
 
         // --- one-time Run-key self-heal (exe moved -> rewrite the path) ---
         prefs::heal_start_with_windows();
@@ -385,7 +359,6 @@ fn main() -> Result<()> {
         tray::add_tray(hwnd)?;
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
         TASKBAR_MSG.store(taskbar_created, Ordering::Relaxed);
-        step("tray");
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -394,7 +367,6 @@ fn main() -> Result<()> {
             render::draw_now(app);
             after_state_change(app);
         }
-        step("pump");
 
         // --- message pump ---
         let mut msg = MSG::default();
