@@ -4,6 +4,7 @@
 // clocks (content_alpha) repainted by WM_PAINT pumps from main.rs.
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 
 use windows::core::{w, Interface, PCWSTR, Result};
 use windows::Win32::Foundation::HWND;
@@ -12,10 +13,12 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-    ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory, ID2D1PathGeometry,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_LAYER_PARAMETERS, D2D1_LAYER_OPTIONS_NONE,
+    ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry,
+    ID2D1Layer, ID2D1PathGeometry,
     ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0,
     D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
@@ -45,7 +48,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
 use crate::state::{
-    scale_idle, scale_swell, spring_progress, spring_settle, spring_velocity, App,
+    scale_idle, scale_swell, spring_progress, spring_settle, spring_velocity, App, Chat,
     close_progress, close_velocity, CLOSE_DELAY, CONTENT_FADE, IDLE_RGN_H, IDLE_RGN_HALF_W,
     ISLAND_BOT_R, ISLAND_FLARE_R, ISLAND_H, ISLAND_W, ISLAND_X, OPEN_RESPONSE, OPEN_ZETA,
     SLIVER_H, SLIVER_W, SLIVER_X, STAGE1_DUR, SWELL_RESPONSE, SWELL_ZETA,
@@ -116,6 +119,7 @@ pub struct Renderer {
     _clip: IDCompositionRectangleClip,
     ctrl: IDCompositionScaleTransform, // island shell scale (the whole motion)
     island_path: ID2D1PathGeometry,
+    layer: ID2D1Layer, // per-frame content clip: text stays inside the shell
     _target: IDCompositionTarget,
     _visual: IDCompositionVisual,
     pixel_w: f32,
@@ -270,6 +274,7 @@ impl Renderer {
             step("ctrl_scale", ctrl.SetScaleY(&Self::scalar_anim(&dcomp, idle[1])?))?;
             visual.SetEffect(&ctrl)?;
             let island_path = Self::build_island_path(&factory, h, scale)?;
+            let layer = rt.CreateLayer(None)?;
             step("dcomp_commit", dcomp.Commit())?;
 
             let dwrite: IDWriteFactory =
@@ -308,6 +313,7 @@ impl Renderer {
                 _clip: clip,
                 ctrl,
                 island_path,
+                layer,
                 _target: target,
                 _visual: visual,
                 pixel_w: w,
@@ -637,7 +643,7 @@ impl Renderer {
             let alpha = self.content_alpha(app.expanded);
             if alpha > 0.0 {
                 self.br_text_hi.SetOpacity(alpha);
-                self.draw_home(ix, iw, ih, s);
+                self.draw_content(ix, iw, ih, s, &mut app.chat);
             }
 
             let end = self.rt.EndDraw(None, None);
@@ -683,25 +689,58 @@ impl Renderer {
         }
     }
 
-    // Expanded island content: greeting only.
-    unsafe fn draw_home(&self, ix: f32, iw: f32, ih: f32, _s: f32) {
-        let text = "Hello Ankit";
-        if let Ok(l) = self.layout(text, &self.tf_hi, iw, ih) {
-            // center on the real measured text, not a guessed box
+    // Expanded island content: the chat surface, in the greeting slot (same
+    // fonts, same alpha fade — the silhouette and choreography are frozen).
+    // The block stays bottom-anchored (newest line down) and is clipped to
+    // the island silhouette; wheel scrolling offsets it to reveal older
+    // lines instead of spilling past the shell.
+    unsafe fn draw_content(&self, ix: f32, iw: f32, ih: f32, s: f32, chat: &mut Chat) {
+        let text = chat.slot_text();
+        if let Ok(l) = self.layout(&text, &self.tf_hi, iw - 24.0 * s, ih) {
             let mut m = DWRITE_TEXT_METRICS::default();
             let (tw, th) = match l.GetMetrics(&mut m) {
                 Ok(()) => (m.width, m.height),
                 Err(_) => (iw, ih), // fallback keeps it on-island
             };
-            self.rt.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: ix + (iw - tw) / 2.0,
-                    y: (ih - th) / 2.0,
+            let x = if tw < iw * 0.9 {
+                // short text (greeting, status lines) stays centered
+                ix + (iw - tw) / 2.0
+            } else {
+                // long chat blocks sit left-aligned with a margin
+                ix + 24.0 * s
+            };
+            // viewport = what fits inside the shell above the bottom margin;
+            // scroll 0 pins the newest line to the bottom, scrolling up
+            // slides the block down until the oldest line touches the top
+            let viewport = (ih - 14.0 * s).max(1.0);
+            chat.max_scroll = (th - viewport).max(0.0);
+            chat.scroll = chat.scroll.clamp(0.0, chat.max_scroll);
+            let y = (ih - th - 10.0 * s) + chat.scroll;
+            // clip to the island body — previously tall text drew straight
+            // out of the shell's bottom edge onto the desktop
+            let mask: ID2D1Geometry = match self.island_path.cast() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            self.rt.PushLayer(
+                &D2D1_LAYER_PARAMETERS {
+                    contentBounds: D2D_RECT_F { left: ix, top: 0.0, right: ix + iw, bottom: ih },
+                    geometricMask: ManuallyDrop::new(Some(mask)),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 },
+                    opacity: 1.0,
+                    opacityBrush: ManuallyDrop::new(None),
+                    layerOptions: D2D1_LAYER_OPTIONS_NONE,
                 },
+                &self.layer,
+            );
+            self.rt.DrawTextLayout(
+                D2D_POINT_2F { x, y },
                 &l,
                 &self.br_text_hi,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
+            self.rt.PopLayer();
         }
     }
 }

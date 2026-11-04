@@ -7,14 +7,17 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuItem, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, PostMessageW,
-    TrackPopupMenu, HMENU, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_BYCOMMAND,
-    MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RETURNCMD, WM_NULL,
+    AppendMenuW, CheckMenuItem, CreatePopupMenu, DestroyMenu, EnableMenuItem, GetCursorPos,
+    LoadIconW, PostMessageW, TrackPopupMenu, HMENU, IDI_APPLICATION, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MF_BYCOMMAND, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_RIGHTALIGN,
+    TPM_RETURNCMD, WM_NULL,
 };
 
 pub const TRAY_CALLBACK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 9; // 0x8009
 
 const MENU_START_WITH_WINDOWS: usize = 100;
+const MENU_CONNECT: usize = 101;
+const MENU_DISCONNECT: usize = 102;
 const MENU_EXIT: usize = 104;
 
 fn wide(s: &str) -> Vec<u16> {
@@ -57,11 +60,19 @@ fn append(hmenu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITE
 }
 
 /// Builds + shows the menu; returns the chosen command id (0 if dismissed).
-pub unsafe fn popup_menu(hwnd: HWND) -> usize {
+pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool) -> usize {
     let hmenu = match CreatePopupMenu() {
         Ok(h) => h,
         Err(_) => return 0,
     };
+    append(hmenu, MF_STRING, "Connect ChatGPT", MENU_CONNECT);
+    append(hmenu, MF_STRING, "Disconnect", MENU_DISCONNECT);
+    if chat_connected {
+        let _ = EnableMenuItem(hmenu, MENU_CONNECT as u32, MF_GRAYED);
+    } else {
+        let _ = EnableMenuItem(hmenu, MENU_DISCONNECT as u32, MF_GRAYED);
+    }
+    append(hmenu, MF_SEPARATOR, "", 0);
     append(hmenu, MF_STRING, "Start with Windows", MENU_START_WITH_WINDOWS);
     let mode = if crate::prefs::is_start_with_windows() { MF_CHECKED } else { MF_UNCHECKED };
     CheckMenuItem(hmenu, MENU_START_WITH_WINDOWS as u32, (MF_BYCOMMAND | mode).0);
@@ -89,4 +100,6 @@ pub unsafe fn popup_menu(hwnd: HWND) -> usize {
 }
 
 pub const ID_START: u32 = MENU_START_WITH_WINDOWS as u32;
+pub const ID_CONNECT: u32 = MENU_CONNECT as u32;
+pub const ID_DISCONNECT: u32 = MENU_DISCONNECT as u32;
 pub const ID_EXIT: u32 = MENU_EXIT as u32;

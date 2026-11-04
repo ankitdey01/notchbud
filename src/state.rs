@@ -169,6 +169,99 @@ pub fn scale_swell() -> [f32; 2] {
     [SCALE_SWELL_X, SCALE_SWELL_Y]
 }
 
+// ---------------------------------------------------------------------------
+// Chat state — everything the streaming panel inside the frozen island needs.
+// Geometry, springs, scale choreography above are untouched.
+// ---------------------------------------------------------------------------
+
+pub use crate::connector::chat::{Msg, Role, StreamEvent};
+
+/// History cap: 4 turns back is all that shows and all the slot needs.
+const HISTORY_MAX: usize = 8;
+
+pub struct Chat {
+    /// The saved ChatGPT sign-in; None = not connected.
+    pub tokens: Option<crate::connector::auth::Tokens>,
+    /// Resolved Codex model (plan listing first, gpt-6-luna fallback).
+    pub model: Option<String>,
+    pub input: String,
+    /// Assistant text currently arriving.
+    pub stream: String,
+    /// Finished turns, oldest first.
+    pub history: Vec<(Role, String)>,
+    pub streaming: bool,
+    /// Device sign-in in progress (tray Connect clicked).
+    pub signing_in: bool,
+    /// Device user code while a sign-in is pending ("XXXX-XXXX").
+    pub user_code: Option<String>,
+    /// One-line error/status for the slot.
+    pub error: Option<String>,
+    /// Scroll offset in px; 0 = pinned to the newest line (bottom-anchored),
+    /// larger values reveal older lines. Wheel hook adjusts, draw clamps.
+    pub scroll: f32,
+    /// Content height beyond the island viewport; refreshed every frame.
+    pub max_scroll: f32,
+}
+
+impl Chat {
+    pub fn new() -> Self {
+        Chat {
+            tokens: None,
+            model: None,
+            input: String::new(),
+            stream: String::new(),
+            history: Vec::new(),
+            streaming: false,
+            signing_in: false,
+            user_code: None,
+            error: None,
+            scroll: 0.0,
+            max_scroll: 0.0,
+        }
+    }
+
+    pub fn connected(&self) -> bool {
+        self.tokens.is_some()
+    }
+
+    pub fn push_history(&mut self, role: Role, text: String) {
+        if self.history.len() >= HISTORY_MAX {
+            self.history.remove(0);
+        }
+        self.history.push((role, text));
+        self.scroll = 0.0; // a new turn snaps the view back to the newest line
+    }
+
+    /// The text shown in the slot when the island is open, ready for
+    /// render::draw_content.
+    pub fn slot_text(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(code) = &self.user_code {
+            lines.push(format!("Code {code} — approve in the browser (copied)"));
+        }
+        if let Some(e) = &self.error {
+            lines.push(e.clone());
+        }
+        for (role, text) in &self.history {
+            match role {
+                Role::User => lines.push(format!("› {text}")),
+                Role::Assistant => lines.push(text.clone()),
+            }
+        }
+        if self.streaming && !self.stream.is_empty() {
+            lines.push(self.stream.clone());
+        }
+        if self.connected() && !self.streaming {
+            lines.push(format!("› {}▏", self.input));
+        }
+        if lines.is_empty() {
+            "Hello Ankit".into()
+        } else {
+            lines.join("\n")
+        }
+    }
+}
+
 pub struct App {
     pub hwnd: windows::Win32::Foundation::HWND,
     pub scale: f32,
@@ -177,6 +270,9 @@ pub struct App {
 
     pub expanded: bool,   // false = idle sliver, true = island shown
     pub mouse_inside: bool,
+
+    // island chat (frozen slot content + history); tokens live here too
+    pub chat: Chat,
 
     // geometry snapshot refreshed each frame (NCHITTEST hit surface)
     pub bar_area: [f32; 4],
@@ -200,6 +296,7 @@ impl App {
             height,
             expanded: false,
             mouse_inside: false,
+            chat: Chat::new(),
             bar_area: [0.0; 4],
             rgn_area: [0.0; 4],
             win_x: 0,
