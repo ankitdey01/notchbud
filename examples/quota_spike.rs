@@ -1,54 +1,84 @@
-// quota_spike — PLAN.md Milestone 0: run the device flow once against a
-// free/Go account, then one Codex request, and print what the plan allows:
-// HTTP status, the returned model list, the x-codex-* quota headers, and one
-// streamed answer. The recorded numbers decide dyland's whole positioning.
+// quota_spike — probe what the signed-in ChatGPT plan allows over the
+// documented SIWC flow: browser authorize once, then print the account's
+// model catalog and one streamed answer through the public Responses API.
 //
 //     cargo run --example quota_spike
 //
-// Run it, open the printed URL in a browser, enter the code, wait.
+// Run it, approve in the opened browser, wait for the callback.
 
-use dyland::connector::{auth, chat, chat::Msg, chat::Role};
+use notchbud::connector::{auth, chat, chat::Msg, chat::Role};
 
 fn main() {
-    let login = match auth::start_device_login() {
-        Ok(l) => l,
+    let host_id = match auth::load_or_create_host_id() {
+        Ok(h) => h,
         Err(e) => {
             eprintln!("sign-in could not start: {e}");
             return;
         }
     };
-    println!("Open {} and enter this code:\n", auth::VERIFICATION_URL);
-    println!("    {}\n", login.user_code);
-
-    let tokens = loop {
-        std::thread::sleep(std::time::Duration::from_millis(login.interval_ms));
-        match auth::poll_device_login(&login) {
-            Ok(auth::Poll::Pending) => {
-                print!(".");
-                continue;
-            }
-            Ok(auth::Poll::Connected(t)) => break t,
-            Err(e) => {
-                println!();
-                eprintln!("sign-in failed: {e}");
-                return;
-            }
+    let saved = auth::load_tokens();
+    let (pending, url) = match auth::begin_authorize(saved.as_ref(), &host_id) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sign-in could not start: {e}");
+            return;
         }
     };
-    // save for the app: dyland.exe picks these up from %APPDATA%\dyland\auth.bin
-    let _ = auth::save_tokens(&tokens);
-    println!();
+    println!("Open this URL in your browser:\n\n    {url}\n");
+    // Also try to open it directly.
+    let _ = open::that(&url);
+    let (cb, meta) = match auth::wait_callback(pending) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sign-in failed: {e}");
+            return;
+        }
+    };
+    let data = match auth::exchange_code(&meta, &cb.code, &cb.client_id) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sign-in failed: {e}");
+            return;
+        }
+    };
+    let tokens = match auth::finish_signin(&data, &cb.client_id, &meta.nonce, &host_id, saved.as_ref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("sign-in failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = auth::save_tokens(&tokens) {
+        eprintln!("could not save credentials ({e}) — sign-in works, persistence does not");
+        std::process::exit(2);
+    }
     println!("access token expires at: {} (epoch s)", tokens.expires_at);
-    println!("account id: {}", tokens.account_id.as_deref().unwrap_or("(none)"));
+    println!("subject: {}", tokens.subject);
+    println!("plan usage allowed: {}", tokens.plan_allowed);
 
-    // model inventory: what this plan's listing offers
+    // model inventory: what this account's catalog offers
     match auth::list_models(&tokens) {
-        Ok(models) if !models.is_empty() => println!("models: {}", models.join(", ")),
-        _ => println!("models: listing unreadable — defaults: {}", auth::FALLBACK_MODELS.join(", ")),
+        Ok(models) if !models.is_empty() => {
+            let names: Vec<String> =
+                models.iter().map(|m| format!("{} ({})", m.slug, m.display_name)).collect();
+            println!("models: {}", names.join(", "));
+        }
+        _ => println!("models: listing unreadable"),
     }
 
-    // one streamed request against the default model
-    let model = auth::pick_model(&tokens);
+    if !tokens.plan_allowed {
+        println!("plan usage not granted — inference disabled by design.");
+        return;
+    }
+
+    // one streamed request against the first catalog model
+    let model = match auth::pick_model(&tokens) {
+        Ok(m) => m,
+        Err(m) => {
+            println!("request: FAILED — {m}");
+            return;
+        }
+    };
     println!("trying model {model} …");
     let history = [Msg { role: Role::User, text: "Reply with the single word: OK".into() }];
     let res = chat::stream_chat(&tokens, &model, &history, |ev| match ev {
@@ -59,39 +89,23 @@ fn main() {
         _ => true,
     });
     println!();
-    // also print the raw response headers once: they carry the quota facts
-    // (x-codex-plan-type, x-codex-active-limit, …) on the plain POST path.
-    print_quota_headers(&tokens, &model, &history);
     match res {
         Ok(()) => println!("request: OK (streamed above)"),
         Err(m) => println!("request: FAILED — {m}"),
     }
-    println!("\nRecord these numbers before any dyland code claims a tier.");
+    println!("\nRecord these numbers before any notchbud code claims a tier.");
 }
 
-fn print_quota_headers(tokens: &auth::Tokens, model: &str, history: &[Msg]) {
-    use ureq::AgentBuilder;
-    let agent = AgentBuilder::new()
-        .user_agent(auth::USER_AGENT)
-        .build();
-    let mut req = agent
-        .post(chat::RESPONSES_URL)
-        .set("authorization", &format!("Bearer {}", tokens.access))
-        .set("originator", auth::ORIGINATOR)
-        .set("accept", "text/event-stream")
-        .set("content-type", "application/json");
-    if let Some(account) = &tokens.account_id {
-        req = req.set("chatgpt-account-id", account);
-    }
-    match req.send_string(&chat::responses_body(model, history).to_string()) {
-        Ok(r) => {
-            println!("status: {}", r.status());
-            for name in r.headers_names() {
-                if name.starts_with("x-codex") {
-                    println!("  {name}: {}", r.header(&name).unwrap_or(""));
-                }
-            }
-        }
-        Err(e) => println!("status: error {e}"),
+mod open {
+    pub fn that(url: &str) -> std::io::Result<()> {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS so no console window flashes.
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        std::process::Command::new("rundll32")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .creation_flags(DETACHED_PROCESS)
+            .spawn()
+            .map(|_| ())
     }
 }

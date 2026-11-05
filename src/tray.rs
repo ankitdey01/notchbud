@@ -35,7 +35,7 @@ pub unsafe fn add_tray(hwnd: HWND) -> windows::core::Result<()> {
         hIcon: hicon,
         ..Default::default()
     };
-    let tip = wide("Dyland");
+    let tip = wide("Notchbud");
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
         return Err(windows::core::Error::from_win32());
@@ -60,16 +60,18 @@ fn append(hmenu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITE
 }
 
 /// Builds + shows the menu; returns the chosen command id (0 if dismissed).
-pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool) -> usize {
+/// Connect stays enabled when signed in without plan usage, so the user can
+/// authorize it separately; Disconnect is only meaningful while signed in.
+pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool, plan_ready: bool) -> usize {
     let hmenu = match CreatePopupMenu() {
         Ok(h) => h,
         Err(_) => return 0,
     };
     append(hmenu, MF_STRING, "Connect ChatGPT", MENU_CONNECT);
     append(hmenu, MF_STRING, "Disconnect", MENU_DISCONNECT);
-    if chat_connected {
+    if chat_connected && plan_ready {
         let _ = EnableMenuItem(hmenu, MENU_CONNECT as u32, MF_GRAYED);
-    } else {
+    } else if !chat_connected {
         let _ = EnableMenuItem(hmenu, MENU_DISCONNECT as u32, MF_GRAYED);
     }
     append(hmenu, MF_SEPARATOR, "", 0);
@@ -103,3 +105,30 @@ pub const ID_START: u32 = MENU_START_WITH_WINDOWS as u32;
 pub const ID_CONNECT: u32 = MENU_CONNECT as u32;
 pub const ID_DISCONNECT: u32 = MENU_DISCONNECT as u32;
 pub const ID_EXIT: u32 = MENU_EXIT as u32;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Crossed menu ids silently run Exit instead of Connect (or vice versa).
+    // Pure consts — no window needed.
+    #[test]
+    fn menu_ids_distinct_and_wired() {
+        let ids = [ID_START, ID_CONNECT, ID_DISCONNECT, ID_EXIT];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j], "menu ids must be unique");
+            }
+        }
+        assert_eq!(ID_START, MENU_START_WITH_WINDOWS as u32);
+        assert_eq!(ID_CONNECT, MENU_CONNECT as u32);
+        assert_eq!(ID_DISCONNECT, MENU_DISCONNECT as u32);
+        assert_eq!(ID_EXIT, MENU_EXIT as u32);
+        assert_eq!(ID_EXIT, 104, "matches the documented Exit slot");
+    }
+
+    #[test]
+    fn tray_callback_is_wm_app_plus_9() {
+        assert_eq!(TRAY_CALLBACK, 0x8009);
+    }
+}

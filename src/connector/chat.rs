@@ -1,7 +1,8 @@
-// chat.rs — the island chat: a Responses request to the Codex backend with
-// the user's own ChatGPT tokens, and the SSE stream decoded into
-// StreamEvents. Only output_text deltas + completed/failed are read; notch
-// chat has no tool calls.
+// chat.rs — the island chat: a Responses request to the public OpenAI API
+// with the user's authorized ChatGPT-plan token, and the SSE stream decoded
+// into StreamEvents. A turn counts only after `response.completed`; notch
+// chat has no tool calls. Never any other billing path: plan-usage errors
+// surface as-is, never a silent switch to API-key billing.
 
 use std::io::BufRead;
 use std::time::Duration;
@@ -9,12 +10,25 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use ureq::Agent;
 
-use super::auth::{Tokens, ORIGINATOR, USER_AGENT};
+use super::auth::{Tokens, USER_AGENT};
 
-pub const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
 /// Everything chat sends is text; keep instructions plain.
-const INSTRUCTIONS: &str = "You are dyland, the tiny assistant inside a notch island on the desktop. Answer in one or two short plain-text sentences — no markdown, no lists.";
+const INSTRUCTIONS: &str = "You are notchbud, the tiny assistant inside a notch island on the desktop. Answer in one or two short plain-text sentences — no markdown, no lists.";
+
+/// System prompt, with the user's name folded in: `instructions` rides every
+/// request (Responses keeps no server-side state), so the model always knows
+/// who it serves. The name is one user-supplied line (control characters are
+/// rejected at save), quoted so it reads as data, never as an instruction.
+pub fn instructions_for(user_name: Option<&str>) -> String {
+    match user_name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => format!(
+            "{INSTRUCTIONS} The person you are talking to is called \"{name}\"."
+        ),
+        None => INSTRUCTIONS.to_owned(),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Role {
@@ -58,29 +72,56 @@ fn chat_agent() -> Agent {
         .build()
 }
 
-/// The Responses body for the island chat: the whole short history, no tools,
-/// nothing stored.
-pub fn responses_body(model: &str, history: &[Msg]) -> Value {
+/// The Responses body for the island chat: the whole short history, nothing
+/// stored server-side (`store: false`), streamed. `user_name` (the saved
+/// onboarding name) is folded into `instructions` on every turn.
+pub fn responses_body(model: &str, history: &[Msg], user_name: Option<&str>) -> Value {
     let input: Vec<Value> = history
         .iter()
         .map(|m| {
             json!({
-                "type": "message",
                 "role": match m.role { Role::User => "user", Role::Assistant => "assistant" },
-                "content": match m.role {
-                    Role::User => json!([{ "type": "input_text", "text": m.text }]),
-                    Role::Assistant => json!(m.text),
-                },
+                "content": m.text,
             })
         })
         .collect();
     json!({
         "model": model,
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions_for(user_name),
         "input": input,
-        "stream": true,
         "store": false,
-        "reasoning": { "effort": "medium", "summary": "auto" },
+        "stream": true,
+    })
+}
+
+/// Documented plan-usage failure codes, mapped to slot-sized lines.
+fn plan_error(code: &str) -> Option<String> {
+    Some(match code {
+        "subscription_sharing_user_not_eligible" => {
+            "Your ChatGPT account can't share plan usage with apps.".into()
+        }
+        "subscription_sharing_usage_limit_exceeded" => {
+            "Your plan's limit is reached for now. See ChatGPT Settings → Usage.".into()
+        }
+        "subscription_sharing_usage_unavailable" => {
+            "Plan usage is temporarily unavailable. Try again later.".into()
+        }
+        "subscription_sharing_unsupported_capability" => {
+            "That request isn't supported with plan usage.".into()
+        }
+        "subscription_sharing_route_not_supported" => {
+            "This request route isn't supported with plan usage.".into()
+        }
+        "subscription_sharing_invalid_user" => {
+            "Your ChatGPT account could not be verified. Sign in again.".into()
+        }
+        "chatpass_v2_scope_not_authorized" | "chatpass_v2_invalid_authorization_context" => {
+            "This sign-in isn't authorized for plan usage. Connect again.".into()
+        }
+        "subscription_sharing_user_unavailable" => {
+            "Account info is temporarily unavailable. Try again later.".into()
+        }
+        _ => return None,
     })
 }
 
@@ -88,20 +129,31 @@ pub fn responses_body(model: &str, history: &[Msg]) -> Value {
 fn decode_event(v: &Value) -> Option<StreamEvent> {
     match v.get("type").and_then(Value::as_str) {
         Some("response.output_text.delta") => Some(StreamEvent::Delta(
-            v.get("delta").and_then(Value::as_str).unwrap_or("").to_owned(),
+            v.get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
         )),
-        Some("response.completed") | Some("response.incomplete") | Some("response.done") => {
-            Some(StreamEvent::Done)
-        }
+        Some("response.completed") => Some(StreamEvent::Done),
+        Some("response.incomplete") => Some(StreamEvent::Error(
+            "The reply was incomplete. Try again.".into(),
+        )),
         Some("response.failed") => {
-            let msg = v["response"]["error"]["message"]
+            let err = &v["response"]["error"];
+            let code = err["code"].as_str().unwrap_or("");
+            if let Some(mapped) = plan_error(code) {
+                return Some(StreamEvent::Error(mapped));
+            }
+            let msg = err["message"]
                 .as_str()
-                .or_else(|| v["response"]["error"]["code"].as_str())
+                .filter(|s| !s.is_empty())
                 .unwrap_or("ChatGPT could not complete the request.");
             Some(StreamEvent::Error(user_error(msg)))
         }
         Some("error") => {
-            let msg = v["error"]["message"].as_str().unwrap_or("ChatGPT could not complete the request.");
+            let msg = v["error"]["message"]
+                .as_str()
+                .unwrap_or("ChatGPT could not complete the request.");
             Some(StreamEvent::Error(user_error(msg)))
         }
         _ => None,
@@ -111,8 +163,12 @@ fn decode_event(v: &Value) -> Option<StreamEvent> {
 /// Friendly lines for the slot: quota exhausted / sign-in expired / offline.
 fn user_error(raw: &str) -> String {
     let low = raw.to_ascii_lowercase();
-    if low.contains("usage not included") || low.contains("usage_limit") || low.contains("rate limit")
-        || low.contains("quota") || low.contains("limit reached") || low.contains("limit has been")
+    if low.contains("usage not included")
+        || low.contains("usage_limit")
+        || low.contains("rate limit")
+        || low.contains("quota")
+        || low.contains("limit reached")
+        || low.contains("limit has been")
     {
         "Your plan's limit is reached for now.".into()
     } else if low.contains("unauthorized") || low.contains("token expired") {
@@ -120,7 +176,7 @@ fn user_error(raw: &str) -> String {
     } else if low.contains("model") && low.contains("not") {
         "This model is not on your plan — trying again later.".into()
     } else {
-        raw.chars().take(120).collect()
+        raw.chars().take(140).collect()
     }
 }
 
@@ -131,19 +187,16 @@ pub fn stream_chat(
     tokens: &Tokens,
     model: &str,
     history: &[Msg],
+    user_name: Option<&str>,
     mut on: impl FnMut(StreamEvent) -> bool,
 ) -> Result<(), String> {
     let agent = chat_agent();
-    let mut req = agent
+    let req = agent
         .post(RESPONSES_URL)
         .set("authorization", &format!("Bearer {}", tokens.access))
-        .set("originator", ORIGINATOR)
         .set("accept", "text/event-stream")
         .set("content-type", "application/json");
-    if let Some(account) = &tokens.account_id {
-        req = req.set("chatgpt-account-id", account);
-    }
-    let resp = match req.send_string(&responses_body(model, history).to_string()) {
+    let resp = match req.send_string(&responses_body(model, history, user_name).to_string()) {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
         Err(_) => return Err("offline — can't reach ChatGPT".to_owned()),
@@ -152,63 +205,72 @@ pub fn stream_chat(
         let status = resp.status();
         let snippet = resp.into_string().unwrap_or_default();
         let v: Value = serde_json::from_str(&snippet).unwrap_or(Value::Null);
+        // Direct-route admission may return {"detail":"..."} with no error
+        // object; structured failures carry error.code.
+        let code = v["error"]["code"].as_str().unwrap_or("").to_owned();
+        if !code.is_empty() {
+            if let Some(mapped) = plan_error(&code) {
+                return Err(mapped);
+            }
+        }
         let raw = v["error"]["message"]
             .as_str()
-            .or_else(|| v["message"].as_str())
             .or_else(|| v["detail"].as_str())
             .unwrap_or(&snippet);
-        // 401/403 reads as an expired sign-in; anything else passes through.
-        let msg = if status == 401 || status == 403 {
-            user_error("unauthorized")
-        } else {
-            user_error(raw)
+        let msg = match status {
+            401 => "Your ChatGPT sign-in was not accepted. Connect again from the tray.".to_owned(),
+            403 => user_error(if raw.is_empty() { "not permitted" } else { raw }),
+            503 => "ChatGPT plan routing is unavailable right now. Try again later.".to_owned(),
+            _ => user_error(if raw.is_empty() {
+                "ChatGPT could not complete the request."
+            } else {
+                raw
+            }),
         };
         return Err(msg);
     }
 
     let mut reader = std::io::BufReader::new(resp.into_reader()); // into_reader is a plain Read
     let mut line = String::new();
-    let mut got_text = false;
+    let mut completed = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => break, // stream ended
             Ok(_) => {}
-            Err(_) => {
-                // A dropped connection after real text counts as done.
-                if got_text {
-                    let _ = on(StreamEvent::Done);
-                    return Ok(());
-                }
-                return Err("The reply was cut off. Try again.".to_owned());
-            }
+            Err(_) => return Err("The reply was cut off. Try again.".to_owned()),
         }
-        let Some(rest) = line.strip_prefix("data:") else { continue };
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
         let rest = rest.trim();
         if rest.is_empty() || rest == "[DONE]" {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(rest) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(rest) else {
+            continue;
+        };
         match decode_event(&v) {
             None => {}
             Some(StreamEvent::Delta(d)) => {
                 if !d.is_empty() && !on(StreamEvent::Delta(d)) {
                     return Ok(()); // cancelled by the UI
                 }
-                got_text = true;
             }
             Some(StreamEvent::Done) => {
+                completed = true;
                 let _ = on(StreamEvent::Done);
-                return Ok(());
+                break;
             }
             Some(StreamEvent::Error(m)) => return Err(m),
         }
     }
-    if got_text {
-        let _ = on(StreamEvent::Done);
+    // Success only after response.completed: an interrupted stream is a
+    // failure, not a partial answer.
+    if completed {
         Ok(())
     } else {
-        Err("ChatGPT returned an empty reply.".to_owned())
+        Err("The reply was cut off. Try again.".to_owned())
     }
 }
 
@@ -219,22 +281,37 @@ mod tests {
     #[test]
     fn sse_events_decode() {
         assert_eq!(
-            decode_event(&serde_json::from_str::<Value>(
-                r#"{"type":"response.output_text.delta","delta":"Hi"}"#
-            ).unwrap()),
+            decode_event(
+                &serde_json::from_str::<Value>(
+                    r#"{"type":"response.output_text.delta","delta":"Hi"}"#
+                )
+                .unwrap()
+            ),
             Some(StreamEvent::Delta("Hi".into()))
         );
         assert_eq!(
-            decode_event(&serde_json::from_str::<Value>(
-                r#"{"type":"response.completed","response":{}}"#
-            ).unwrap()),
+            decode_event(
+                &serde_json::from_str::<Value>(r#"{"type":"response.completed","response":{}}"#)
+                    .unwrap()
+            ),
             Some(StreamEvent::Done)
         );
         assert_eq!(
             decode_event(&serde_json::from_str::<Value>(
-                r#"{"type":"response.failed","response":{"error":{"message":"quota exhausted"}}}"#
+                r#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}}"#
             ).unwrap()),
-            Some(StreamEvent::Error("Your plan's limit is reached for now.".into()))
+            Some(StreamEvent::Error(
+                "Your plan's limit is reached for now. See ChatGPT Settings → Usage.".into()
+            ))
+        );
+        assert_eq!(
+            decode_event(
+                &serde_json::from_str::<Value>(r#"{"type":"response.incomplete","response":{}}"#)
+                    .unwrap()
+            ),
+            Some(StreamEvent::Error(
+                "The reply was incomplete. Try again.".into()
+            ))
         );
         assert_eq!(
             decode_event(&serde_json::json!({"type":"response.created"})),
@@ -245,18 +322,40 @@ mod tests {
     #[test]
     fn responses_body_shape() {
         let body = responses_body(
-            "gpt-6-luna",
+            "gpt-6.1-sol",
             &[
-                Msg { role: Role::User, text: "hi".into() },
-                Msg { role: Role::Assistant, text: "hey".into() },
+                Msg {
+                    role: Role::User,
+                    text: "hi".into(),
+                },
+                Msg {
+                    role: Role::Assistant,
+                    text: "hey".into(),
+                },
             ],
+            Some("Ankit"),
         );
-        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["model"], "gpt-6.1-sol");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"], "hi");
         assert_eq!(body["input"][1]["role"], "assistant");
         assert_eq!(body["input"][1]["content"], "hey");
+        // The saved name rides every request so the model knows its user.
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(instructions.contains("\"Ankit\""), "{instructions}");
+    }
+
+    #[test]
+    fn instructions_name_rules() {
+        // Named, blank, and missing all behave: name quoted, no name, no name.
+        let named = instructions_for(Some("Ankit"));
+        assert!(named.contains("called \"Ankit\""), "{named}");
+        assert!(named.starts_with(INSTRUCTIONS));
+        assert_eq!(instructions_for(Some("   ")), INSTRUCTIONS);
+        assert_eq!(instructions_for(None), INSTRUCTIONS);
+        // One line, always: names cannot smuggle newlines past save.
+        assert!(!named.chars().any(|c| c == '\n'));
     }
 }

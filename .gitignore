@@ -5,3 +5,4 @@ run*.log
 *.png
 build_warn.txt
 crop*.ps1
+web

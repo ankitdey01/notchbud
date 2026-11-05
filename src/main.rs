@@ -1,7 +1,12 @@
-// dyland — minimal notch: idle sliver at the top of the screen; hovering
-// expands the island and shows "Hello Ankit"; leaving collapses it.
+// notchbud — minimal notch: idle sliver at the top of the screen; hovering
+// expands the island (sign-in prompt when signed out, chat when signed in);
+// leaving collapses it.
 
-use dyland::{connector, render, state};
+// No console window in release builds: this is a pure GUI (Win32) app.
+// Debug builds keep the console so the [notchbud] log lines stay visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use notchbud::{connector, render, state, user};
 
 mod prefs;
 mod tray;
@@ -25,7 +30,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyboardState, ToUnicode, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
     VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowRect, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
@@ -35,7 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WNDCLASSEXW, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
-    SW_SHOWNORMAL, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 // "TaskbarCreated" message id; re-adds the tray icon when explorer restarts
@@ -60,8 +64,9 @@ const CHAT_DELTA: usize = 0; // *String
 const CHAT_DONE: usize = 1;
 const CHAT_ERROR: usize = 2; // *String
 const CHAT_CONNECTED: usize = 3; // *Tokens
-const CHAT_SHOW_CODE: usize = 4; // *String (formatted user code)
 const CHAT_MODEL: usize = 5; // *String (resolved model)
+const CHAT_SIGNED_OUT: usize = 6; // *String (terminal auth failure: clear creds)
+const CHAT_STATUS: usize = 7; // *String (transient notice, keeps signing_in)
 
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
 static CHAT_CANCEL: AtomicBool = AtomicBool::new(false);   // island left mid-stream
@@ -200,7 +205,6 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = app_from(hwnd) else {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -269,6 +273,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // collapse isn't clipped by the idle strip mid-flight (Nusa does
             // the same); a one-shot timer swaps regions after the settle.
             schedule_idle_region(app.hwnd, state::CLOSE_SETTLE + state::CLOSE_DELAY + 0.12);
+            LRESULT(0)
+        }
+
+        WM_LBUTTONUP => {
+            // Only the sign-in pill is clickable: it starts the
+            // browser-based ChatGPT sign-in (same as tray Connect).
+            // Onboarding has no button (Enter submits); everywhere else
+            // typing + wheel drive the island.
+            let pt = state::client_pt(lparam);
+            let (px, py) = (pt.x as f32, pt.y as f32);
+            if app.screen() == state::Screen::SignIn
+                && app.chat.shows_signin_button()
+                && !app.chat.signing_in
+            {
+                let on_pill = app.signin_rect.is_some_and(|r| state::App::hit(&r, px, py));
+                // Lenient: the pill is the visual, but the whole island stays
+                // actionable so a first-timer cannot miss.
+                let a = app.bar_area;
+                let on_island = px >= a[0] && px < a[2] && py >= a[1] && py < a[3];
+                if on_pill || on_island {
+                    start_signin(app);
+                    render::draw_now(app);
+                }
+            }
             LRESULT(0)
         }
 
@@ -385,7 +413,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 fn handle_tray_menu(app: &mut state::App) {
     unsafe {
-        let chosen = tray::popup_menu(app.hwnd, app.chat.connected());
+        let chosen = tray::popup_menu(app.hwnd, app.chat.connected(), app.chat.plan_ready());
         match chosen as u32 {
             tray::ID_START => {
                 let on = !prefs::is_start_with_windows();
@@ -404,123 +432,182 @@ fn handle_tray_menu(app: &mut state::App) {
 // ---------------------------------------------------------------------------
 
 fn disconnect(app: &mut state::App) {
+    // Best-effort remote revocation off the UI thread; local credentials are
+    // cleared immediately either way.
+    if let Some(tokens) = app.chat.tokens.clone() {
+        std::thread::spawn(move || connector::auth::revoke_session(&tokens));
+    }
     connector::auth::delete_tokens();
     app.chat.tokens = None;
     app.chat.model = None;
     app.chat.streaming = false;
     app.chat.stream.clear();
     app.chat.history.clear();
-    app.chat.user_code = None;
+    app.chat.notice = None;
     CHAT_CANCEL.store(true, Ordering::Release);
     app.chat.error = Some("Disconnected from ChatGPT.".into());
     render::draw_now(app);
 }
 
-/// Tray "Connect ChatGPT": start the device flow on a thread, open the
-/// approval page, clipboard the user code. The code also shows in the slot.
+/// Tray "Connect ChatGPT": browser-based SIWC authorization on a worker
+/// thread. Fresh installs register dynamically; saved accounts reauthorize
+/// with their issued client id (also the path for authorizing plan usage
+/// after an identity-only sign-in).
 fn start_signin(app: &mut state::App) {
-    if app.chat.tokens.is_some() || app.chat.signing_in {
+    if app.chat.signing_in || app.chat.streaming {
+        return;
+    }
+    if app.chat.plan_ready() {
         return;
     }
     app.chat.signing_in = true;
+    app.chat.error = None;
+    render::draw_now(app);
     let hwnd = app.hwnd.0 as isize;
+    let saved = app.chat.tokens.clone();
     std::thread::spawn(move || unsafe {
         let hwnd_raw = HWND(hwnd as *mut _);
-        let post_err = |m: String| {
+        let fail = |m: String| {
             let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_ERROR), LPARAM(Box::into_raw(Box::new(m)) as isize));
         };
-        let post_tokens = |t: connector::auth::Tokens| {
-            let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_CONNECTED), LPARAM(Box::into_raw(Box::new(t)) as isize));
-        };
-        let login = match connector::auth::start_device_login() {
-            Ok(l) => l,
+        let host_id = match connector::auth::load_or_create_host_id() {
+            Ok(h) => h,
             Err(e) => {
-                post_err(e.msg);
+                fail(e.msg);
                 return;
             }
         };
-        let code = format!("{}-{}", &login.user_code[..4], &login.user_code[4..]);
-        let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_SHOW_CODE), LPARAM(Box::into_raw(Box::new(code.clone())) as isize));
-        copy_to_clipboard(hwnd_raw, &code);
-        open_browser(hwnd_raw, connector::auth::VERIFICATION_URL);
-        // poll until the user approves (or the code expires)
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(login.interval_ms));
-            match connector::auth::poll_device_login(&login) {
-                Ok(connector::auth::Poll::Pending) => continue,
-                Ok(connector::auth::Poll::Connected(t)) => {
-                    let _ = connector::auth::save_tokens(&t);
-                    post_tokens(t);
-                    break;
-                }
-                Err(e) => {
-                    post_err(e.msg);
-                    break;
-                }
+        let (pending, url) = match connector::auth::begin_authorize(saved.as_ref(), &host_id) {
+            Ok(p) => p,
+            Err(e) => {
+                fail(e.msg);
+                return;
             }
+        };
+        // Keep the redirect target and verifier before the blocking wait.
+        eprintln!("[notchbud] signin: listener on {}", pending.redirect_uri);
+        // Open the approval page in the default browser; the clipboard
+        // keeps a silent copy in case the handoff is blocked. The same
+        // loopback callback completes either path.
+        open_browser(&url);
+        let _ = copy_text_to_clipboard(&url);
+        let _ = PostMessageW(
+            hwnd_raw,
+            WM_CHAT,
+            WPARAM(CHAT_STATUS),
+            LPARAM(Box::into_raw(Box::new(
+                "Approve in your browser to finish signing in.".to_string(),
+            )) as isize),
+        );
+        eprintln!("[notchbud] signin: waiting for callback");
+        let (cb, meta) = match connector::auth::wait_callback(pending) {
+            Ok(c) => c,
+            Err(e) => {
+                fail(e.msg);
+                return;
+            }
+        };
+        let nonce = meta.nonce.clone();
+        let data = match connector::auth::exchange_code(&meta, &cb.code, &cb.client_id) {
+            Ok(d) => d,
+            Err(e) => {
+                fail(e.msg);
+                return;
+            }
+        };
+        match connector::auth::finish_signin(&data, &cb.client_id, &nonce, &host_id, saved.as_ref()) {
+            Ok(t) => {
+                // Persistence must not fail silently: without the saved grant
+                // the next launch would be signed out again. Still connect
+                // this session so a storage hiccup doesn't waste an approval.
+                if let Err(e) = connector::auth::save_tokens(&t) {
+                    eprintln!("[notchbud] credentials could not be saved ({e}); session continues without persistence");
+                    let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_CONNECTED), LPARAM(Box::into_raw(Box::new(t)) as isize));
+                    fail("Signed in for now, but credentials could not be saved — sign-in won't survive a restart.".into());
+                    return;
+                }
+                let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_CONNECTED), LPARAM(Box::into_raw(Box::new(t)) as isize));
+            }
+            Err(e) => fail(e.msg),
         }
     });
 }
-
-fn copy_to_clipboard(hwnd: HWND, text: &str) {
+fn copy_text_to_clipboard(text: &str) -> bool {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     unsafe {
-        if OpenClipboard(hwnd).is_err() {
-            return;
+        if OpenClipboard(None).is_err() {
+            return false;
         }
         let _ = EmptyClipboard();
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         wide.push(0);
+        let mut ok = false;
         if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) {
             let p = GlobalLock(h) as *mut u16;
             if !p.is_null() {
                 std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
                 let _ = GlobalUnlock(h);
-                let _ = SetClipboardData(13 /* CF_UNICODETEXT */, HANDLE(h.0));
+                if SetClipboardData(13 /* CF_UNICODETEXT */, HANDLE(h.0)).is_ok() {
+                    ok = true;
+                }
             }
         }
         let _ = CloseClipboard();
+        ok
     }
 }
 
-fn open_browser(hwnd: HWND, url: &str) {
+/// Open the URL the way any app opens a link: hand it to the OS, which
+/// routes it to the already-running default browser.
+fn open_browser(url: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        let mut wide: Vec<u16> = url.encode_utf16().collect();
-        wide.push(0);
-        let _ = ShellExecuteW(
-            hwnd,
-            w!("open"),
-            windows::core::PCWSTR(wide.as_ptr()),
-            None,
-            None,
+        ShellExecuteW(
+            HWND(std::ptr::null_mut()),
+            windows::core::PCWSTR(op.as_ptr()),
+            windows::core::PCWSTR(file.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
             SW_SHOWNORMAL,
         );
     }
 }
 
-/// WM_KEY from the hook: edit the chat input line. Enter submits.
+/// WM_KEY from the hook: onboarding edits the name field, otherwise the chat
+/// input line. Enter submits. Chat keys only work while signed in — a
+/// signed-out island shows just the sign-in pill, with nothing to type in.
 fn handle_chat_key(app: &mut state::App, code: usize) {
-    if !app.chat.connected() || app.chat.streaming {
-        return; // silent while a stream runs; sign-in is tray-driven
+    if app.needs_onboarding() {
+        handle_name_key(app, code);
+        return;
     }
-    // typing targets the input line at the bottom of the slot — snap back
+    if !app.chat.connected() || app.chat.streaming {
+        return; // no field to type in; silent while a stream runs
+    }
+    // typing targets the input line at the bottom of the slot; snap back
     app.chat.scroll = 0.0;
     match code {
         c if c == VK_BACK.0 as usize => {
             app.chat.input.pop();
+            app.chat.error = None;
         }
         c if c == VK_ESCAPE.0 as usize => {
             app.chat.input.clear();
+            app.chat.error = None;
         }
         c if c == VK_RETURN.0 as usize => submit_chat(app),
         c if (32..=0x10FFFF).contains(&c) => {
             if let Some(ch) = char::from_u32(c as u32) {
-                if app.chat.input.chars().count() < 400 {
+                if !ch.is_control() && app.chat.input.chars().count() < 400 {
                     app.chat.input.push(ch);
+                    app.chat.error = None;
                 }
             }
         }
@@ -529,6 +616,51 @@ fn handle_chat_key(app: &mut state::App, code: usize) {
     render::draw_now(app);
 }
 
+/// WM_KEY while the island asks for a name: same editing keys, capped at
+/// NAME_MAX_CHARS. Enter persists (greeting and chat wait for sign-in);
+/// Escape clears the draft.
+fn handle_name_key(app: &mut state::App, code: usize) {
+    match code {
+        c if c == VK_BACK.0 as usize => {
+            app.name_draft.pop();
+            app.name_error = None;
+        }
+        c if c == VK_ESCAPE.0 as usize => {
+            app.name_draft.clear();
+            app.name_error = None;
+        }
+        c if c == VK_RETURN.0 as usize => submit_name(app),
+        c if (32..=0x10FFFF).contains(&c) => {
+            if let Some(ch) = char::from_u32(c as u32) {
+                if !ch.is_control()
+                    && app.name_draft.chars().count() < user::NAME_MAX_CHARS
+                {
+                    app.name_draft.push(ch);
+                    app.name_error = None;
+                }
+            }
+        }
+        _ => {}
+    }
+    render::draw_now(app);
+}
+
+/// Onboarding submit: persist the name so the next launch greets directly.
+/// Blank/too-long drafts stay on the prompt with the reason underneath.
+fn submit_name(app: &mut state::App) {
+    match user::save_name(&app.name_draft) {
+        Ok(canonical) => {
+            app.user_name = Some(canonical);
+            app.name_draft.clear();
+            app.name_error = None;
+        }
+        Err(e) => {
+            eprintln!("[notchbud] save name failed: {}", e.detail);
+            app.name_error = Some(e.ui.to_owned());
+        }
+    }
+    render::draw_now(app);
+}
 /// Enter: push the user turn, spawn the connector thread for one streaming
 /// response. Refresh happens on the chat thread (5-min margin), never UI.
 fn submit_chat(app: &mut state::App) {
@@ -536,8 +668,17 @@ fn submit_chat(app: &mut state::App) {
     if text.is_empty() {
         return;
     }
+    // Keys only reach here while signed in (handle_chat_key gates), so a
+    // missing connection just drops a stale turn instead of stranding it.
     let Some(tokens) = app.chat.tokens.clone() else { return };
     if app.chat.streaming {
+        return;
+    }
+    if !tokens.plan_ready() {
+        // Identity-only sign-in: inference stays off until plan usage is
+        // authorized (tray Connect re-runs OAuth with the full scope set).
+        app.chat.error = Some("ChatGPT plan use isn't enabled — Connect again to authorize it.".into());
+        render::draw_now(app);
         return;
     }
     app.chat.input.clear();
@@ -545,6 +686,7 @@ fn submit_chat(app: &mut state::App) {
     app.chat.streaming = true;
     app.chat.stream.clear();
     app.chat.error = None;
+    app.chat.notice = None;
     CHAT_CANCEL.store(false, Ordering::Release);
     render::draw_now(app);
 
@@ -556,6 +698,7 @@ fn submit_chat(app: &mut state::App) {
         .map(|(role, text)| state::Msg { role: *role, text: text.clone() })
         .collect();
     let model = app.chat.model.clone();
+    let user_name = app.user_name.clone();
     std::thread::spawn(move || unsafe {
         let hwnd = HWND(hwnd as *mut _);
         // 5-min-margin refresh; OpenAI rotates the refresh token per use, and
@@ -564,12 +707,17 @@ fn submit_chat(app: &mut state::App) {
             false => tokens,
             true => match connector::auth::refresh_tokens(&tokens) {
                 Ok(t) => {
-                    let _ = connector::auth::save_tokens(&t);
+                    if let Err(e) = connector::auth::save_tokens(&t) {
+                        eprintln!("[notchbud] refreshed credentials could not be saved ({e}); this session continues, but the sign-in may not survive a restart");
+                    }
                     let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_CONNECTED), LPARAM(Box::into_raw(Box::new(t.clone())) as isize));
                     t
                 }
                 Err(e) if e.expired => {
-                    let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_ERROR), LPARAM(Box::into_raw(Box::new(e.msg)) as isize));
+                    // Terminal: the saved grant is unusable. Clear it so the
+                    // island falls back to the sign-in prompt.
+                    connector::auth::delete_tokens();
+                    let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_SIGNED_OUT), LPARAM(Box::into_raw(Box::new(e.msg)) as isize));
                     return;
                 }
                 // transient: the still-valid access token usually works
@@ -579,17 +727,29 @@ fn submit_chat(app: &mut state::App) {
         let model = match model {
             Some(m) => m,
             None => {
-                // plan's own model listing first; luna fallback — cached in App
-                let m = connector::auth::pick_model(&tokens);
-                let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_MODEL), LPARAM(Box::into_raw(Box::new(m.clone())) as isize));
-                m
+                // The account catalog decides; no hardcoded fallback.
+                match connector::auth::pick_model(&tokens) {
+                    Ok(m) => {
+                        let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_MODEL), LPARAM(Box::into_raw(Box::new(m.clone())) as isize));
+                        m
+                    }
+                    Err(msg) => {
+                        if msg == "expired" {
+                            connector::auth::delete_tokens();
+                            let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_SIGNED_OUT), LPARAM(Box::into_raw(Box::new("Sign-in expired. Connect again from the tray.".to_owned())) as isize));
+                        } else {
+                            let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_ERROR), LPARAM(Box::into_raw(Box::new(msg)) as isize));
+                        }
+                        return;
+                    }
+                }
             }
         };
         let post_delta = |d: String| {
             let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_DELTA), LPARAM(Box::into_raw(Box::new(d)) as isize));
         };
         let cancelled = || CHAT_CANCEL.load(Ordering::Relaxed);
-        let result = connector::chat::stream_chat(&tokens, &model, &history, |ev| match ev {
+        let result = connector::chat::stream_chat(&tokens, &model, &history, user_name.as_deref(), |ev| match ev {
             connector::chat::StreamEvent::Delta(d) => {
                 if cancelled() {
                     false
@@ -641,6 +801,11 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
                 app.chat.streaming = false;
                 app.chat.stream.clear();
                 app.chat.error = Some(*s);
+                // A failed sign-in must be retryable: drop the in-progress
+                // flag so the island falls back to the
+                // "Sign in with ChatGPT" prompt (click to retry).
+                app.chat.signing_in = false;
+                app.chat.notice = None;
             } else {
                 // a cancelled leave: swallow the failure quietly
                 CHAT_CANCEL.store(false, Ordering::Release);
@@ -651,13 +816,26 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             let t = unsafe { Box::from_raw(lparam.0 as *mut connector::auth::Tokens) };
             app.chat.tokens = Some(*t);
             app.chat.signing_in = false;
-            app.chat.user_code = None;
+            app.chat.notice = None;
             app.chat.error = None;
             render::draw_now(app);
         }
-        CHAT_SHOW_CODE => {
+        CHAT_STATUS => {
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
-            app.chat.user_code = Some(*s);
+            app.chat.notice = Some(*s);
+            render::draw_now(app);
+        }
+        CHAT_SIGNED_OUT => {
+            // Terminal auth failure (expired/revoked grant): the saved grant
+            // is already deleted. Clear the UI back to the sign-in prompt.
+            let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
+            app.chat.tokens = None;
+            app.chat.model = None;
+            app.chat.streaming = false;
+            app.chat.stream.clear();
+            app.chat.signing_in = false;
+            app.chat.notice = None;
+            app.chat.error = Some(*s);
             render::draw_now(app);
         }
         CHAT_MODEL => {
@@ -713,15 +891,26 @@ fn main() -> Result<()> {
         // --- DPI awareness (PER_MONITOR_AWARE_V2) ---
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
 
-        // --- single instance: Local\Dyland.SingleInstance (env dev override) ---
-        let mut name_wide: Vec<u16> = match std::env::var("DYLAND_MUTEX_NAME") {
+        // --- single instance: Local\Notchbud.SingleInstance (env dev override) ---
+        let mut name_wide: Vec<u16> = match std::env::var("NOTCHBUD_MUTEX_NAME") {
             Ok(s) => format!(r"Local\{s}").encode_utf16().collect(),
-            Err(_) => r"Local\Dyland.SingleInstance".encode_utf16().collect(),
+            Err(_) => r"Local\Notchbud.SingleInstance".encode_utf16().collect(),
         };
         name_wide.push(0); // explicit NUL — r"...\0" is a literal backslash-zero
         let _mutex = CreateMutexW(None, true, windows::core::PCWSTR(name_wide.as_ptr()))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            return Ok(()); // already running — exit silently
+            // Tell instead of vanishing: without a tray icon there is no
+            // other way to know an older instance is still holding the app.
+            use windows::Win32::UI::WindowsAndMessaging::{
+                MessageBoxW, MB_ICONINFORMATION, MB_OK,
+            };
+            let _ = MessageBoxW(
+                None,
+                w!("Notchbud is already running (check Task Manager if you cannot see it)."),
+                w!("Notchbud"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return Ok(()); // already running — exit after telling
         }
 
         let hmodule = GetModuleHandleW(None)?;
@@ -734,7 +923,7 @@ fn main() -> Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
             hCursor: LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_ARROW)?,
-            lpszClassName: w!("DylandWindow"),
+            lpszClassName: w!("NotchbudWindow"),
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -746,8 +935,8 @@ fn main() -> Result<()> {
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW,
-            w!("DylandWindow"),
-            w!("Dyland"),
+            w!("NotchbudWindow"),
+            w!("Notchbud"),
             windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
             x,
             0,
@@ -762,6 +951,7 @@ fn main() -> Result<()> {
         // --- App state ---
         let mut app = Box::new(state::App::new(hwnd, scale, width, height));
         app.chat.tokens = connector::auth::load_tokens(); // saved sign-in, if any
+        app.user_name = user::load_name(); // saved name; None = first run onboarding
         app.win_x = x;
         app.win_y = 0;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
@@ -769,15 +959,18 @@ fn main() -> Result<()> {
         // --- one-time Run-key self-heal (exe moved -> rewrite the path) ---
         prefs::heal_start_with_windows();
 
-        // --- tray icon + explorer-restart hook ---
-        tray::add_tray(hwnd)?;
+        // --- tray icon + explorer-restart hook (non-fatal: the island
+        // runs fine without it; Shell_NotifyIcon NIM_ADD can return
+        // E_ACCESSDENIED on machines where Explorer blocks the icon) ---
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if let Err(e) = tray::add_tray(hwnd) {
+            eprintln!("[notchbud] tray unavailable, continuing without it: {e:#}");
+        }
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
         TASKBAR_MSG.store(taskbar_created, Ordering::Relaxed);
 
         // --- keyboard hook for the chat input (never activates the window) ---
         install_key_hook(hwnd, hinstance);
-
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         // first frame
         if let Some(app) = app_from(hwnd) {

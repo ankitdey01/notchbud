@@ -1,8 +1,8 @@
 // motion.rs — pure math checks for state.rs springs/knots and render.rs hermite.
 // Integration tests live here so the crate root stays window-free.
 
-use dyland::render::hermite;
-use dyland::state::*;
+use notchbud::render::hermite;
+use notchbud::state::*;
 
 // knots must be strictly increasing and the table must end held at 0
 #[test]

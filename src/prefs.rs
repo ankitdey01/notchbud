@@ -9,12 +9,16 @@ use windows::Win32::System::Registry::{
     RRF_RT_REG_SZ,
 };
 
-// --- "start with windows" (HKCU\...\Run value "Dyland") ---
+// --- "start with windows" (HKCU\...\Run value "Notchbud") ---
 const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: PCWSTR = w!("Dyland");
+const RUN_VALUE: PCWSTR = w!("Notchbud");
 
 fn win32(err: WIN32_ERROR) -> windows::core::Result<()> {
-    if err.is_ok() { Ok(()) } else { Err(windows::core::Error::from(err)) }
+    if err.is_ok() {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from(err))
+    }
 }
 
 // current exe, quoted — the exact text we store under the Run key
@@ -26,7 +30,7 @@ pub fn current_run_cmd() -> String {
     }
 }
 
-// stored Run-value text; None when the value is absent or unreadable
+// stored Run-value text; None when absent or unreadable
 // (which includes a path too long for the buffer)
 fn run_value() -> Option<String> {
     unsafe {
@@ -65,7 +69,13 @@ pub fn set_start_with_windows(on: bool) -> windows::core::Result<()> {
     unsafe {
         let mut hk = HKEY::default();
         let res = (|| -> windows::core::Result<()> {
-            win32(RegOpenKeyExW(HKEY_CURRENT_USER, RUN_SUBKEY, 0, REG_SAM_FLAGS(KEY_SET_VALUE.0 | KEY_READ.0), &mut hk))?;
+            win32(RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                RUN_SUBKEY,
+                0,
+                REG_SAM_FLAGS(KEY_SET_VALUE.0 | KEY_READ.0),
+                &mut hk,
+            ))?;
             if on {
                 let cmd = current_run_cmd();
                 let mut wide: Vec<u16> = cmd.encode_utf16().collect();
@@ -75,7 +85,10 @@ pub fn set_start_with_windows(on: bool) -> windows::core::Result<()> {
                     RUN_VALUE,
                     0,
                     REG_SZ,
-                    Some(std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)),
+                    Some(std::slice::from_raw_parts(
+                        wide.as_ptr() as *const u8,
+                        wide.len() * 2,
+                    )),
                 ))?;
             } else {
                 win32(RegDeleteValueW(hk, RUN_VALUE))?;
@@ -86,5 +99,27 @@ pub fn set_start_with_windows(on: bool) -> windows::core::Result<()> {
             let _ = RegCloseKey(hk);
         }
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Read-only: the exact text stored under HKCU\...\Run must be a quoted
+    // absolute exe path, or the installer and the tray toggle disagree and
+    // heal_start_with_windows rewrites it every launch.
+    // (Deliberately NOT tested: set_start_with_windows writes the dev's
+    // real autostart entry — never touch it from `cargo test`.)
+    #[test]
+    fn run_cmd_is_quoted_absolute_exe() {
+        let cmd = current_run_cmd();
+        assert!(cmd.starts_with('"') && cmd.ends_with('"'), "must be quoted: {cmd}");
+        let inner = &cmd[1..cmd.len() - 1];
+        assert!(inner.ends_with(".exe"), "must point at an exe: {cmd}");
+        assert!(
+            inner.len() > 4 && (inner.as_bytes()[1] == b':' || inner.starts_with(r"\\")),
+            "must be absolute: {cmd}"
+        );
     }
 }
