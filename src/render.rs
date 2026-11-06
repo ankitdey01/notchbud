@@ -7,8 +7,8 @@ use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
 use windows::core::{w, Interface, Result, PCWSTR};
+use windows::Win32::Foundation::{BOOL, HWND};
 use windows::Foundation::Numerics::Matrix3x2;
-use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry,
@@ -33,7 +33,7 @@ use windows::Win32::Graphics::DirectComposition::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_METRICS,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -145,6 +145,7 @@ pub struct Renderer {
     br_black: ID2D1SolidColorBrush, // island shell — always opaque
     br_text_hi: ID2D1SolidColorBrush, // content text + pill fill — fades
     br_btn_text: ID2D1SolidColorBrush, // pill label — fades, never touches the shell
+    br_select: ID2D1SolidColorBrush, // text-selection highlight — fades with content
 }
 
 // Hermite fit through (t0,v0,m0) -> (t1,v1,m1): returns [D, C, B, A] so that
@@ -333,6 +334,7 @@ impl Renderer {
             let br_black = mk_brush(island_bg())?;
             let br_text_hi = mk_brush(text_hi())?;
             let br_btn_text = mk_brush(island_bg())?;
+            let br_select = mk_brush(text_hi())?;
 
             Ok(Self {
                 dc,
@@ -358,6 +360,7 @@ impl Renderer {
                 br_black,
                 br_text_hi,
                 br_btn_text,
+                br_select,
             })
         }
     }
@@ -741,6 +744,7 @@ impl Renderer {
             if alpha > 0.0 {
                 self.br_text_hi.SetOpacity(alpha);
                 self.br_btn_text.SetOpacity(alpha);
+                self.br_select.SetOpacity(alpha * 0.32);
                 self.draw_content(ix, iw, ih, s, app);
             }
 
@@ -848,6 +852,14 @@ impl Renderer {
         if app.screen() != Screen::Chat {
             app.chat.max_scroll = 0.0;
             app.chat.scroll = 0.0;
+            // No selectable text off the Chat screen: drop the viewport so
+            // clicks and the I-beam never act on a stale rect. The sign-in
+            // screen draws no field either, so its geometry goes too (Home
+            // and Onboarding republish theirs via draw_field).
+            app.chat_viewport = None;
+            if app.screen() == Screen::SignIn {
+                app.input_field = None;
+            }
         }
     }
 
@@ -956,10 +968,12 @@ impl Renderer {
 
     /// Enter component: rounded outline field + single-line text with a caret,
     /// plus a drawn Enter glyph pinned to the right inside edge (strokes, no
-    /// font dependency). `text` is already caret-decorated ("Ankit▏");
-    /// `placeholder` shows when `text` is empty. Overlong lines reveal their
-    /// tail (where the caret is) instead of colliding with the glyph — the
-    /// island clip contains the head that slides out left.
+    /// font dependency). `raw` is the undecorated field text; `prefix` ("› "
+    /// or "") and the caret are layout decoration. `sel` is a highlight in
+    /// raw UTF-16 offsets (mapped past the prefix for drawing). Overlong
+    /// lines reveal their tail (where the caret is) instead of colliding
+    /// with the glyph — the island clip contains the head that slides out
+    /// left. Publishes the frame's geometry for mouse hit-testing.
     unsafe fn draw_field(
         &self,
         x: f32,
@@ -967,8 +981,11 @@ impl Renderer {
         w: f32,
         h: f32,
         s: f32,
-        text: &str,
-        placeholder: &str,
+        app: &mut App,
+        raw: &str,
+        prefix: &'static str,
+        placeholder: &'static str,
+        sel: Option<(usize, usize)>,
     ) {
         let field = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
@@ -988,18 +1005,17 @@ impl Renderer {
         // The glyph owns the right inside edge; text never runs under it.
         let glyph_right = x + w - 12.0 * s;
         self.draw_enter_glyph(glyph_right, y + h / 2.0, s);
-        let shown = if text.is_empty() {
-            format!("{placeholder}▏")
-        } else {
-            text.to_owned()
-        };
+        let shown = crate::state::field_shown(raw, prefix, placeholder);
         let pad_x = 16.0 * s;
         let inner = (glyph_right - 10.0 * s - (x + pad_x)).max(1.0);
         if let Ok(l) = self.layout(&shown, &self.tf_hi, 4000.0, h) {
             let mut m = DWRITE_TEXT_METRICS::default();
             let (tw, th) = match l.GetMetrics(&mut m) {
                 Ok(()) => (m.width, m.height),
-                Err(_) => return,
+                Err(_) => {
+                    app.input_field = None;
+                    return;
+                }
             };
             // Tail-visible: long lines shift left so the caret stays in view.
             let mut tx = x + pad_x;
@@ -1009,12 +1025,54 @@ impl Renderer {
             // Tail-visible: long lines shift left so the caret stays in view;
             // the island mask clips the head that hangs past the field edge.
             let ty = y + ((h - th) / 2.0).max(0.0);
+            // Highlight behind the text, same wash as the chat viewport.
+            if let Some((a, b)) = sel {
+                if b > a {
+                    let pu = prefix.encode_utf16().count() as u32;
+                    let total = shown.encode_utf16().count() as u32;
+                    let la = (a as u32 + pu).min(total);
+                    let lb = (b as u32 + pu).min(total);
+                    if lb > la {
+                        let mut need = 0u32;
+                        let _ = l.HitTestTextRange(la, lb - la, tx, ty, None, &mut need);
+                        if need > 0 {
+                            let mut metrics: Vec<DWRITE_HIT_TEST_METRICS> =
+                                vec![std::mem::zeroed(); need as usize];
+                            let mut got = 0u32;
+                            if l
+                                .HitTestTextRange(la, lb - la, tx, ty, Some(&mut metrics), &mut got)
+                                .is_ok()
+                            {
+                                for hm in metrics.iter().take(got as usize) {
+                                    self.rt.FillRectangle(
+                                        &D2D_RECT_F {
+                                            left: hm.left,
+                                            top: hm.top,
+                                            right: hm.left + hm.width,
+                                            bottom: hm.top + hm.height,
+                                        },
+                                        &self.br_select,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             self.rt.DrawTextLayout(
                 D2D_POINT_2F { x: tx, y: ty },
                 &l,
                 &self.br_text_hi,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
+            app.input_field = Some(crate::state::InputFieldGeom {
+                rect: [x, y, x + w, y + h],
+                origin: [tx, ty],
+                prefix,
+                placeholder,
+            });
+        } else {
+            app.input_field = None;
         }
     }
 
@@ -1058,30 +1116,6 @@ impl Renderer {
         lines.join("\n")
     }
 
-    /// History + live stream lines for the Chat section (no status, no input,
-    /// no pill — those are separate sections below it).
-    fn history_text(app: &App) -> String {
-        use crate::state::{Role, Screen};
-        debug_assert_eq!(app.screen(), Screen::Chat);
-        let mut lines: Vec<String> = Vec::new();
-        for (role, text) in &app.chat.history {
-            match role {
-                Role::User => lines.push(format!("› {text}")),
-                Role::Assistant => lines.push(text.clone()),
-            }
-        }
-        if app.chat.streaming {
-            if app.chat.stream.is_empty() {
-                lines.push("…".into()); // first delta hasn't arrived yet
-            } else {
-                lines.push(app.chat.stream.clone());
-            }
-        } else if !app.chat.stream.is_empty() {
-            lines.push(app.chat.stream.clone());
-        }
-        lines.join("\n")
-    }
-
     // ---------- sections ----------
 
     /// Onboarding: title + name field, vertically centered as one column.
@@ -1116,12 +1150,10 @@ impl Renderer {
         let field_x = ix + (iw - field_w) / 2.0;
         let field_y = cy;
         let draft = app.name_draft.clone();
-        let caret = if draft.is_empty() {
-            String::new()
-        } else {
-            format!("{draft}▏")
-        };
-        self.draw_field(field_x, field_y, field_w, field_h, s, &caret, PLACEHOLDER);
+        let sel = app.name_sel.normalized(&draft);
+        self.draw_field(
+            field_x, field_y, field_w, field_h, s, app, &draft, "", PLACEHOLDER, sel,
+        );
         cy = field_y + field_h + 8.0 * s;
 
         if let Some(err) = app.name_error.clone() {
@@ -1269,26 +1301,30 @@ impl Renderer {
 
         // Chat field (Enter component).
         let field_w = maxw;
-        let input_line = if app.chat.input.is_empty() {
-            String::new()
-        } else {
-            format!("› {}▏", app.chat.input)
-        };
+        let raw = app.chat.input.clone();
+        let sel = app.chat.input_sel.normalized(&raw);
         self.draw_field(
             field_x,
             field_y,
             field_w,
             field_h,
             s,
-            &input_line,
+            app,
+            &raw,
+            "› ",
             CHAT_PLACEHOLDER,
+            sel,
         );
     }
 
     /// Chat: signed in and chatting — history/stream viewport on top, chat
     /// field pinned at the bottom. The pill never appears here: losing the
     /// connection routes the frame back to SignIn (which keeps the history).
+    /// The viewport text is mouse-selectable: drag highlights it (Ctrl+C
+    /// copies the highlight, else the whole transcript).
     unsafe fn draw_chat(&self, ix: f32, iw: f32, ih: f32, s: f32, app: &mut App) {
+        use crate::state::Screen;
+        debug_assert_eq!(app.screen(), Screen::Chat);
         const CHAT_PLACEHOLDER: &str = "Ask anything…";
         let maxw = iw - 48.0 * s;
 
@@ -1302,18 +1338,14 @@ impl Renderer {
         let viewport_top = 10.0 * s;
         let viewport_bottom = field_y - 8.0 * s;
         let viewport = (viewport_bottom - viewport_top).max(1.0);
+        // Published for select-drag hit gating + the I-beam cursor; cleared
+        // on every non-Chat frame by draw_content.
+        app.chat_viewport = Some([ix, viewport_top, ix + iw, viewport_bottom]);
 
         // Status above history; both bottom-anchored. Wheel scroll reveals
-        // older lines.
-        let status_block = Self::status_text(app);
-        let mut full = Self::history_text(app);
-        if !status_block.is_empty() {
-            full = if full.is_empty() {
-                status_block
-            } else {
-                format!("{status_block}\n{full}")
-            };
-        }
+        // older lines. Single source with hit-testing: caret_from_point
+        // rebuilds this exact string, width, and origin.
+        let full = app.chat.viewport_text();
         if !full.is_empty() {
             if let Ok(l) = self.layout(&full, &self.tf_hi, maxw, 4000.0) {
                 let mut m = DWRITE_TEXT_METRICS::default();
@@ -1341,6 +1373,47 @@ impl Renderer {
                     },
                     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 );
+                // Selection highlight first (white wash), text over it —
+                // clipped to the viewport like the text itself.
+                if let Some((spos, epos)) = app.chat.normalized_selection() {
+                    let mut need = 0u32;
+                    let _ = l.HitTestTextRange(
+                        spos as u32,
+                        (epos - spos) as u32,
+                        x,
+                        y,
+                        None,
+                        &mut need,
+                    );
+                    if need > 0 {
+                        let mut metrics: Vec<DWRITE_HIT_TEST_METRICS> =
+                            vec![std::mem::zeroed(); need as usize];
+                        let mut got = 0u32;
+                        if l
+                            .HitTestTextRange(
+                                spos as u32,
+                                (epos - spos) as u32,
+                                x,
+                                y,
+                                Some(&mut metrics),
+                                &mut got,
+                            )
+                            .is_ok()
+                        {
+                            for hm in metrics.iter().take(got as usize) {
+                                self.rt.FillRectangle(
+                                    &D2D_RECT_F {
+                                        left: hm.left,
+                                        top: hm.top,
+                                        right: hm.left + hm.width,
+                                        bottom: hm.top + hm.height,
+                                    },
+                                    &self.br_select,
+                                );
+                            }
+                        }
+                    }
+                }
                 self.rt.DrawTextLayout(
                     D2D_POINT_2F { x, y },
                     &l,
@@ -1354,19 +1427,112 @@ impl Renderer {
             app.chat.scroll = 0.0;
         }
 
-        let input_line = if app.chat.input.is_empty() {
-            String::new()
-        } else {
-            format!("› {}▏", app.chat.input)
-        };
+        let raw = app.chat.input.clone();
+        let sel = app.chat.input_sel.normalized(&raw);
         self.draw_field(
             field_x,
             field_y,
             field_w,
             field_h,
             s,
-            &input_line,
+            app,
+            &raw,
+            "› ",
             CHAT_PLACEHOLDER,
+            sel,
         );
     }
+}
+
+/// Map a window-px point to a UTF-16 caret offset in the Chat viewport
+/// text. Rebuilds the exact layout draw_chat draws (same string, same
+/// width, same bottom-anchored origin incl. the scroll clamp) so a
+/// select-drag lands on glyphs. None outside the viewport, off the Chat
+/// screen, or when there is no text.
+pub fn caret_from_point(app: &App, px: f32, py: f32) -> Option<usize> {
+    use crate::state::{utf16_len, Screen, ISLAND_H, ISLAND_W, ISLAND_X};
+    if app.screen() != Screen::Chat {
+        return None;
+    }
+    let s = app.scale;
+    let ix = ISLAND_X * s;
+    let iw = ISLAND_W * s;
+    let ih = ISLAND_H * s;
+    let maxw = iw - 48.0 * s;
+    let field_h = 32.0 * s;
+    let field_y = ih - field_h - 10.0 * s;
+    let viewport_top = 10.0 * s;
+    let viewport_bottom = field_y - 8.0 * s;
+    if py < viewport_top || py > viewport_bottom || px < ix || px > ix + iw {
+        return None;
+    }
+    let full = app.chat.viewport_text();
+    if full.is_empty() {
+        return None;
+    }
+    SLOT.with_borrow(|slot| {
+        let rd = slot.as_ref()?;
+        unsafe {
+            let l = rd.layout(&full, &rd.tf_hi, maxw, 4000.0).ok()?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            l.GetMetrics(&mut m).ok()?;
+            let viewport = (viewport_bottom - viewport_top).max(1.0);
+            let max_scroll = (m.height - viewport).max(0.0);
+            let scroll = app.chat.scroll.clamp(0.0, max_scroll);
+            let x = ix + 24.0 * s;
+            let y = viewport_bottom - m.height + scroll;
+            // HitTestPoint takes layout-space coords: the drawn origin off.
+            let mut trailing = BOOL::default();
+            let mut inside = BOOL::default();
+            let mut hm: DWRITE_HIT_TEST_METRICS = std::mem::zeroed();
+            l.HitTestPoint(px - x, py - y, &mut trailing, &mut inside, &mut hm)
+                .ok()?;
+            let pos = hm.textPosition as usize + ((trailing.0 != 0) as usize);
+            Some(pos.min(utf16_len(&full)))
+        }
+    })
+}
+
+/// Map a window-px point to a UTF-16 caret offset in the visible input
+/// field's raw text (name prompt or chat input). Uses the geometry
+/// draw_field published this frame plus the same shown string, so a
+/// select-drag lands on glyphs even when a long line is tail-shifted.
+/// None outside the field, on the SignIn screen, or when the field is
+/// empty (the placeholder is not selectable).
+pub fn field_caret_from_point(app: &App, px: f32, py: f32) -> Option<usize> {
+    use crate::state::{field_shown, utf16_len, Screen};
+    let g = app.input_field.as_ref()?;
+    if px < g.rect[0] || px >= g.rect[2] || py < g.rect[1] || py >= g.rect[3] {
+        return None;
+    }
+    let raw: &str = match app.screen() {
+        Screen::Onboarding => &app.name_draft,
+        Screen::Home | Screen::Chat => &app.chat.input,
+        Screen::SignIn => return None,
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    let shown = field_shown(raw, g.prefix, g.placeholder);
+    let pu = g.prefix.encode_utf16().count();
+    SLOT.with_borrow(|slot| {
+        let rd = slot.as_ref()?;
+        unsafe {
+            let h = (g.rect[3] - g.rect[1]).max(1.0);
+            let l = rd.layout(&shown, &rd.tf_hi, 4000.0, h).ok()?;
+            let mut trailing = BOOL::default();
+            let mut inside = BOOL::default();
+            let mut hm: DWRITE_HIT_TEST_METRICS = std::mem::zeroed();
+            l.HitTestPoint(
+                px - g.origin[0],
+                py - g.origin[1],
+                &mut trailing,
+                &mut inside,
+                &mut hm,
+            )
+            .ok()?;
+            let pos = hm.textPosition as usize + ((trailing.0 != 0) as usize);
+            Some(pos.saturating_sub(pu).min(utf16_len(raw)))
+        }
+    })
 }

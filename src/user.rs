@@ -1,7 +1,7 @@
 // user.rs — first-run identity: the name the island greets with.
 //
 // Stored as plain JSON at %APPDATA%\notchbud\user.json (not a credential):
-//   {"v":1,"name":"Ankit"}
+//   {"v":1,"name":"Alex"}
 // Missing file, unreadable file, invalid JSON, or a blank name all mean the
 // same thing to the UI: onboarding (ask for the name). Deleting the file
 // manually just re-runs onboarding next launch.
@@ -29,7 +29,7 @@ pub fn normalize_name(raw: &str) -> Option<String> {
         return None;
     }
     // Collapse surrounding whitespace; keep inner spacing but squeeze runs so
-    // "  Ankit   Kumar  " greets as "Ankit Kumar".
+    // "  Alex   Kumar  " greets as "Alex Kumar".
     let mut parts: Vec<&str> = Vec::new();
     for word in raw.split_whitespace() {
         if !word.is_empty() {
@@ -65,7 +65,7 @@ pub fn load_name_from(path: &Path) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    // Preferred shape: {"name":"Ankit",...}. A leading '{' or '"' that fails
+    // Preferred shape: {"name":"Alex",...}. A leading '{' or '"' that fails
     // to parse is corruption, not a name — never greet with broken JSON.
     // Anything else is treated as a bare name file (hand edits, older
     // builds) so we never re-ask needlessly.
@@ -138,8 +138,38 @@ pub fn local_hour() -> u32 {
     (t.wHour as u32) % 24
 }
 
+/// Title-case for display: first letter of every word in caps, everything
+/// else untouched — so "José-O'Brien Jr." and "McDonald" survive intact
+/// while "alex kumar" greets as "Alex Kumar". Words start after whitespace,
+/// hyphens, and apostrophes ("anne-marie" -> "Anne-Marie").
+pub fn title_case_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut word_start = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            word_start = true;
+            out.push(ch);
+        } else if word_start && ch.is_alphabetic() {
+            // Uppercase the head only (some lowercases expand, e.g. ß->SS).
+            let mut up = ch.to_uppercase();
+            out.push(up.next().unwrap_or(ch));
+            out.extend(up);
+            word_start = false;
+        } else {
+            if ch == '-' || ch == '\'' || ch == '’' {
+                word_start = true;
+            } else {
+                word_start = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Pure greeting picker (injected hour -> unit-testable). Boundaries match the
 /// everyday sense: 5–11 morning, 12–16 afternoon, 17–21 evening, else night.
+/// Displayed title-cased: "Good Evening, Alex Kumar".
 pub fn greeting_for_hour(hour: u32, name: &str) -> String {
     let h = hour % 24;
     let part = if (5..12).contains(&h) {
@@ -152,13 +182,13 @@ pub fn greeting_for_hour(hour: u32, name: &str) -> String {
         "Good night"
     };
     if name.is_empty() {
-        part.to_owned()
+        title_case_words(part)
     } else {
-        format!("{part}, {name}")
+        title_case_words(&format!("{part}, {name}"))
     }
 }
 
-/// Greeting for right now: "Good evening, Ankit" at 7pm, etc.
+/// Greeting for right now: "Good Evening, Alex" at 7pm, etc.
 pub fn greeting_now(name: &str) -> String {
     greeting_for_hour(local_hour(), name)
 }
@@ -169,8 +199,8 @@ mod tests {
 
     #[test]
     fn trims_and_squeezes_spaces() {
-        assert_eq!(normalize_name("  Ankit   Kumar  "), Some("Ankit Kumar".into()));
-        assert_eq!(normalize_name("Ankit"), Some("Ankit".into()));
+        assert_eq!(normalize_name("  Alex   Kumar  "), Some("Alex Kumar".into()));
+        assert_eq!(normalize_name("Alex"), Some("Alex".into()));
     }
 
     #[test]
@@ -185,7 +215,7 @@ mod tests {
     #[test]
     fn accepts_international_names() {
         assert_eq!(normalize_name("José-O'Brien Jr."), Some("José-O'Brien Jr.".into()));
-        assert_eq!(normalize_name("अंकित"), Some("अंकित".into()));
+        assert_eq!(normalize_name("张伟"), Some("张伟".into()));
     }
 
     // Scratch space under the workspace target/ dir: spawned test processes
@@ -200,16 +230,31 @@ mod tests {
 
     #[test]
     fn greeting_boundaries() {
-        assert_eq!(greeting_for_hour(4, "Ankit"), "Good night, Ankit");
-        assert_eq!(greeting_for_hour(5, "Ankit"), "Good morning, Ankit");
-        assert_eq!(greeting_for_hour(11, "Ankit"), "Good morning, Ankit");
-        assert_eq!(greeting_for_hour(12, "Ankit"), "Good afternoon, Ankit");
-        assert_eq!(greeting_for_hour(16, "Ankit"), "Good afternoon, Ankit");
-        assert_eq!(greeting_for_hour(17, "Ankit"), "Good evening, Ankit");
-        assert_eq!(greeting_for_hour(19, "Ankit"), "Good evening, Ankit");
-        assert_eq!(greeting_for_hour(21, "Ankit"), "Good evening, Ankit");
-        assert_eq!(greeting_for_hour(22, "Ankit"), "Good night, Ankit");
-        assert_eq!(greeting_for_hour(0, "Ankit"), "Good night, Ankit");
+        assert_eq!(greeting_for_hour(4, "Alex"), "Good Night, Alex");
+        assert_eq!(greeting_for_hour(5, "Alex"), "Good Morning, Alex");
+        assert_eq!(greeting_for_hour(11, "Alex"), "Good Morning, Alex");
+        assert_eq!(greeting_for_hour(12, "Alex"), "Good Afternoon, Alex");
+        assert_eq!(greeting_for_hour(16, "Alex"), "Good Afternoon, Alex");
+        assert_eq!(greeting_for_hour(17, "Alex"), "Good Evening, Alex");
+        assert_eq!(greeting_for_hour(19, "Alex"), "Good Evening, Alex");
+        assert_eq!(greeting_for_hour(21, "Alex"), "Good Evening, Alex");
+        assert_eq!(greeting_for_hour(22, "Alex"), "Good Night, Alex");
+        assert_eq!(greeting_for_hour(0, "Alex"), "Good Night, Alex");
+    }
+
+    #[test]
+    fn greeting_title_cases_every_word() {
+        // Lowercase names greet capped; the day part too.
+        assert_eq!(greeting_for_hour(19, "alex kumar"), "Good Evening, Alex Kumar");
+        assert_eq!(greeting_for_hour(9, ""), "Good Morning");
+        // Already-capped names pass through untouched — never lowercased.
+        assert_eq!(
+            greeting_for_hour(19, "José-O'Brien Jr."),
+            "Good Evening, José-O'Brien Jr."
+        );
+        assert_eq!(greeting_for_hour(19, "McDonald"), "Good Evening, McDonald");
+        assert_eq!(greeting_for_hour(19, "anne-marie"), "Good Evening, Anne-Marie");
+        assert_eq!(greeting_for_hour(19, "o'brien"), "Good Evening, O'Brien");
     }
 
     #[test]
@@ -217,8 +262,8 @@ mod tests {
         let dir = test_scratch_dir("roundtrip");
         let path = dir.join("user.json");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(save_name_to(&path, "  Ankit  "), Ok("Ankit".into()));
-        assert_eq!(load_name_from(&path), Some("Ankit".into()));
+        assert_eq!(save_name_to(&path, "  Alex  "), Ok("Alex".into()));
+        assert_eq!(load_name_from(&path), Some("Alex".into()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -234,8 +279,8 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         assert_eq!(load_name_from(&path), None);
         // Bare-name fallback still works.
-        std::fs::write(&path, "Ankit").unwrap();
-        assert_eq!(load_name_from(&path), Some("Ankit".into()));
+        std::fs::write(&path, "Alex").unwrap();
+        assert_eq!(load_name_from(&path), Some("Alex".into()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

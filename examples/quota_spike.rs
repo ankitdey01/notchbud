@@ -81,7 +81,7 @@ fn main() {
     };
     println!("trying model {model} …");
     let history = [Msg { role: Role::User, text: "Reply with the single word: OK".into() }];
-    let res = chat::stream_chat(&tokens, &model, &history, |ev| match ev {
+    let res = chat::stream_chat(&tokens, &model, &history, None, |ev| match ev {
         chat::StreamEvent::Delta(d) => {
             print!("{d}");
             true

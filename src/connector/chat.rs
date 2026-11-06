@@ -333,7 +333,7 @@ mod tests {
                     text: "hey".into(),
                 },
             ],
-            Some("Ankit"),
+            Some("Alex"),
         );
         assert_eq!(body["model"], "gpt-6.1-sol");
         assert_eq!(body["stream"], true);
@@ -344,14 +344,14 @@ mod tests {
         assert_eq!(body["input"][1]["content"], "hey");
         // The saved name rides every request so the model knows its user.
         let instructions = body["instructions"].as_str().unwrap();
-        assert!(instructions.contains("\"Ankit\""), "{instructions}");
+        assert!(instructions.contains("\"Alex\""), "{instructions}");
     }
 
     #[test]
     fn instructions_name_rules() {
         // Named, blank, and missing all behave: name quoted, no name, no name.
-        let named = instructions_for(Some("Ankit"));
-        assert!(named.contains("called \"Ankit\""), "{named}");
+        let named = instructions_for(Some("Alex"));
+        assert!(named.contains("called \"Alex\""), "{named}");
         assert!(named.starts_with(INSTRUCTIONS));
         assert_eq!(instructions_for(Some("   ")), INSTRUCTIONS);
         assert_eq!(instructions_for(None), INSTRUCTIONS);

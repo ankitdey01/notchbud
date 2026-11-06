@@ -14,7 +14,7 @@ mod tray;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 use windows::core::{w, Result};use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, MonitorFromPoint, SetWindowRgn, ValidateRect, MONITOR_DEFAULTTOPRIMARY,
@@ -27,18 +27,19 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardState, ToUnicode, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN,
+    GetAsyncKeyState, GetKeyboardState, ReleaseCapture, SetCapture, ToUnicode, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN,
+    VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, GetWindowRect, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SetWindowsHookExW, SetWindowLongPtrW, SetTimer,
-    SetWindowPos, GetWindowLongPtrW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
-    GWLP_USERDATA, HHOOK, HTCLIENT, HTTRANSPARENT, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos,
+    GetMessageW, GetSystemMetrics, GetWindowRect, KillTimer, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetCursor, SetWindowsHookExW,
+    SetWindowLongPtrW, SetTimer, SetWindowPos, GetWindowLongPtrW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
+    GWLP_USERDATA, HHOOK, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_IBEAM, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
     SM_CXSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WNDCLASSEXW, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
+    WH_MOUSE_LL, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_TIMER,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
@@ -59,6 +60,12 @@ const WM_KEY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 11; // key
 const WM_WHEEL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12; // mouse hook wheel
 /// Chat scroll per wheel notch, in layout units (draw multiplies by scale).
 const WHEEL_STEP: f32 = 48.0;
+// WM_KEY codes for the island clipboard shortcuts (past the Unicode range
+// so they never collide with typed characters).
+const KEY_COPY: usize = 0x110000; // Ctrl+C / Ctrl+Insert: copy highlight, else transcript
+const KEY_SELECT_ALL: usize = 0x110001; // Ctrl+A: highlight the whole viewport
+const KEY_CUT: usize = 0x110002; // Ctrl+X / Shift+Delete: cut field highlight to clipboard
+const KEY_PASTE: usize = 0x110003; // Ctrl+V / Shift+Insert: paste clipboard into the field
 // WM_CHAT wparam codes (lp carries a Box pointer where noted)
 const CHAT_DELTA: usize = 0; // *String
 const CHAT_DONE: usize = 1;
@@ -137,17 +144,61 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     let is_down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
     if code >= 0 && is_down && ISLAND_ACTIVE.load(Ordering::Acquire) {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let post = |c: usize| {
+            let _ = PostMessageW(
+                HWND(HOOK_HWND.load(Ordering::Relaxed) as *mut _),
+                WM_KEY,
+                WPARAM(c),
+                LPARAM(0),
+            );
+        };
+        let ctrl_down = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
+        let alt_down = GetAsyncKeyState(VK_MENU.0 as i32) < 0;
+        let shift_down = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
+        // Island clipboard shortcuts work inside the island and never reach
+        // the app behind it. Other Ctrl/Alt chords still pass through.
+        if ctrl_down && !alt_down {
+            match kb.vkCode {
+                0x43 | 0x2D => {
+                    // C, Insert
+                    post(KEY_COPY);
+                    return LRESULT(1);
+                }
+                0x41 => {
+                    // A
+                    post(KEY_SELECT_ALL);
+                    return LRESULT(1);
+                }
+                0x58 => {
+                    // X
+                    post(KEY_CUT);
+                    return LRESULT(1);
+                }
+                0x56 => {
+                    // V
+                    post(KEY_PASTE);
+                    return LRESULT(1);
+                }
+                _ => {}
+            }
+        } else if shift_down && !ctrl_down && !alt_down {
+            match kb.vkCode {
+                0x2D => {
+                    // Shift+Insert: paste
+                    post(KEY_PASTE);
+                    return LRESULT(1);
+                }
+                0x2E => {
+                    // Shift+Delete: cut
+                    post(KEY_CUT);
+                    return LRESULT(1);
+                }
+                _ => {}
+            }
+        }
         // only plain typing: no Ctrl/Alt chords (shortcuts pass through)
-        if GetAsyncKeyState(VK_CONTROL.0 as i32) >= 0 && GetAsyncKeyState(VK_MENU.0 as i32) >= 0 {
+        if !ctrl_down && !alt_down {
             let vk = kb.vkCode as u32;
-            let post = |c: usize| {
-                let _ = PostMessageW(
-                    HWND(HOOK_HWND.load(Ordering::Relaxed) as *mut _),
-                    WM_KEY,
-                    WPARAM(c),
-                    LPARAM(0),
-                );
-            };
             match vk {
                 8 | 13 | 27 => { // VK_BACK VK_RETURN VK_ESCAPE
                     post(vk as usize);
@@ -205,6 +256,28 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+/// Visible input field selection for the current screen (name prompt or
+/// chat line); None on SignIn, which draws no field.
+fn field_sel_mut(app: &mut state::App) -> Option<&mut state::FieldSel> {
+    match app.screen() {
+        state::Screen::Onboarding => Some(&mut app.name_sel),
+        state::Screen::Home | state::Screen::Chat => Some(&mut app.chat.input_sel),
+        state::Screen::SignIn => None,
+    }
+}
+
+/// End a field select-drag: a zero-length tap clears the highlight.
+fn end_field_drag(sel: &mut state::FieldSel) {
+    sel.dragging = false;
+    if let Some((a, b)) = sel.range {
+        if a == b {
+            sel.clear();
+        }
+    } else {
+        sel.anchor = None;
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = app_from(hwnd) else {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -229,7 +302,92 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
 
+        WM_SETCURSOR => {
+            // I-beam over selectable text (chat history or the input line),
+            // arrow everywhere else. Handled here — not on MOUSEMOVE — so
+            // DefWindowProc can't flicker it back to the class arrow.
+            if (lparam.0 & 0xFFFF) == HTCLIENT as isize {
+                let mut cpos = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut cpos).is_ok() {
+                    // Cached window origin, no GetWindowRect per mouse move.
+                    let (px, py) =
+                        ((cpos.x - app.win_x) as f32, (cpos.y - app.win_y) as f32);
+                    let over_viewport = app.chat_viewport.is_some_and(|r| {
+                        px >= r[0] && px < r[2] && py >= r[1] && py < r[3]
+                    });
+                    let over_field = app.input_field.as_ref().is_some_and(|g| {
+                        px >= g.rect[0] && px < g.rect[2] && py >= g.rect[1] && py < g.rect[3]
+                    });
+                    let id = if over_viewport || over_field {
+                        IDC_IBEAM
+                    } else {
+                        IDC_ARROW
+                    };
+                    if let Ok(cur) = LoadCursorW(None, id) {
+                        let _ = SetCursor(cur);
+                        return LRESULT(1);
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
         WM_MOUSEMOVE => {
+            let pt = state::client_pt(lparam);
+            let (px, py) = (pt.x as f32, pt.y as f32);
+            // Input-field drag first (name prompt or chat line): clamped
+            // into the field rect so dragging out selects to the end.
+            if app.chat.input_sel.dragging || app.name_sel.dragging {
+                if (wparam.0 & 1) != 0 {
+                    if let Some(g) = app.input_field.as_ref() {
+                        let cx = px.clamp(g.rect[0], (g.rect[2] - 1.0).max(g.rect[0]));
+                        let cy = py.clamp(g.rect[1], (g.rect[3] - 1.0).max(g.rect[1]));
+                        if let Some(pos) = render::field_caret_from_point(app, cx, cy) {
+                            if let Some(sel) = field_sel_mut(app) {
+                                let anchor = sel.anchor.unwrap_or(pos);
+                                sel.range = Some((anchor.min(pos), anchor.max(pos)));
+                                render::draw_now(app);
+                            }
+                        }
+                    }
+                } else {
+                    // Button released without a LBUTTONUP: end the drags
+                    // rather than sticking.
+                    end_field_drag(&mut app.chat.input_sel);
+                    end_field_drag(&mut app.name_sel);
+                    let _ = ReleaseCapture();
+                    render::draw_now(app);
+                }
+            // Select-drag extension while the button is held (capture keeps
+            // moves coming even past the island edge; clamp to the viewport
+            // so dragging out selects to the nearest end).
+            } else if app.chat.selecting {
+                if (wparam.0 & 1) != 0 {
+                    if app.screen() == state::Screen::Chat {
+                        if let Some(vp) = app.chat_viewport {
+                            let cx = px.clamp(vp[0], (vp[2] - 1.0).max(vp[0]));
+                            let cy = py.clamp(vp[1], (vp[3] - 1.0).max(vp[1]));
+                            if let Some(pos) = render::caret_from_point(app, cx, cy) {
+                                let anchor = app.chat.selection_anchor.unwrap_or(pos);
+                                app.chat.selection =
+                                    Some((anchor.min(pos), anchor.max(pos)));
+                                render::draw_now(app);
+                            }
+                        }
+                    }
+                } else {
+                    // Button released without a LBUTTONUP (hook ate it, or
+                    // capture broke): end the drag rather than sticking.
+                    app.chat.selecting = false;
+                    if let Some((a, b)) = app.chat.selection {
+                        if a == b {
+                            app.chat.clear_selection();
+                        }
+                    }
+                    let _ = ReleaseCapture();
+                    render::draw_now(app);
+                }
+            }
             if !app.mouse_inside {
                 app.mouse_inside = true;
                 let mut tme = TRACKMOUSEEVENT {
@@ -254,6 +412,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_MOUSELEAVE => {
+            // A select-drag owns the island: leaving mid-drag must not
+            // collapse it (or cancel the stream being copied).
+            if app.chat.selecting || app.chat.input_sel.dragging || app.name_sel.dragging {
+                app.mouse_inside = false;
+                return LRESULT(0);
+            }
             app.mouse_inside = false;
             ISLAND_ACTIVE.store(false, Ordering::Release);
             app.expanded = false;
@@ -276,17 +440,95 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
-        WM_LBUTTONUP => {
-            // Only the sign-in pill is clickable: it starts the
-            // browser-based ChatGPT sign-in (same as tray Connect).
-            // Onboarding has no button (Enter submits); everywhere else
-            // typing + wheel drive the island.
+        WM_LBUTTONDOWN => {
             let pt = state::client_pt(lparam);
             let (px, py) = (pt.x as f32, pt.y as f32);
-            if app.screen() == state::Screen::SignIn
+            // Input field first (name prompt or chat line): begin a
+            // select-drag. The field sits below the viewport; rects are
+            // disjoint.
+            if let Some(pos) = render::field_caret_from_point(app, px, py) {
+                if let Some(sel) = field_sel_mut(app) {
+                    sel.dragging = true;
+                    sel.anchor = Some(pos);
+                    sel.range = Some((pos, pos));
+                    let _ = SetCapture(hwnd);
+                    render::draw_now(app);
+                }
+                LRESULT(0)
+            // Chat viewport: begin a select-drag. Anywhere else on the Chat
+            // screen (padding): drop the highlight.
+            } else if app.screen() == state::Screen::Chat {
+                if let Some(vp) = app.chat_viewport {
+                    if px >= vp[0] && px < vp[2] && py >= vp[1] && py < vp[3] {
+                        if let Some(pos) = render::caret_from_point(app, px, py) {
+                            app.chat.selecting = true;
+                            app.chat.selection_anchor = Some(pos);
+                            app.chat.selection = Some((pos, pos));
+                            let _ = SetCapture(hwnd);
+                            render::draw_now(app);
+                        }
+                        LRESULT(0)
+                    } else {
+                        if app.chat.selection.is_some()
+                            || app.chat.selection_anchor.is_some()
+                        {
+                            app.chat.clear_selection();
+                            render::draw_now(app);
+                        }
+                        LRESULT(0)
+                    }
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            } else {
+                // Clicking elsewhere on a field screen drops the field
+                // highlight; SignIn keeps default handling (pill uses UP).
+                let mut changed = false;
+                if let Some(sel) = field_sel_mut(app) {
+                    if sel.range.is_some() || sel.anchor.is_some() {
+                        sel.clear();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    render::draw_now(app);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
+        }
+
+        WM_LBUTTONUP => {
+            // End of a field select-drag: a zero-length tap clears it.
+            if app.chat.input_sel.dragging || app.name_sel.dragging {
+                end_field_drag(&mut app.chat.input_sel);
+                end_field_drag(&mut app.name_sel);
+                let _ = ReleaseCapture();
+                render::draw_now(app);
+                return LRESULT(0);
+            }
+            // End of a viewport select-drag: a zero-length tap clears it.
+            if app.chat.selecting {
+                app.chat.selecting = false;
+                let _ = ReleaseCapture();
+                if let Some((a, b)) = app.chat.selection {
+                    if a == b {
+                        app.chat.clear_selection();
+                    }
+                } else {
+                    app.chat.selection_anchor = None;
+                }
+                render::draw_now(app);
+                return LRESULT(0);
+            } else if app.screen() == state::Screen::SignIn
                 && app.chat.shows_signin_button()
                 && !app.chat.signing_in
             {
+                // Only the sign-in pill is clickable: it starts the
+                // browser-based ChatGPT sign-in (same as tray Connect).
+                let pt = state::client_pt(lparam);
+                let (px, py) = (pt.x as f32, pt.y as f32);
                 let on_pill = app.signin_rect.is_some_and(|r| state::App::hit(&r, px, py));
                 // Lenient: the pill is the visual, but the whole island stays
                 // actionable so a first-timer cannot miss.
@@ -444,6 +686,8 @@ fn disconnect(app: &mut state::App) {
     app.chat.stream.clear();
     app.chat.history.clear();
     app.chat.notice = None;
+    app.chat.clear_selection();
+    app.chat.input_sel.clear();
     CHAT_CANCEL.store(true, Ordering::Release);
     app.chat.error = Some("Disconnected from ChatGPT.".into());
     render::draw_now(app);
@@ -561,6 +805,36 @@ fn copy_text_to_clipboard(text: &str) -> bool {
     }
 }
 
+/// Read Unicode text off the clipboard (for field paste). System-owned
+/// handle: lock/unlock only, never freed.
+fn get_clipboard_text() -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let text = (|| {
+            let h = GetClipboardData(13 /* CF_UNICODETEXT */).ok()?;
+            let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(p, len);
+            let s = String::from_utf16(slice).ok();
+            let _ = GlobalUnlock(HGLOBAL(h.0));
+            s
+        })();
+        let _ = CloseClipboard();
+        text
+    }
+}
+
 /// Open the URL the way any app opens a link: hand it to the OS, which
 /// routes it to the already-running default browser.
 fn open_browser(url: &str) {
@@ -583,7 +857,70 @@ fn open_browser(url: &str) {
 /// WM_KEY from the hook: onboarding edits the name field, otherwise the chat
 /// input line. Enter submits. Chat keys only work while signed in — a
 /// signed-out island shows just the sign-in pill, with nothing to type in.
+/// Field shortcuts: Ctrl+C copies the field highlight (else the transcript
+/// on Chat / the whole line elsewhere), Ctrl+X cuts it, Ctrl+V pastes,
+/// Ctrl+A selects the line first, then the transcript.
 fn handle_chat_key(app: &mut state::App, code: usize) {
+    if code == KEY_COPY || code == KEY_SELECT_ALL || code == KEY_CUT || code == KEY_PASTE {
+        // CUT/PASTE edit the visible input line: needs a field and no
+        // running stream (typing is gated the same way).
+        if code == KEY_CUT || code == KEY_PASTE {
+            if app.needs_onboarding() || !app.chat.connected() || app.chat.streaming {
+                return;
+            }
+            if code == KEY_CUT {
+                if let Some(removed) = app.chat.input_sel.delete_selected(&mut app.chat.input) {
+                    copy_text_to_clipboard(&removed);
+                    app.chat.error = None;
+                    render::draw_now(app);
+                }
+            } else if let Some(clip) = get_clipboard_text() {
+                app.chat
+                    .input_sel
+                    .replace_selected(&mut app.chat.input, &clip, 400);
+                app.chat.error = None;
+                render::draw_now(app);
+            }
+            return;
+        }
+        // Input highlight wins over the viewport for copy; select-all takes
+        // the line first and the transcript on the repeat.
+        if code == KEY_COPY {
+            if let Some(t) = app.chat.input_sel.selected(&app.chat.input) {
+                if !t.is_empty() {
+                    copy_text_to_clipboard(&t);
+                }
+                return;
+            }
+            if app.screen() == state::Screen::Chat {
+                // COPY/SELECT-ALL on the Chat viewport work mid-stream, so
+                // a partial reply can be grabbed while it arrives.
+                let text = app.chat.copy_text();
+                if !text.trim().is_empty() {
+                    copy_text_to_clipboard(&text);
+                }
+            } else if !app.chat.input.trim().is_empty() {
+                copy_text_to_clipboard(&app.chat.input.clone());
+            }
+            return;
+        }
+        if app.screen() == state::Screen::Chat {
+            let total = state::utf16_len(&app.chat.input);
+            let line_full =
+                total > 0 && app.chat.input_sel.normalized(&app.chat.input) == Some((0, total));
+            if total > 0 && !line_full {
+                app.chat.input_sel.select_all(&app.chat.input);
+            } else {
+                app.chat.input_sel.clear();
+                app.chat.select_all();
+            }
+            render::draw_now(app);
+        } else if app.chat.connected() {
+            app.chat.input_sel.select_all(&app.chat.input);
+            render::draw_now(app);
+        }
+        return;
+    }
     if app.needs_onboarding() {
         handle_name_key(app, code);
         return;
@@ -595,19 +932,36 @@ fn handle_chat_key(app: &mut state::App, code: usize) {
     app.chat.scroll = 0.0;
     match code {
         c if c == VK_BACK.0 as usize => {
-            app.chat.input.pop();
+            // Backspace clears a highlight, else pops a char.
+            if app.chat.input_sel.normalized(&app.chat.input).is_some() {
+                let _ = app.chat.input_sel.delete_selected(&mut app.chat.input);
+            } else {
+                app.chat.input.pop();
+            }
             app.chat.error = None;
         }
         c if c == VK_ESCAPE.0 as usize => {
             app.chat.input.clear();
             app.chat.error = None;
+            app.chat.clear_selection();
+            app.chat.input_sel.clear();
         }
         c if c == VK_RETURN.0 as usize => submit_chat(app),
         c if (32..=0x10FFFF).contains(&c) => {
             if let Some(ch) = char::from_u32(c as u32) {
-                if !ch.is_control() && app.chat.input.chars().count() < 400 {
-                    app.chat.input.push(ch);
-                    app.chat.error = None;
+                if !ch.is_control() {
+                    // Typing over a highlight replaces it (standard edit).
+                    if app.chat.input_sel.normalized(&app.chat.input).is_some() {
+                        let mut s = String::new();
+                        s.push(ch);
+                        app.chat
+                            .input_sel
+                            .replace_selected(&mut app.chat.input, &s, 400);
+                        app.chat.error = None;
+                    } else if app.chat.input.chars().count() < 400 {
+                        app.chat.input.push(ch);
+                        app.chat.error = None;
+                    }
                 }
             }
         }
@@ -618,25 +972,73 @@ fn handle_chat_key(app: &mut state::App, code: usize) {
 
 /// WM_KEY while the island asks for a name: same editing keys, capped at
 /// NAME_MAX_CHARS. Enter persists (greeting and chat wait for sign-in);
-/// Escape clears the draft.
+/// Escape clears the draft. The draft is selectable/copyable/cuttable like
+/// the chat line.
 fn handle_name_key(app: &mut state::App, code: usize) {
+    if code == KEY_COPY {
+        if let Some(t) = app.name_sel.selected(&app.name_draft) {
+            if !t.is_empty() {
+                copy_text_to_clipboard(&t);
+            }
+        } else if !app.name_draft.trim().is_empty() {
+            copy_text_to_clipboard(&app.name_draft.clone());
+        }
+        return;
+    }
+    if code == KEY_CUT {
+        if let Some(removed) = app.name_sel.delete_selected(&mut app.name_draft) {
+            copy_text_to_clipboard(&removed);
+            app.name_error = None;
+            render::draw_now(app);
+        }
+        return;
+    }
+    if code == KEY_PASTE {
+        if let Some(clip) = get_clipboard_text() {
+            app.name_sel
+                .replace_selected(&mut app.name_draft, &clip, user::NAME_MAX_CHARS);
+            app.name_error = None;
+            render::draw_now(app);
+        }
+        return;
+    }
+    if code == KEY_SELECT_ALL {
+        app.name_sel.select_all(&app.name_draft);
+        render::draw_now(app);
+        return;
+    }
     match code {
         c if c == VK_BACK.0 as usize => {
-            app.name_draft.pop();
+            if app.name_sel.normalized(&app.name_draft).is_some() {
+                let _ = app.name_sel.delete_selected(&mut app.name_draft);
+            } else {
+                app.name_draft.pop();
+            }
             app.name_error = None;
         }
         c if c == VK_ESCAPE.0 as usize => {
             app.name_draft.clear();
             app.name_error = None;
+            app.name_sel.clear();
         }
         c if c == VK_RETURN.0 as usize => submit_name(app),
         c if (32..=0x10FFFF).contains(&c) => {
             if let Some(ch) = char::from_u32(c as u32) {
-                if !ch.is_control()
-                    && app.name_draft.chars().count() < user::NAME_MAX_CHARS
-                {
-                    app.name_draft.push(ch);
-                    app.name_error = None;
+                if !ch.is_control() {
+                    if app.name_sel.normalized(&app.name_draft).is_some() {
+                        let mut s = String::new();
+                        s.push(ch);
+                        app.name_sel.replace_selected(
+                            &mut app.name_draft,
+                            &s,
+                            user::NAME_MAX_CHARS,
+                        );
+                        app.name_error = None;
+                    } else if app.name_draft.chars().count() < user::NAME_MAX_CHARS
+                    {
+                        app.name_draft.push(ch);
+                        app.name_error = None;
+                    }
                 }
             }
         }
@@ -653,6 +1055,7 @@ fn submit_name(app: &mut state::App) {
             app.user_name = Some(canonical);
             app.name_draft.clear();
             app.name_error = None;
+            app.name_sel.clear();
         }
         Err(e) => {
             eprintln!("[notchbud] save name failed: {}", e.detail);
@@ -682,6 +1085,7 @@ fn submit_chat(app: &mut state::App) {
         return;
     }
     app.chat.input.clear();
+    app.chat.input_sel.clear();
     app.chat.push_history(state::Role::User, text);
     app.chat.streaming = true;
     app.chat.stream.clear();
@@ -891,11 +1295,8 @@ fn main() -> Result<()> {
         // --- DPI awareness (PER_MONITOR_AWARE_V2) ---
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
 
-        // --- single instance: Local\Notchbud.SingleInstance (env dev override) ---
-        let mut name_wide: Vec<u16> = match std::env::var("NOTCHBUD_MUTEX_NAME") {
-            Ok(s) => format!(r"Local\{s}").encode_utf16().collect(),
-            Err(_) => r"Local\Notchbud.SingleInstance".encode_utf16().collect(),
-        };
+        // --- single instance: Local\Notchbud.SingleInstance ---
+        let mut name_wide: Vec<u16> = r"Local\Notchbud.SingleInstance".encode_utf16().collect();
         name_wide.push(0); // explicit NUL — r"...\0" is a literal backslash-zero
         let _mutex = CreateMutexW(None, true, windows::core::PCWSTR(name_wide.as_ptr()))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {

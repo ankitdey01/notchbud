@@ -9,20 +9,19 @@ that streams from your own ChatGPT plan — no notchbud server, no API key.
   keyboard hook feeds the input line, the window never activates) → answers
   stream into the island. Collapse cancels a running stream.
 - **Sign in with ChatGPT** happens once: tray → *Connect ChatGPT* runs the
-  OAuth device flow with the Codex CLI's public client_id; the approval page
-  opens with the code in your clipboard. Tokens are stored as a DPAPI-protected
+  OAuth authorization-code + PKCE flow against a local loopback callback;
+  the approval page opens in your browser. Tokens are stored as a DPAPI-protected
   blob at `%APPDATA%\notchbud\auth.bin`, never plaintext, and refreshed 5 minutes
-  before expiry. Chat goes to `chatgpt.com/backend-api/codex/responses` marked
-  `originator: notchbud` — every answer is billed to your plan's own allowance
-  (free / Go / Plus limits are yours, and your plan carries them).
-- The model is the first the plan's own listing offers, falling back to
-  `gpt-6-luna`.
+  before expiry. Chat goes to the public Responses API (`https://api.openai.com/v1/responses`)
+  with your plan token — every answer is billed to your plan's own allowance.
+- The model is the first entry your plan's own model catalog offers; an empty
+  catalog means no model is available (no hardcoded fallback).
 
 ## Companion script
 
 `cargo run --example quota_spike` performs the sign-in once and sends one
-request, printing the HTTP status, the model list and the `x-codex-*` headers —
-the record that decides which plan tiers notchbud claims to support.
+request, printing the token expiry, the plan flag, and the model catalog —
+the record that decides what the account's plan allows.
 
 ## Build
 

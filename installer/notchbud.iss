@@ -3,7 +3,7 @@
 ;   cargo build --release  ->  target\release\notchbud.exe
 ;
 ; Build the installer (after cargo build), from the repo root:
-;   & "C:\Users\ankit\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer\notchbud.iss
+;   ISCC.exe installer\notchbud.iss
 ; Output: installer\Output\Notchbud-Setup-0.1.2.exe
 ;
 ; What the user sees:

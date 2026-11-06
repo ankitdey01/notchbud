@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use notchbud::connector::auth::{Tokens, PLAN_SCOPE};
 use notchbud::connector::chat::Role;
-use notchbud::state::{client_pt, screen_pt, App, Chat};
+use notchbud::state::{
+    client_pt, field_shown, screen_pt, utf16_byte_range, utf16_len, utf16_slice, App, Chat,
+    FieldSel,
+};
 use windows::Win32::Foundation::{HWND, LPARAM};
 
 fn toks(expires_in_secs: i64, plan_allowed: bool) -> Tokens {
@@ -135,4 +138,138 @@ fn screen_pt_subtracts_window_origin() {
     app.win_y = 20;
     let p = screen_pt(&app, pack(15, 25));
     assert_eq!((p.x, p.y), (5, 5));
+}
+
+// --- selectable transcript: UTF-16 helpers (DirectWrite units) ---
+
+#[test]
+fn utf16_helpers_count_and_slice() {
+    assert_eq!(utf16_len("hi"), 2);
+    assert_eq!(utf16_len("› hi"), 4); // › is a single unit
+    assert_eq!(utf16_len("a😀b"), 4); // emoji is a surrogate pair
+    assert_eq!(utf16_slice("› hello", 0, 2), "› ");
+    assert_eq!(utf16_slice("a😀b", 1, 3), "😀");
+    assert_eq!(utf16_slice("abc", 1, 99), "bc"); // end clamps
+    assert_eq!(utf16_slice("abc", 2, 2), "");
+}
+
+#[test]
+fn viewport_text_combines_status_history_stream() {
+    let mut c = Chat::new();
+    c.tokens = Some(toks(3600, true));
+    c.push_history(Role::User, "hi".into());
+    c.push_history(Role::Assistant, "hey".into());
+    let t = c.viewport_text();
+    assert!(t.contains("› hi"), "{t}");
+    assert!(t.contains("hey"), "{t}");
+    // error status rides above the conversation
+    c.error = Some("e1".into());
+    let t = c.viewport_text();
+    assert!(t.starts_with("e1"), "{t}");
+    assert!(t.contains("› hi"), "{t}");
+}
+
+#[test]
+fn selection_copy_prefers_highlight() {
+    let mut c = Chat::new();
+    c.tokens = Some(toks(3600, true));
+    c.push_history(Role::User, "hello".into());
+    c.push_history(Role::Assistant, "world".into());
+    // no highlight: Ctrl+C takes the whole transcript
+    let full = c.viewport_text();
+    assert_eq!(c.copy_text(), full);
+    // a highlight wins
+    let n = utf16_len(&full);
+    assert!(n > 4);
+    c.selection = Some((0, 4));
+    assert_eq!(c.copy_text(), utf16_slice(&full, 0, 4));
+    // reversed + overlong ends clamp instead of panicking
+    c.selection = Some((99, 2));
+    assert_eq!(c.selected_text().unwrap(), utf16_slice(&full, 2, 99));
+    c.clear_selection();
+    assert!(c.selected_text().is_none());
+    assert_eq!(c.copy_text(), c.viewport_text());
+}
+
+#[test]
+fn select_all_covers_viewport() {
+    let mut c = Chat::new();
+    assert!(c.viewport_text().is_empty());
+    c.select_all();
+    assert!(c.selection.is_none(), "nothing to highlight");
+    c.tokens = Some(toks(3600, true));
+    c.push_history(Role::User, "hi".into());
+    c.select_all();
+    let (a, b) = c.selection.unwrap();
+    assert_eq!((a, b), (0, utf16_len(&c.viewport_text())));
+    assert_eq!(c.selected_text().unwrap(), c.viewport_text());
+}
+
+// --- input field selection + edit ops (UTF-16 offsets, DirectWrite units) ---
+
+#[test]
+fn utf16_byte_range_maps_emoji() {
+    assert_eq!(utf16_byte_range("a😀b", 0, 1), (0, 1));
+    assert_eq!(utf16_byte_range("a😀b", 1, 3), (1, 5)); // surrogate pair stays whole
+    assert_eq!(utf16_byte_range("a😀b", 0, 99), (0, 6));
+    assert_eq!(utf16_byte_range("", 0, 5), (0, 0));
+}
+
+#[test]
+fn field_shown_decorates() {
+    assert_eq!(field_shown("", "› ", "Ask anything…"), "Ask anything…▏");
+    assert_eq!(field_shown("hi", "› ", "Ask anything…"), "› hi▏");
+    assert_eq!(field_shown("Al", "", "Type your name…"), "Al▏");
+}
+
+#[test]
+fn field_select_all_and_selected() {
+    let mut sel = FieldSel::default();
+    assert!(sel.selected("hi").is_none());
+    sel.select_all("hi");
+    assert_eq!(sel.range, Some((0, 2)));
+    assert_eq!(sel.selected("hi").unwrap(), "hi");
+    sel.select_all("");
+    assert!(sel.range.is_none(), "empty field clears");
+}
+
+#[test]
+fn field_cut_deletes_highlight() {
+    let mut text = "hello world".to_owned();
+    let mut sel = FieldSel::default();
+    // no highlight: nothing to cut
+    assert!(sel.delete_selected(&mut text).is_none());
+    assert_eq!(text, "hello world");
+    sel.range = Some((6, 11));
+    assert_eq!(sel.delete_selected(&mut text).unwrap(), "world");
+    assert_eq!(text, "hello ");
+    assert!(sel.range.is_none(), "cut clears the highlight");
+}
+
+#[test]
+fn field_replace_respects_cap_and_filters_controls() {
+    // type-over: highlight replaced, then cleared
+    let mut text = "ab".to_owned();
+    let mut sel = FieldSel::default();
+    sel.range = Some((0, 2));
+    sel.replace_selected(&mut text, "XYZ", 5);
+    assert_eq!(text, "XYZ");
+    assert!(sel.range.is_none());
+    // cap counts the selection as freed room
+    let mut text = "ab".to_owned();
+    let mut sel = FieldSel::default();
+    sel.range = Some((0, 2));
+    sel.replace_selected(&mut text, "wxyz", 2);
+    assert_eq!(text, "wx");
+    // append path: control chars stripped, capped
+    let mut text = "ab".to_owned();
+    let mut sel = FieldSel::default();
+    sel.replace_selected(&mut text, "c\nd", 3);
+    assert_eq!(text, "abc");
+    // reversed + overlong ranges clamp instead of panicking
+    let mut text = "a😀b".to_owned();
+    let mut sel = FieldSel::default();
+    sel.range = Some((99, 1));
+    assert_eq!(sel.delete_selected(&mut text).unwrap(), "😀b");
+    assert_eq!(text, "a");
 }

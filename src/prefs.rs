@@ -109,7 +109,7 @@ mod tests {
     // Read-only: the exact text stored under HKCU\...\Run must be a quoted
     // absolute exe path, or the installer and the tray toggle disagree and
     // heal_start_with_windows rewrites it every launch.
-    // (Deliberately NOT tested: set_start_with_windows writes the dev's
+    // (Deliberately NOT tested: set_start_with_windows writes the
     // real autostart entry — never touch it from `cargo test`.)
     #[test]
     fn run_cmd_is_quoted_absolute_exe() {
