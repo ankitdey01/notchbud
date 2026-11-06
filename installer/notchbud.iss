@@ -2,8 +2,12 @@
 ; Builds Notchbud-Setup-{version}.exe from the single portable exe:
 ;   cargo build --release  ->  target\release\notchbud.exe
 ;
-; Build the installer (after cargo build), from the repo root:
+; Build the installer (after cargo build), from the repo root.
+; Requires Inno Setup 6 (ISCC.exe). Either put its directory on PATH:
+;   set PATH=%PATH%;"C:\Program Files (x86)\Inno Setup 6"
 ;   ISCC.exe installer\notchbud.iss
+; or invoke the compiler by full path:
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\notchbud.iss
 ; Output: installer\Output\Notchbud-Setup-0.1.2.exe
 ;
 ; What the user sees:

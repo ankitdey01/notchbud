@@ -17,6 +17,12 @@ pub const ISLAND_X: f32 = (WINDOW_UNITS_W - ISLAND_W) / 2.0;
 pub const ISLAND_FLARE_R: f32 = 16.8; // top swoop radius (unit-scaled, not px-fixed)
 pub const ISLAND_BOT_R: f32 = 35.2; // bottom corner radius
 
+/// Uniform island content inset, layout units: the text field keeps this
+/// margin on the left, right, AND bottom so the spacing reads even on all
+/// sides (one spacing value, no optical exceptions). Small enough that the
+/// field stretches close to the island borders.
+pub const FIELD_INSET: f32 = 16.0;
+
 pub const SLIVER_W: f32 = 45.6; // idle tab 57x5 physical px
 pub const SLIVER_H: f32 = 14.0; // hover strip height — matches Nusa's idle hit area
 pub const SLIVER_X: f32 = (WINDOW_UNITS_W - SLIVER_W) / 2.0;

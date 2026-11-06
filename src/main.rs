@@ -447,6 +447,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // select-drag. The field sits below the viewport; rects are
             // disjoint.
             if let Some(pos) = render::field_caret_from_point(app, px, py) {
+                app.chat.clear_selection();
                 if let Some(sel) = field_sel_mut(app) {
                     sel.dragging = true;
                     sel.anchor = Some(pos);
@@ -461,6 +462,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(vp) = app.chat_viewport {
                     if px >= vp[0] && px < vp[2] && py >= vp[1] && py < vp[3] {
                         if let Some(pos) = render::caret_from_point(app, px, py) {
+                            app.chat.input_sel.clear();
                             app.chat.selecting = true;
                             app.chat.selection_anchor = Some(pos);
                             app.chat.selection = Some((pos, pos));
@@ -861,18 +863,24 @@ fn open_browser(url: &str) {
 /// on Chat / the whole line elsewhere), Ctrl+X cuts it, Ctrl+V pastes,
 /// Ctrl+A selects the line first, then the transcript.
 fn handle_chat_key(app: &mut state::App, code: usize) {
+    if app.needs_onboarding() {
+        handle_name_key(app, code);
+        return;
+    }
     if code == KEY_COPY || code == KEY_SELECT_ALL || code == KEY_CUT || code == KEY_PASTE {
         // CUT/PASTE edit the visible input line: needs a field and no
         // running stream (typing is gated the same way).
         if code == KEY_CUT || code == KEY_PASTE {
-            if app.needs_onboarding() || !app.chat.connected() || app.chat.streaming {
+            if !app.chat.connected() || app.chat.streaming {
                 return;
             }
             if code == KEY_CUT {
-                if let Some(removed) = app.chat.input_sel.delete_selected(&mut app.chat.input) {
-                    copy_text_to_clipboard(&removed);
-                    app.chat.error = None;
-                    render::draw_now(app);
+                if let Some(text) = app.chat.input_sel.selected(&app.chat.input) {
+                    if copy_text_to_clipboard(&text) {
+                        let _ = app.chat.input_sel.delete_selected(&mut app.chat.input);
+                        app.chat.error = None;
+                        render::draw_now(app);
+                    }
                 }
             } else if let Some(clip) = get_clipboard_text() {
                 app.chat
@@ -919,10 +927,6 @@ fn handle_chat_key(app: &mut state::App, code: usize) {
             app.chat.input_sel.select_all(&app.chat.input);
             render::draw_now(app);
         }
-        return;
-    }
-    if app.needs_onboarding() {
-        handle_name_key(app, code);
         return;
     }
     if !app.chat.connected() || app.chat.streaming {
@@ -986,10 +990,12 @@ fn handle_name_key(app: &mut state::App, code: usize) {
         return;
     }
     if code == KEY_CUT {
-        if let Some(removed) = app.name_sel.delete_selected(&mut app.name_draft) {
-            copy_text_to_clipboard(&removed);
-            app.name_error = None;
-            render::draw_now(app);
+        if let Some(text) = app.name_sel.selected(&app.name_draft) {
+            if copy_text_to_clipboard(&text) {
+                let _ = app.name_sel.delete_selected(&mut app.name_draft);
+                app.name_error = None;
+                render::draw_now(app);
+            }
         }
         return;
     }

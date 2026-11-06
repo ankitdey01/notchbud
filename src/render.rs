@@ -48,7 +48,7 @@ use windows::Win32::System::SystemInformation::GetTickCount64;
 use crate::state::{
     close_bounce_factor, close_progress, close_velocity, scale_idle, scale_swell, spring_progress,
     spring_settle, spring_velocity, App, CLOSE_COLLAPSE_END, CLOSE_DELAY, CLOSE_DIP_FACTOR,
-    CLOSE_DIP_T, CLOSE_RECOVER_T, CONTENT_FADE, IDLE_RGN_H, IDLE_RGN_HALF_W, ISLAND_BOT_R,
+    CLOSE_DIP_T, CLOSE_RECOVER_T, CONTENT_FADE, FIELD_INSET, IDLE_RGN_H, IDLE_RGN_HALF_W, ISLAND_BOT_R,
     ISLAND_FLARE_R, ISLAND_H, ISLAND_W, ISLAND_X, OPEN_RESPONSE, OPEN_ZETA, Screen, SLIVER_H,
     SLIVER_W, SLIVER_X, STAGE1_DUR, SWELL_RESPONSE, SWELL_ZETA, WINDOW_UNITS_H, WINDOW_UNITS_W,
 };
@@ -142,10 +142,14 @@ pub struct Renderer {
     anim_from: [f32; 2], // scale values where the run anim started
 
     tf_hi: IDWriteTextFormat, // title: .headline, white
+    tf_greet: IDWriteTextFormat, // greeting: Apple Display cut, larger, white
     br_black: ID2D1SolidColorBrush, // island shell — always opaque
     br_text_hi: ID2D1SolidColorBrush, // content text + pill fill — fades
     br_btn_text: ID2D1SolidColorBrush, // pill label — fades, never touches the shell
     br_select: ID2D1SolidColorBrush, // text-selection highlight — fades with content
+    br_field_fill: ID2D1SolidColorBrush, // field fill (subtle gray material) — fades
+    br_field_edge: ID2D1SolidColorBrush, // field hairline — fades
+    br_text_dim: ID2D1SolidColorBrush, // placeholder text — fades, dimmer
 }
 
 // Hermite fit through (t0,v0,m0) -> (t1,v1,m1): returns [D, C, B, A] so that
@@ -327,6 +331,10 @@ impl Renderer {
             // Apple system font; falls back to the default face when SF Pro
             // isn't installed on this machine.
             let tf_hi = mk_fmt(w!("SF Pro Text"), 17.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            // Greeting: the larger Apple cut at a larger size — Apple ships
+            // Text for small UI and Display for headlines, so the island
+            // follows the same split. Same fallback when SF isn't installed.
+            let tf_greet = mk_fmt(w!("SF Pro Display"), 28.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
 
             let mk_brush = |c: D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush> {
                 rt.CreateSolidColorBrush(&c, None)
@@ -335,6 +343,11 @@ impl Renderer {
             let br_text_hi = mk_brush(text_hi())?;
             let br_btn_text = mk_brush(island_bg())?;
             let br_select = mk_brush(text_hi())?;
+            // Field + placeholder share the content fade; their base colors
+            // are white / text-white and the alpha below keeps them quiet.
+            let br_field_fill = mk_brush(text_hi())?;
+            let br_field_edge = mk_brush(text_hi())?;
+            let br_text_dim = mk_brush(text_hi())?;
 
             Ok(Self {
                 dc,
@@ -357,10 +370,14 @@ impl Renderer {
                 anim_settle: 0.0,
                 anim_from: scale_idle(),
                 tf_hi,
+                tf_greet,
                 br_black,
                 br_text_hi,
                 br_btn_text,
                 br_select,
+                br_field_fill,
+                br_field_edge,
+                br_text_dim,
             })
         }
     }
@@ -745,6 +762,11 @@ impl Renderer {
                 self.br_text_hi.SetOpacity(alpha);
                 self.br_btn_text.SetOpacity(alpha);
                 self.br_select.SetOpacity(alpha * 0.32);
+                // Field material reads quiet: gray fill + hairline, and a
+                // dimmer placeholder — all riding the same content fade.
+                self.br_field_fill.SetOpacity(alpha * 0.10);
+                self.br_field_edge.SetOpacity(alpha * 0.15);
+                self.br_text_dim.SetOpacity(alpha * 0.45);
                 self.draw_content(ix, iw, ih, s, app);
             }
 
@@ -873,10 +895,22 @@ impl Renderer {
         maxw: f32,
         maxh: f32,
     ) -> (Option<IDWriteTextLayout>, f32, f32) {
+        self.measure_with(text, &self.tf_hi, maxw, maxh)
+    }
+
+    /// Same, with an explicit text format (the greeting uses the larger
+    /// Apple Display cut instead of the standard UI format).
+    unsafe fn measure_with(
+        &self,
+        text: &str,
+        tf: &IDWriteTextFormat,
+        maxw: f32,
+        maxh: f32,
+    ) -> (Option<IDWriteTextLayout>, f32, f32) {
         if text.is_empty() {
             return (None, 0.0, 0.0);
         }
-        match self.layout(text, &self.tf_hi, maxw, maxh) {
+        match self.layout(text, tf, maxw, maxh) {
             Ok(l) => {
                 let mut m = DWRITE_TEXT_METRICS::default();
                 match l.GetMetrics(&mut m) {
@@ -966,14 +1000,14 @@ impl Renderer {
         Some([bx, by, bx + btn_w, by + btn_h])
     }
 
-    /// Enter component: rounded outline field + single-line text with a caret,
-    /// plus a drawn Enter glyph pinned to the right inside edge (strokes, no
-    /// font dependency). `raw` is the undecorated field text; `prefix` ("› "
-    /// or "") and the caret are layout decoration. `sel` is a highlight in
-    /// raw UTF-16 offsets (mapped past the prefix for drawing). Overlong
-    /// lines reveal their tail (where the caret is) instead of colliding
-    /// with the glyph — the island clip contains the head that slides out
-    /// left. Publishes the frame's geometry for mouse hit-testing.
+    /// Enter component: pill field with a quiet gray material (fill +
+    /// hairline, iMessage-style) + single-line text with a caret. `raw` is
+    /// the undecorated field text; `prefix` ("› " or "") and the caret are
+    /// layout decoration. `sel` is a highlight in raw UTF-16 offsets (mapped
+    /// past the prefix for drawing). Empty fields show the placeholder in
+    /// dimmed text. Symmetric side padding; overlong lines reveal their tail
+    /// (where the caret is) — the island clip contains the head that slides
+    /// out left. Publishes the frame's geometry for mouse hit-testing.
     unsafe fn draw_field(
         &self,
         x: f32,
@@ -999,15 +1033,15 @@ impl Renderer {
         };
         if let Ok(factory) = self.rt.GetFactory() {
             if let Ok(geo) = factory.CreateRoundedRectangleGeometry(&field) {
-                let _ = self.rt.DrawGeometry(&geo, &self.br_text_hi, 1.5 * s, None);
+                // Material first: subtle fill, then a hairline on top.
+                let _ = self.rt.FillGeometry(&geo, &self.br_field_fill, None);
+                let _ = self.rt.DrawGeometry(&geo, &self.br_field_edge, 1.0 * s, None);
             }
         }
-        // The glyph owns the right inside edge; text never runs under it.
-        let glyph_right = x + w - 12.0 * s;
-        self.draw_enter_glyph(glyph_right, y + h / 2.0, s);
         let shown = crate::state::field_shown(raw, prefix, placeholder);
+        // Even padding on both inside edges — no glyph zone anymore.
         let pad_x = 16.0 * s;
-        let inner = (glyph_right - 10.0 * s - (x + pad_x)).max(1.0);
+        let inner = (w - 2.0 * pad_x).max(1.0);
         if let Ok(l) = self.layout(&shown, &self.tf_hi, 4000.0, h) {
             let mut m = DWRITE_TEXT_METRICS::default();
             let (tw, th) = match l.GetMetrics(&mut m) {
@@ -1059,10 +1093,16 @@ impl Renderer {
                     }
                 }
             }
+            // Placeholder reads dimmer than typed text (secondary label).
+            let text_brush = if raw.is_empty() {
+                &self.br_text_dim
+            } else {
+                &self.br_text_hi
+            };
             self.rt.DrawTextLayout(
                 D2D_POINT_2F { x: tx, y: ty },
                 &l,
-                &self.br_text_hi,
+                text_brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
             app.input_field = Some(crate::state::InputFieldGeom {
@@ -1074,26 +1114,6 @@ impl Renderer {
         } else {
             app.input_field = None;
         }
-    }
-
-    /// The Enter glyph: a small bent arrow drawn in strokes at
-    /// (`right`, `center_y`) so it never depends on a font glyph existing.
-    /// Reads the way return keys read: down, then left with an arrowhead.
-    unsafe fn draw_enter_glyph(&self, right: f32, center_y: f32, s: f32) {
-        let u = 2.6 * s;
-        let spine_x = right - 1.5 * u;
-        let bend_y = center_y + 1.8 * u;
-        let pt = |x: f32, y: f32| D2D_POINT_2F { x, y };
-        let a = pt(spine_x, center_y - 2.8 * u);
-        let b = pt(spine_x, bend_y);
-        let c = pt(spine_x - 3.6 * u, bend_y);
-        let h1 = pt(c.x + 1.8 * u, c.y - 1.8 * u);
-        let h2 = pt(c.x + 1.8 * u, c.y + 1.8 * u);
-        let sw = 1.7 * s;
-        let _ = self.rt.DrawLine(a, b, &self.br_text_hi, sw, None);
-        let _ = self.rt.DrawLine(b, c, &self.br_text_hi, sw, None);
-        let _ = self.rt.DrawLine(c, h1, &self.br_text_hi, sw, None);
-        let _ = self.rt.DrawLine(c, h2, &self.br_text_hi, sw, None);
     }
 
     /// Status lines shared by Home and Chat: transient notice, error, and the
@@ -1119,9 +1139,9 @@ impl Renderer {
     // ---------- sections ----------
 
     /// Onboarding: title + name field, vertically centered as one column.
-    /// Enter submits (the glyph inside the field says so); there is no
-    /// button and clicks do nothing here. A rejection reason appears under
-    /// the field only when a submit fails validation.
+    /// Enter submits; there is no button and clicks do nothing here. A
+    /// rejection reason appears under the field only when a submit fails
+    /// validation.
     unsafe fn draw_onboarding(&self, ix: f32, iw: f32, ih: f32, s: f32, app: &mut App) {
         const TITLE: &str = "What should we call you?";
         const PLACEHOLDER: &str = "Type your name…";
@@ -1145,8 +1165,9 @@ impl Renderer {
         }
         cy += title_h + 10.0 * s;
 
-        // Name field (Enter component).
-        let field_w = (320.0 * s).min(maxw);
+        // Name field (Enter component). Column-centered, so side margins
+        // are even by construction; cap the width like a form field.
+        let field_w = (320.0 * s).min(iw - 2.0 * FIELD_INSET * s);
         let field_x = ix + (iw - field_w) / 2.0;
         let field_y = cy;
         let draft = app.name_draft.clone();
@@ -1264,18 +1285,21 @@ impl Renderer {
     /// only exists while connected.
     unsafe fn draw_home(&self, ix: f32, iw: f32, ih: f32, s: f32, app: &mut App) {
         const CHAT_PLACEHOLDER: &str = "Ask anything…";
-        let maxw = iw - 48.0 * s;
+        let maxw = iw - 2.0 * FIELD_INSET * s;
 
         // Bottom-anchored chat field first, so it stays whole at every scale.
+        // Even FIELD_INSET margins on the left, right, and bottom.
         let field_h = 34.0 * s;
-        let field_x = ix + 24.0 * s;
-        let field_y = ih - field_h - 8.0 * s;
+        let field_x = ix + FIELD_INSET * s;
+        let field_y = ih - field_h - FIELD_INSET * s;
 
         // Top anchor: the greeting, until the first chat hides it.
+        // Larger Apple Display cut — the greeting is the island's headline.
+        // Sits a touch below the top edge rather than kissing it.
         let greeting = app.greeting();
-        let mut cy = 14.0 * s;
+        let mut cy = 20.0 * s;
         if !greeting.is_empty() {
-            let (t_l, t_w, t_h) = self.measure_line(&greeting, maxw, 60.0 * s);
+            let (t_l, t_w, t_h) = self.measure_with(&greeting, &self.tf_greet, maxw, 60.0 * s);
             if let Some(l) = t_l {
                 self.draw_centered(&l, t_w, ix, iw, s, cy);
                 cy += t_h + 8.0 * s;
@@ -1326,14 +1350,15 @@ impl Renderer {
         use crate::state::Screen;
         debug_assert_eq!(app.screen(), Screen::Chat);
         const CHAT_PLACEHOLDER: &str = "Ask anything…";
-        let maxw = iw - 48.0 * s;
+        let maxw = iw - 2.0 * FIELD_INSET * s;
 
         // Bottom-anchored input field first, so the history viewport is
-        // whatever space is left above it.
+        // whatever space is left above it. Even FIELD_INSET margins on the
+        // left, right, and bottom.
         let field_w = maxw;
         let field_h = 32.0 * s;
-        let field_x = ix + 24.0 * s;
-        let field_y = ih - field_h - 10.0 * s;
+        let field_x = ix + FIELD_INSET * s;
+        let field_y = ih - field_h - FIELD_INSET * s;
 
         let viewport_top = 10.0 * s;
         let viewport_bottom = field_y - 8.0 * s;
@@ -1458,9 +1483,9 @@ pub fn caret_from_point(app: &App, px: f32, py: f32) -> Option<usize> {
     let ix = ISLAND_X * s;
     let iw = ISLAND_W * s;
     let ih = ISLAND_H * s;
-    let maxw = iw - 48.0 * s;
+    let maxw = iw - 2.0 * FIELD_INSET * s;
     let field_h = 32.0 * s;
-    let field_y = ih - field_h - 10.0 * s;
+    let field_y = ih - field_h - FIELD_INSET * s;
     let viewport_top = 10.0 * s;
     let viewport_bottom = field_y - 8.0 * s;
     if py < viewport_top || py > viewport_bottom || px < ix || px > ix + iw {
@@ -1487,7 +1512,12 @@ pub fn caret_from_point(app: &App, px: f32, py: f32) -> Option<usize> {
             let mut hm: DWRITE_HIT_TEST_METRICS = std::mem::zeroed();
             l.HitTestPoint(px - x, py - y, &mut trailing, &mut inside, &mut hm)
                 .ok()?;
-            let pos = hm.textPosition as usize + ((trailing.0 != 0) as usize);
+            let pos = hm.textPosition as usize
+                + if trailing.0 != 0 {
+                    hm.length as usize
+                } else {
+                    0
+                };
             Some(pos.min(utf16_len(&full)))
         }
     })
@@ -1531,7 +1561,12 @@ pub fn field_caret_from_point(app: &App, px: f32, py: f32) -> Option<usize> {
                 &mut hm,
             )
             .ok()?;
-            let pos = hm.textPosition as usize + ((trailing.0 != 0) as usize);
+            let pos = hm.textPosition as usize
+                + if trailing.0 != 0 {
+                    hm.length as usize
+                } else {
+                    0
+                };
             Some(pos.saturating_sub(pu).min(utf16_len(raw)))
         }
     })
