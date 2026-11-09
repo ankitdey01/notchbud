@@ -153,7 +153,7 @@ fn run_value_present() -> bool {
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
-            0,
+            Some(0),
             KEY_READ,
             &mut hk,
         )

@@ -1,0 +1,438 @@
+/* notchbud island — content layer inside WebView2.
+   The shell (black silhouette + springs) stays in Direct2D/DComp;
+   everything here is transparent so the shell shows through.
+   Pixel target: dark notch card — top chrome, greeting, ask box, pills.
+   (No outer outline: the shell edge stays plain black.) */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: "SF Pro Text", system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #f2f2f7;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+#island {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 4px 10px 6px;
+    animation: island-in 0.18s ease-out;
+}
+
+@keyframes island-in {
+    from {
+        opacity: 0;
+        transform: translateY(-3px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.screen {
+    width: 100%;
+    max-width: 560px;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    /* Top-anchored with auto margins (not justify-content:center):
+     when content overflows the fixed island height it spills downward
+     only, instead of overlapping the topbar. */
+    justify-content: flex-start;
+    gap: 5px;
+}
+
+.screen> :first-child {
+    margin-top: auto;
+}
+
+.screen> :last-child {
+    margin-bottom: auto;
+}
+
+/* Short pre-home screens never overflow: plain centering is safe there. */
+#screen-onboarding,
+#screen-signin,
+#screen-home {
+    justify-content: center;
+}
+
+#screen-onboarding> :first-child,
+#screen-signin> :first-child,
+#screen-home> :first-child {
+    margin-top: 0;
+}
+
+#screen-onboarding> :last-child,
+#screen-signin> :last-child,
+#screen-home> :last-child {
+    margin-bottom: 0;
+}
+
+/* Home: even 8px rhythm — topbar-to-greeting equals greeting-to-input.
+   Top-anchored so the equality holds at any island height. */
+#screen-home {
+    justify-content: flex-start;
+    gap: 8px;
+    padding-top: 8px;
+}
+
+/* Chat owns its own layout (history flexes, ask box pins to the bottom). */
+#screen-chat> :first-child {
+    margin-top: 0;
+}
+
+#screen-chat> :last-child {
+    margin-bottom: 0;
+}
+
+.screen[hidden] {
+    display: none !important;
+}
+
+/* ---------- top chrome ---------- */
+
+.topbar {
+    width: 100%;
+    max-width: 560px;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    padding: 0;
+}
+
+.topbar>.iconbtn {
+    justify-self: start;
+}
+
+.iconbtn {
+    position: relative;
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.06);
+    color: #ececf1;
+    cursor: pointer;
+    padding: 0;
+    flex: none;
+}
+
+.iconbtn:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.iconbtn:active {
+    transform: scale(0.94);
+}
+
+.iconbtn svg {
+    display: block;
+}
+
+.bell .dot {
+    position: absolute;
+    top: 5px;
+    right: 7px;
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: #007AFF;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.brand-logo {
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    object-fit: cover;
+    display: block;
+}
+
+.brand-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+    letter-spacing: 0.1px;
+}
+
+.beta {
+    font-size: 10px;
+    font-weight: 500;
+    color: #a1a1aa;
+    background: rgba(255, 255, 255, 0.09);
+    border-radius: 999px;
+    padding: 2px 8px;
+}
+
+.topactions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+/* ---------- greeting ---------- */
+
+.greet {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 2px;
+}
+
+.greet-tile {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 10px;
+    background: rgba(0, 122, 255, 0.16);
+    color: #007AFF;
+}
+
+.greet-tile svg {
+    display: block;
+}
+
+.greet-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.greet-title {
+    font-size: 17px;
+    line-height: 1.15;
+    font-weight: 700;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.greet-sub {
+    font-size: 12px;
+    font-weight: 400;
+    color: #9ca3af;
+}
+
+/* ---------- ask box ---------- */
+
+.askbox {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.05);
+    padding: 3px 3px 3px 14px;
+}
+
+.asklead {
+    flex: none;
+    display: grid;
+    place-items: center;
+    color: #8e8e93;
+}
+
+.asklead svg {
+    display: block;
+}
+
+.askinput {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: #f2f2f7;
+    font-size: 13.5px;
+    font-family: inherit;
+    padding: 6px 0;
+}
+
+.askinput::placeholder {
+    color: rgba(235, 235, 245, 0.45);
+}
+
+.kbd {
+    flex: none;
+    font-size: 11px;
+    font-weight: 500;
+    color: #a1a1aa;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 5px 8px;
+    white-space: nowrap;
+}
+
+.send {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 999px;
+    border: none;
+    background: #007AFF;
+    color: #fff;
+    cursor: pointer;
+    padding: 0;
+}
+
+.send:hover {
+    filter: brightness(1.08);
+}
+
+.send:active {
+    transform: scale(0.94);
+}
+
+.send svg {
+    display: block;
+    margin-left: 2px;
+}
+
+/* ---------- legacy bits (onboarding / signin / chat) ---------- */
+
+.title {
+    font-size: 17px;
+    font-weight: 600;
+    text-align: center;
+}
+
+.status {
+    font-size: 14px;
+    font-weight: 400;
+    text-align: center;
+    opacity: 0.75;
+    white-space: pre-wrap;
+    max-width: 100%;
+}
+
+.error {
+    font-size: 13px;
+    text-align: center;
+    opacity: 0.7;
+}
+
+/* white pill — the only button in the pre-home island */
+.pill {
+    border: none;
+    border-radius: 999px;
+    background: #f2f2f7;
+    color: #000;
+    font-size: 14px;
+    font-weight: 600;
+    font-family: inherit;
+    padding: 10px 22px;
+    cursor: pointer;
+}
+
+.pill:hover {
+    background: #fff;
+}
+
+/* rounded prompt line (onboarding) */
+.field {
+    width: min(320px, 100%);
+    height: 34px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.10);
+    color: #f2f2f7;
+    font-size: 14px;
+    font-family: inherit;
+    padding: 0 16px;
+    outline: none;
+    margin: 0 auto;
+}
+
+.field::placeholder {
+    color: rgba(242, 242, 247, 0.45);
+}
+
+.field:focus {
+    border-color: rgba(255, 255, 255, 0.35);
+}
+
+/* chat history: bottom-anchored, scrolls natively */
+.history {
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    gap: 4px;
+    font-size: 14px;
+    line-height: 1.45;
+    padding: 0 2px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+}
+
+.history::-webkit-scrollbar {
+    width: 4px;
+}
+
+.history::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 2px;
+}
+
+.turn-user {
+    opacity: 0.95;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.turn-assistant {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.turn-stream {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.turn-stream::after {
+    content: "▏";
+    animation: caret 1s steps(1) infinite;
+}
+
+@keyframes caret {
+    50% {
+        opacity: 0;
+    }
+}

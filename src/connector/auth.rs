@@ -1129,7 +1129,7 @@ unsafe fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>, String> {
         return Err("dpapi".into());
     }
     let blob = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
-    let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out.pbData as *mut _));
+    let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(out.pbData as *mut _)));
     Ok(blob)
 }
 

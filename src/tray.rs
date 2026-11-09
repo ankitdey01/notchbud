@@ -2,15 +2,16 @@
 // (separator) / Exit, opened at the cursor with RETURNCMD.
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuItem, CreatePopupMenu, DestroyMenu, EnableMenuItem, GetCursorPos,
-    LoadIconW, PostMessageW, TrackPopupMenu, HMENU, IDI_APPLICATION, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MF_BYCOMMAND, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_RIGHTALIGN,
-    TPM_RETURNCMD, WM_NULL,
+    LoadImageW, PostMessageW, TrackPopupMenu, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR,
+    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_BYCOMMAND, MF_UNCHECKED,
+    TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RETURNCMD, WM_NULL,
 };
 
 pub const TRAY_CALLBACK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 9; // 0x8009
@@ -25,20 +26,29 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 pub unsafe fn add_tray(hwnd: HWND) -> windows::core::Result<()> {
-    let hicon = LoadIconW(None, IDI_APPLICATION)?;
+    // Cat logo from the exe resources (assets/app.rc, group id 1).
+    let hmodule = GetModuleHandleW(None)?;
+    let hicon = LoadImageW(
+        Some(HINSTANCE(hmodule.0)),
+        PCWSTR(1 as *const u16),
+        IMAGE_ICON,
+        32,
+        32,
+        LR_DEFAULTCOLOR,
+    )?;
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: TRAY_CALLBACK,
-        hIcon: hicon,
+        hIcon: HICON(hicon.0),
         ..Default::default()
     };
     let tip = wide("Notchbud");
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-        return Err(windows::core::Error::from_win32());
+        return Err(windows::core::Error::from_thread());
     }
     Ok(())
 }
@@ -91,11 +101,11 @@ pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool, plan_ready: bool) -> 
         TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD,
         pt.x,
         pt.y,
-        0,
+        Some(0),
         hwnd,
         None,
     ); // RETURNCMD: loword = command (0 = dismissed)
-    let _ = PostMessageW(hwnd, WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    let _ = PostMessageW(Some(hwnd), WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
     // the handle is ours to free — without this every right-click leaks an HMENU
     let _ = DestroyMenu(hmenu);
     chosen.0.max(0) as usize

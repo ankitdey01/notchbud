@@ -1,0 +1,6 @@
+// notchbud — native app icon (the cat logo).
+// Compiled by build.rs with the Windows SDK rc.exe into app.res,
+// which is passed straight to link.exe. Group icon ID 1 — the Rust
+// side loads it via LoadImageW(MAKEINTRESOURCEW(1)) for the taskbar
+// button and the tray icon.
+1 ICON "notchbud.ico"

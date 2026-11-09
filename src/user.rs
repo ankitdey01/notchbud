@@ -179,7 +179,7 @@ pub fn greeting_for_hour(hour: u32, name: &str) -> String {
     } else if (17..22).contains(&h) {
         "Good evening"
     } else {
-        "Good night"
+        "sleep already"
     };
     if name.is_empty() {
         title_case_words(part)
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn greeting_boundaries() {
-        assert_eq!(greeting_for_hour(4, "Alex"), "Good Night, Alex");
+        assert_eq!(greeting_for_hour(4, "Alex"), "Sleep Already, Alex");
         assert_eq!(greeting_for_hour(5, "Alex"), "Good Morning, Alex");
         assert_eq!(greeting_for_hour(11, "Alex"), "Good Morning, Alex");
         assert_eq!(greeting_for_hour(12, "Alex"), "Good Afternoon, Alex");
@@ -238,8 +238,8 @@ mod tests {
         assert_eq!(greeting_for_hour(17, "Alex"), "Good Evening, Alex");
         assert_eq!(greeting_for_hour(19, "Alex"), "Good Evening, Alex");
         assert_eq!(greeting_for_hour(21, "Alex"), "Good Evening, Alex");
-        assert_eq!(greeting_for_hour(22, "Alex"), "Good Night, Alex");
-        assert_eq!(greeting_for_hour(0, "Alex"), "Good Night, Alex");
+        assert_eq!(greeting_for_hour(22, "Alex"), "Sleep Already, Alex");
+        assert_eq!(greeting_for_hour(0, "Alex"), "Sleep Already, Alex");
     }
 
     #[test]

@@ -72,7 +72,7 @@ pub fn set_start_with_windows(on: bool) -> windows::core::Result<()> {
             win32(RegOpenKeyExW(
                 HKEY_CURRENT_USER,
                 RUN_SUBKEY,
-                0,
+                Some(0),
                 REG_SAM_FLAGS(KEY_SET_VALUE.0 | KEY_READ.0),
                 &mut hk,
             ))?;
@@ -83,7 +83,7 @@ pub fn set_start_with_windows(on: bool) -> windows::core::Result<()> {
                 win32(RegSetValueExW(
                     hk,
                     RUN_VALUE,
-                    0,
+                    Some(0),
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
                         wide.as_ptr() as *const u8,

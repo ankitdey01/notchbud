@@ -1,19 +1,25 @@
 // notchbud — minimal notch: idle sliver at the top of the screen; hovering
 // expands the island (sign-in prompt when signed out, chat when signed in);
 // leaving collapses it.
+//
+// Shell: Win32 window + Direct2D island silhouette + DComp spring motion.
+// Content: WebView2 child inside the island rendering HTML/CSS (ui/).
+// The window never activates — a low-level keyboard hook forwards keys
+// into the page via island_web while the island is expanded.
 
 // No console window in release builds: this is a pure GUI (Win32) app.
 // Debug builds keep the console so the [notchbud] log lines stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use notchbud::{connector, render, state, user};
+use notchbud::{connector, island_web, render, state, user};
 
 mod prefs;
 mod tray;
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
-use windows::core::{w, Result};use windows::Win32::Foundation::{
+use windows::core::{w, Result, PCWSTR};
+use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
@@ -27,45 +33,38 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardState, ReleaseCapture, SetCapture, ToUnicode, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN,
-    VK_SHIFT,
+    GetAsyncKeyState, GetKeyboardState, ToUnicode, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetSystemMetrics, GetWindowRect, KillTimer, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetCursor, SetWindowsHookExW,
-    SetWindowLongPtrW, SetTimer, SetWindowPos, GetWindowLongPtrW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
-    GWLP_USERDATA, HHOOK, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_IBEAM, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-    SM_CXSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WNDCLASSEXW, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_TIMER,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
+    GetSystemMetrics, GetWindowRect, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SetTimer, SetWindowsHookExW, SetWindowLongPtrW, SetWindowPos,
+    GetWindowLongPtrW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, GWLP_USERDATA, HHOOK,
+    HICON, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IMAGE_ICON, KBDLLHOOKSTRUCT, LoadImageW, LR_DEFAULTCOLOR,
+    MSG, SM_CXSCREEN, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_SHOWNOACTIVATE, WNDCLASSEXW, WH_KEYBOARD_LL, WM_DESTROY, WM_DPICHANGED,
+    WM_KEYDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 // "TaskbarCreated" message id; re-adds the tray icon when explorer restarts
 static TASKBAR_MSG: AtomicU32 = AtomicU32::new(0);
 
-// timers on the message pump, replacing spawned sleep threads — KillTimer on
-// any reschedule makes the choreography cancellable
-const TIMER_FADE_START: usize = 1; // one-shot: fade becomes visible after the delay
-const TIMER_FADE: usize = 2;      // 16 ms repaint pump while the text alpha animates
-const TIMER_IDLE_RGN: usize = 3;  // one-shot: region swap after the close settles
-const FADE_STEP_MS: u32 = 16;
+// one-shot: region swap after the close settles
+const TIMER_IDLE_RGN: usize = 3;
+// one-shot: reveal the web page once the open spring has settled, so DWM
+// composites the live Chromium surface only after the shell stops moving
+const TIMER_WEB_SHOW: usize = 4;
 
-// chat wiring: connector thread(s) post into this pump via PostMessage — the
-// WM_TIMER message-pump pattern extended with two custom app messages.
+// chat wiring: connector thread(s) post into this pump via PostMessage.
 const WM_CHAT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10; // connector events
 const WM_KEY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 11; // keyboard hook chars
-const WM_WHEEL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12; // mouse hook wheel
-/// Chat scroll per wheel notch, in layout units (draw multiplies by scale).
-const WHEEL_STEP: f32 = 48.0;
-// WM_KEY codes for the island clipboard shortcuts (past the Unicode range
-// so they never collide with typed characters).
-const KEY_COPY: usize = 0x110000; // Ctrl+C / Ctrl+Insert: copy highlight, else transcript
-const KEY_SELECT_ALL: usize = 0x110001; // Ctrl+A: highlight the whole viewport
-const KEY_CUT: usize = 0x110002; // Ctrl+X / Shift+Delete: cut field highlight to clipboard
-const KEY_PASTE: usize = 0x110003; // Ctrl+V / Shift+Insert: paste clipboard into the field
+// WM_KEY codes for island shortcuts (past the Unicode range).
+const KEY_COPY: usize = 0x110000;
+const KEY_SELECT_ALL: usize = 0x110001;
+const KEY_CUT: usize = 0x110002;
+const KEY_PASTE: usize = 0x110003;
 // WM_CHAT wparam codes (lp carries a Box pointer where noted)
 const CHAT_DELTA: usize = 0; // *String
 const CHAT_DONE: usize = 1;
@@ -76,10 +75,9 @@ const CHAT_SIGNED_OUT: usize = 6; // *String (terminal auth failure: clear creds
 const CHAT_STATUS: usize = 7; // *String (transient notice, keeps signing_in)
 
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
-static CHAT_CANCEL: AtomicBool = AtomicBool::new(false);   // island left mid-stream
-static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);       // where the hook posts
-static KEYHOOK: AtomicIsize = AtomicIsize::new(0);         // hook handle (unhook on quit)
-static MOUSEHOOK: AtomicIsize = AtomicIsize::new(0);       // wheel hook handle (unhook on quit)
+static CHAT_CANCEL: AtomicBool = AtomicBool::new(false); // island left mid-stream
+static HOOK_HWND: AtomicIsize = AtomicIsize::new(0); // where the hook posts
+static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on quit)
 
 // ---------------------------------------------------------------------------
 // wndproc
@@ -100,28 +98,37 @@ unsafe fn apply_window_region(app: &state::App) {
     }
     let rgn = CreateRectRgn(l, 0, r, b);
     if !rgn.is_invalid() {
-        let _ = SetWindowRgn(app.hwnd, rgn, false);
+        let _ = SetWindowRgn(app.hwnd, Some(rgn), false);
     }
 }
 
-// region + visuals must follow every expanded/sliver transition
+// region follows every expanded/sliver transition. Web visibility is
+// choreographed separately: hidden during the spring, revealed after it
+// settles (TIMER_WEB_SHOW), so the compositor animates the shell alone.
 fn after_state_change(app: &state::App) {
     unsafe { apply_window_region(app) };
 }
 
-// content-choreography pump: the silhouette scale animates on the DComp
-// compositor thread and WM_PAINT never fires on its own during a run, so
-// repaint every 16 ms (DWM's cadence) while the drawn text alpha has a
-// scheduled fade — otherwise the fade would never advance. delay = when the
-// fade starts (0 for the retract fade-out), dur = how long it runs.
-unsafe fn start_fade_pump(hwnd: HWND, app: &mut state::App, delay: f32, dur: f32) {
-    KillTimer(hwnd, TIMER_FADE_START).ok();
-    KillTimer(hwnd, TIMER_FADE).ok();
-    app.pump_steps = ((dur.max(0.0) / 0.016) as usize).max(1);
-    if delay > 0.001 {
-        SetTimer(hwnd, TIMER_FADE_START, (delay * 1000.0).ceil() as u32, None);
-    } else {
-        SetTimer(hwnd, TIMER_FADE, FADE_STEP_MS, None);
+/// Reveal the page now that the shell sits at scale 1.0.
+fn show_web_now(app: &mut state::App) {
+    island_web::set_visible(true);
+    island_web::layout(app.scale);
+    push_web(app);
+    island_web::fade_in();
+}
+
+/// Push Rust state into the HTML island.
+fn push_web(app: &mut state::App) {
+    island_web::push_state(&app.page_state());
+    app.last_web_push_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+}
+
+/// Streaming coalescing: at most one page render per ~48 ms while tokens
+/// arrive; the final DONE always pushes.
+fn push_web_throttled(app: &mut state::App) {
+    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    if now.wrapping_sub(app.last_web_push_ms) >= 48 {
+        push_web(app);
     }
 }
 
@@ -129,15 +136,46 @@ unsafe fn start_fade_pump(hwnd: HWND, app: &mut state::App, delay: f32, dur: f32
 // isn't clipped by the idle strip mid-flight (Nusa does the same); a one-shot
 // timer fires after the settle and swaps regions to the idle hit strip.
 unsafe fn schedule_idle_region(hwnd: HWND, settle: f32) {
-    KillTimer(hwnd, TIMER_IDLE_RGN).ok();
-    SetTimer(hwnd, TIMER_IDLE_RGN, (settle * 1000.0).ceil() as u32, None);
+    KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
+    SetTimer(Some(hwnd), TIMER_IDLE_RGN, (settle * 1000.0).ceil() as u32, None);
 }
 
+// Reveal the page after the open spring settles (matched to the original
+// content choreography: greeting fades in only once the pop is done).
+unsafe fn schedule_web_show(hwnd: HWND) {
+    KillTimer(Some(hwnd), TIMER_WEB_SHOW).ok();
+    let delay = state::open_settle() + state::CONTENT_FADE;
+    SetTimer(Some(hwnd), TIMER_WEB_SHOW, (delay * 1000.0).ceil() as u32, None);
+}
+
+// One-shot hover-leave tracking for the parent window (consumed on fire).
+unsafe fn arm_leave_tracking(hwnd: HWND) {
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    let _ = TrackMouseEvent(&mut tme);
+}
+
+/// Cursor position in window-client px (cached origin, no GetWindowRect).
+/// None when the position cannot be read — callers treat that as outside.
+fn cursor_client_px(app: &state::App) -> Option<(f32, f32)> {
+    unsafe {
+        let mut cpos = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cpos).ok()?;
+        Some((
+            (cpos.x - app.win_x) as f32,
+            (cpos.y - app.win_y) as f32,
+        ))
+    }
+}
 // ---------------------------------------------------------------------------
-// keyboard hook — the only functional addition to the frozen UI.
-// The window is WS_EX_NOACTIVATE, so hover alone never grants keystrokes:
-// a low-level hook forwards typed keys into WM_KEY while the island is
-// expanded (and eats them, so they don't type into the app behind it too).
+// keyboard hook — the window never activates, so hover alone never grants
+// keystrokes: a low-level hook forwards typed keys into the WebView2 page
+// (via island_web) while the island is expanded, and eats them so they
+// don't type into the app behind it too.
 // ---------------------------------------------------------------------------
 
 unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -146,7 +184,7 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let post = |c: usize| {
             let _ = PostMessageW(
-                HWND(HOOK_HWND.load(Ordering::Relaxed) as *mut _),
+                Some(HWND(HOOK_HWND.load(Ordering::Relaxed) as *mut _)),
                 WM_KEY,
                 WPARAM(c),
                 LPARAM(0),
@@ -154,43 +192,24 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         };
         let ctrl_down = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
         let alt_down = GetAsyncKeyState(VK_MENU.0 as i32) < 0;
-        let shift_down = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
-        // Island clipboard shortcuts work inside the island and never reach
-        // the app behind it. Other Ctrl/Alt chords still pass through.
+        // Island shortcuts work inside the page and never reach the app
+        // behind it. Other Ctrl/Alt chords still pass through.
         if ctrl_down && !alt_down {
             match kb.vkCode {
-                0x43 | 0x2D => {
-                    // C, Insert
+                0x43 => {
                     post(KEY_COPY);
                     return LRESULT(1);
                 }
                 0x41 => {
-                    // A
                     post(KEY_SELECT_ALL);
                     return LRESULT(1);
                 }
                 0x58 => {
-                    // X
                     post(KEY_CUT);
                     return LRESULT(1);
                 }
                 0x56 => {
-                    // V
                     post(KEY_PASTE);
-                    return LRESULT(1);
-                }
-                _ => {}
-            }
-        } else if shift_down && !ctrl_down && !alt_down {
-            match kb.vkCode {
-                0x2D => {
-                    // Shift+Insert: paste
-                    post(KEY_PASTE);
-                    return LRESULT(1);
-                }
-                0x2E => {
-                    // Shift+Delete: cut
-                    post(KEY_CUT);
                     return LRESULT(1);
                 }
                 _ => {}
@@ -200,16 +219,17 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         if !ctrl_down && !alt_down {
             let vk = kb.vkCode as u32;
             match vk {
-                8 | 13 | 27 => { // VK_BACK VK_RETURN VK_ESCAPE
+                8 | 13 | 27 => {
+                    // VK_BACK VK_RETURN VK_ESCAPE
                     post(vk as usize);
                     return LRESULT(1);
                 }
                 _ => {
                     // VK -> character via the active keyboard layout
-                    let mut state = [0u8; 256];
-                    let _ = GetKeyboardState(&mut state);
+                    let mut st = [0u8; 256];
+                    let _ = GetKeyboardState(&mut st);
                     let mut buf = [0u16; 4];
-                    let n = ToUnicode(vk, kb.scanCode, Some(&state), &mut buf, 0);
+                    let n = ToUnicode(vk, kb.scanCode, Some(&st), &mut buf, 0);
                     // n > 0: produced text; n < 0: dead key — never eaten
                     if n > 0 {
                         post(buf[0] as usize);
@@ -223,58 +243,10 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
 }
 
 unsafe fn install_key_hook(hwnd: HWND, hinstance: HINSTANCE) {
-    let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_hook), hinstance, 0);
+    let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_hook), Some(hinstance), 0);
     if let Ok(h) = hook {
         KEYHOOK.store(h.0 as isize, Ordering::Release);
         HOOK_HWND.store(hwnd.0 as isize, Ordering::Release);
-    }
-    // wheel scrolling over the expanded island — NOACTIVATE windows never
-    // receive WM_MOUSEWHEEL, so mirror the keyboard hook pattern
-    let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinstance, 0);
-    if let Ok(h) = hook {
-        MOUSEHOOK.store(h.0 as isize, Ordering::Release);
-    }
-}
-
-// wheel-notches posted as WM_WHEEL while the island is expanded; everything
-// else passes through untouched
-unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0
-        && wparam.0 == WM_MOUSEWHEEL as usize
-        && ISLAND_ACTIVE.load(Ordering::Acquire)
-    {
-        let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        let delta = ((ms.mouseData >> 16) as u16 as i16) as i32; // signed notch delta
-        let _ = PostMessageW(
-            HWND(HOOK_HWND.load(Ordering::Relaxed) as *mut _),
-            WM_WHEEL,
-            WPARAM(delta as usize), // i32 preserved through usize round-trip
-            LPARAM(0),
-        );
-        return LRESULT(1); // eaten: don't scroll the window behind too
-    }
-    CallNextHookEx(None, code, wparam, lparam)
-}
-
-/// Visible input field selection for the current screen (name prompt or
-/// chat line); None on SignIn, which draws no field.
-fn field_sel_mut(app: &mut state::App) -> Option<&mut state::FieldSel> {
-    match app.screen() {
-        state::Screen::Onboarding => Some(&mut app.name_sel),
-        state::Screen::Home | state::Screen::Chat => Some(&mut app.chat.input_sel),
-        state::Screen::SignIn => None,
-    }
-}
-
-/// End a field select-drag: a zero-length tap clears the highlight.
-fn end_field_drag(sel: &mut state::FieldSel) {
-    sel.dragging = false;
-    if let Some((a, b)) = sel.range {
-        if a == b {
-            sel.clear();
-        }
-    } else {
-        sel.anchor = None;
     }
 }
 
@@ -289,281 +261,75 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // else HTTRANSPARENT (click-through for windows in our thread).
             // Cross-process click-through comes from apply_window_region —
             // the OS never routes hits that land outside the window region.
-            // draw() publishes the rect in px; apply_window_region consumes it.
             let pt = state::screen_pt(app, lparam);
             let x = pt.x as f32;
             let y = pt.y as f32;
             let a = app.bar_area;
-            let in_bar = x >= a[0] && x < a[2] && y >= a[1] && y < a[3];
-            if in_bar {
+            if x >= a[0] && x < a[2] && y >= a[1] && y < a[3] {
                 LRESULT(HTCLIENT as isize)
             } else {
                 LRESULT(HTTRANSPARENT as isize)
             }
         }
 
-        WM_SETCURSOR => {
-            // I-beam over selectable text (chat history or the input line),
-            // arrow everywhere else. Handled here — not on MOUSEMOVE — so
-            // DefWindowProc can't flicker it back to the class arrow.
-            if (lparam.0 & 0xFFFF) == HTCLIENT as isize {
-                let mut cpos = POINT { x: 0, y: 0 };
-                if GetCursorPos(&mut cpos).is_ok() {
-                    // Cached window origin, no GetWindowRect per mouse move.
-                    let (px, py) =
-                        ((cpos.x - app.win_x) as f32, (cpos.y - app.win_y) as f32);
-                    let over_viewport = app.chat_viewport.is_some_and(|r| {
-                        px >= r[0] && px < r[2] && py >= r[1] && py < r[3]
-                    });
-                    let over_field = app.input_field.as_ref().is_some_and(|g| {
-                        px >= g.rect[0] && px < g.rect[2] && py >= g.rect[1] && py < g.rect[3]
-                    });
-                    let id = if over_viewport || over_field {
-                        IDC_IBEAM
-                    } else {
-                        IDC_ARROW
-                    };
-                    if let Ok(cur) = LoadCursorW(None, id) {
-                        let _ = SetCursor(cur);
-                        return LRESULT(1);
-                    }
-                }
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-
         WM_MOUSEMOVE => {
-            let pt = state::client_pt(lparam);
-            let (px, py) = (pt.x as f32, pt.y as f32);
-            // Input-field drag first (name prompt or chat line): clamped
-            // into the field rect so dragging out selects to the end.
-            if app.chat.input_sel.dragging || app.name_sel.dragging {
-                if (wparam.0 & 1) != 0 {
-                    if let Some(g) = app.input_field.as_ref() {
-                        let cx = px.clamp(g.rect[0], (g.rect[2] - 1.0).max(g.rect[0]));
-                        let cy = py.clamp(g.rect[1], (g.rect[3] - 1.0).max(g.rect[1]));
-                        if let Some(pos) = render::field_caret_from_point(app, cx, cy) {
-                            if let Some(sel) = field_sel_mut(app) {
-                                let anchor = sel.anchor.unwrap_or(pos);
-                                sel.range = Some((anchor.min(pos), anchor.max(pos)));
-                                render::draw_now(app);
-                            }
-                        }
-                    }
-                } else {
-                    // Button released without a LBUTTONUP: end the drags
-                    // rather than sticking.
-                    end_field_drag(&mut app.chat.input_sel);
-                    end_field_drag(&mut app.name_sel);
-                    let _ = ReleaseCapture();
-                    render::draw_now(app);
-                }
-            // Select-drag extension while the button is held (capture keeps
-            // moves coming even past the island edge; clamp to the viewport
-            // so dragging out selects to the nearest end).
-            } else if app.chat.selecting {
-                if (wparam.0 & 1) != 0 {
-                    if app.screen() == state::Screen::Chat {
-                        if let Some(vp) = app.chat_viewport {
-                            let cx = px.clamp(vp[0], (vp[2] - 1.0).max(vp[0]));
-                            let cy = py.clamp(vp[1], (vp[3] - 1.0).max(vp[1]));
-                            if let Some(pos) = render::caret_from_point(app, cx, cy) {
-                                let anchor = app.chat.selection_anchor.unwrap_or(pos);
-                                app.chat.selection =
-                                    Some((anchor.min(pos), anchor.max(pos)));
-                                render::draw_now(app);
-                            }
-                        }
-                    }
-                } else {
-                    // Button released without a LBUTTONUP (hook ate it, or
-                    // capture broke): end the drag rather than sticking.
-                    app.chat.selecting = false;
-                    if let Some((a, b)) = app.chat.selection {
-                        if a == b {
-                            app.chat.clear_selection();
-                        }
-                    }
-                    let _ = ReleaseCapture();
-                    render::draw_now(app);
-                }
-            }
             if !app.mouse_inside {
                 app.mouse_inside = true;
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                let _ = TrackMouseEvent(&mut tme);
-                app.expanded = true;
-                ISLAND_ACTIVE.store(true, Ordering::Release);
-                // animation clock first, so the painted launch frame starts
-                // from the fresh content timeline (greeting hidden on open)
-                render::animate(true);
-                render::draw_now(app);
-                after_state_change(app); // island region now, so it stays clickable while the clip animates open
-                // the greeting reveals only after the pop settles — pump the
-                // repaints that fade it in
-                start_fade_pump(app.hwnd, app, state::open_settle(), state::CONTENT_FADE + 0.05);
+                unsafe { arm_leave_tracking(hwnd); }
+                // Choreography runs on closed->open transitions only (see
+                // state::expand_on_mousemove). Moves while already expanded
+                // (e.g. the parent strips around the WebView child) must not
+                // restart the spring.
+                if state::expand_on_mousemove(app.expanded) {
+                    app.expanded = true;
+                    ISLAND_ACTIVE.store(true, Ordering::Release);
+                    // Kill a pending deferred-hide so it can't fire into the
+                    // fresh open, then run the spring alone. The page stays
+                    // however it is (hidden, or faded mid-close) and is
+                    // reshown + faded in after the settle.
+                    unsafe {
+                        KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
+                    }
+                    render::animate(true);
+                    render::draw_now(app);
+                    after_state_change(app); // island region now, stays clickable
+                    island_web::layout(app.scale);
+                    schedule_web_show(hwnd);
+                }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         WM_MOUSELEAVE => {
-            // A select-drag owns the island: leaving mid-drag must not
-            // collapse it (or cancel the stream being copied).
-            if app.chat.selecting || app.chat.input_sel.dragging || app.name_sel.dragging {
+            // The WebView2 child owns the mouse while it is over the island:
+            // the parent sees a leave when the cursor moves into the child.
+            // Same predicate as the page's mouseleave (see
+            // state::page_leave_collapses) so the two tracking domains can
+            // never disagree and thrash close->open->close.
+            if !state::page_leave_collapses(&app.bar_area, cursor_client_px(app)) {
                 app.mouse_inside = false;
                 return LRESULT(0);
             }
-            app.mouse_inside = false;
-            ISLAND_ACTIVE.store(false, Ordering::Release);
-            app.expanded = false;
-            // the island left mid-stream: default cancel — the partial
-            // stream is discarded silently
-            if app.chat.streaming {
-                CHAT_CANCEL.store(true, Ordering::Release);
-                app.chat.streaming = false;
-                app.chat.stream.clear();
-            }
-            // animation clock first so the painted frame fades the text out
-            // starting at alpha 1; it is fully gone before the shrink starts
-            render::animate(false);
-            render::draw_now(app);
-            start_fade_pump(app.hwnd, app, 0.0, state::CLOSE_DELAY + 0.05);
-            // keep the island window region until the shrink finishes, so the
-            // collapse isn't clipped by the idle strip mid-flight (Nusa does
-            // the same); a one-shot timer swaps regions after the settle.
-            schedule_idle_region(app.hwnd, state::CLOSE_SETTLE + state::CLOSE_DELAY + 0.12);
-            LRESULT(0)
-        }
-
-        WM_LBUTTONDOWN => {
-            let pt = state::client_pt(lparam);
-            let (px, py) = (pt.x as f32, pt.y as f32);
-            // Input field first (name prompt or chat line): begin a
-            // select-drag. The field sits below the viewport; rects are
-            // disjoint.
-            if let Some(pos) = render::field_caret_from_point(app, px, py) {
-                app.chat.clear_selection();
-                if let Some(sel) = field_sel_mut(app) {
-                    sel.dragging = true;
-                    sel.anchor = Some(pos);
-                    sel.range = Some((pos, pos));
-                    let _ = SetCapture(hwnd);
-                    render::draw_now(app);
-                }
-                LRESULT(0)
-            // Chat viewport: begin a select-drag. Anywhere else on the Chat
-            // screen (padding): drop the highlight.
-            } else if app.screen() == state::Screen::Chat {
-                if let Some(vp) = app.chat_viewport {
-                    if px >= vp[0] && px < vp[2] && py >= vp[1] && py < vp[3] {
-                        if let Some(pos) = render::caret_from_point(app, px, py) {
-                            app.chat.input_sel.clear();
-                            app.chat.selecting = true;
-                            app.chat.selection_anchor = Some(pos);
-                            app.chat.selection = Some((pos, pos));
-                            let _ = SetCapture(hwnd);
-                            render::draw_now(app);
-                        }
-                        LRESULT(0)
-                    } else {
-                        if app.chat.selection.is_some()
-                            || app.chat.selection_anchor.is_some()
-                        {
-                            app.chat.clear_selection();
-                            render::draw_now(app);
-                        }
-                        LRESULT(0)
-                    }
-                } else {
-                    DefWindowProcW(hwnd, msg, wparam, lparam)
-                }
-            } else {
-                // Clicking elsewhere on a field screen drops the field
-                // highlight; SignIn keeps default handling (pill uses UP).
-                let mut changed = false;
-                if let Some(sel) = field_sel_mut(app) {
-                    if sel.range.is_some() || sel.anchor.is_some() {
-                        sel.clear();
-                        changed = true;
-                    }
-                }
-                if changed {
-                    render::draw_now(app);
-                    LRESULT(0)
-                } else {
-                    DefWindowProcW(hwnd, msg, wparam, lparam)
-                }
-            }
-        }
-
-        WM_LBUTTONUP => {
-            // End of a field select-drag: a zero-length tap clears it.
-            if app.chat.input_sel.dragging || app.name_sel.dragging {
-                end_field_drag(&mut app.chat.input_sel);
-                end_field_drag(&mut app.name_sel);
-                let _ = ReleaseCapture();
-                render::draw_now(app);
-                return LRESULT(0);
-            }
-            // End of a viewport select-drag: a zero-length tap clears it.
-            if app.chat.selecting {
-                app.chat.selecting = false;
-                let _ = ReleaseCapture();
-                if let Some((a, b)) = app.chat.selection {
-                    if a == b {
-                        app.chat.clear_selection();
-                    }
-                } else {
-                    app.chat.selection_anchor = None;
-                }
-                render::draw_now(app);
-                return LRESULT(0);
-            } else if app.screen() == state::Screen::SignIn
-                && app.chat.shows_signin_button()
-                && !app.chat.signing_in
-            {
-                // Only the sign-in pill is clickable: it starts the
-                // browser-based ChatGPT sign-in (same as tray Connect).
-                let pt = state::client_pt(lparam);
-                let (px, py) = (pt.x as f32, pt.y as f32);
-                let on_pill = app.signin_rect.is_some_and(|r| state::App::hit(&r, px, py));
-                // Lenient: the pill is the visual, but the whole island stays
-                // actionable so a first-timer cannot miss.
-                let a = app.bar_area;
-                let on_island = px >= a[0] && px < a[2] && py >= a[1] && py < a[3];
-                if on_pill || on_island {
-                    start_signin(app);
-                    render::draw_now(app);
-                }
-            }
+            collapse(app);
             LRESULT(0)
         }
 
         WM_TIMER => {
             match wparam.0 {
-                TIMER_FADE_START => {
-                    KillTimer(hwnd, TIMER_FADE_START).ok();
-                    SetTimer(hwnd, TIMER_FADE, FADE_STEP_MS, None);
-                }
-                TIMER_FADE => {
-                    if app.pump_steps == 0 {
-                        KillTimer(hwnd, TIMER_FADE).ok();
-                    } else {
-                        app.pump_steps -= 1;
-                        render::draw_now(app);
-                        if app.pump_steps == 0 {
-                            KillTimer(hwnd, TIMER_FADE).ok();
-                        }
-                    }
-                }
                 TIMER_IDLE_RGN => {
-                    KillTimer(hwnd, TIMER_IDLE_RGN).ok();
+                    KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
+                    // Post-settle teardown: the spring is done, so destroying
+                    // the Chromium surface (and swapping the region) is
+                    // invisible. Never hide mid-spring.
+                    island_web::set_visible(false);
                     after_state_change(app);
+                }
+                TIMER_WEB_SHOW => {
+                    KillTimer(Some(hwnd), TIMER_WEB_SHOW).ok();
+                    // Late leave wins: only reveal if still expanded.
+                    if app.expanded {
+                        show_web_now(app);
+                    }
                 }
                 _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
             }
@@ -574,7 +340,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             render::draw_now(app);
             // validate: without this the update region never clears and the
             // resulting WM_PAINT storm starves everything in the queue
-            let _ = ValidateRect(hwnd, None);
+            let _ = ValidateRect(Some(hwnd), None);
             LRESULT(0)
         }
 
@@ -585,10 +351,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_DESTROY => {
             let hook_handle = KEYHOOK.load(Ordering::Relaxed);
-            if hook_handle != 0 {
-                let _ = UnhookWindowsHookEx(HHOOK(hook_handle as *mut _));
-            }
-            let hook_handle = MOUSEHOOK.load(Ordering::Relaxed);
             if hook_handle != 0 {
                 let _ = UnhookWindowsHookEx(HHOOK(hook_handle as *mut _));
             }
@@ -604,37 +366,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if msg == WM_KEY {
                 handle_chat_key(app, wparam.0);
                 LRESULT(0)
-            } else if msg == WM_WHEEL {
-                // wheel up (positive) reveals older lines; draw clamps to
-                // [0, max_scroll] and skips work when nothing overflows
-                let delta = wparam.0 as i32;
-                if delta != 0 && app.chat.max_scroll > 0.0 {
-                    app.chat.scroll =
-                        (app.chat.scroll + delta.signum() as f32 * WHEEL_STEP * app.scale)
-                            .clamp(0.0, app.chat.max_scroll);
-                    render::draw_now(app);
-                }
+            } else if msg == island_web::WM_WEBMSG {
+                handle_webmsg(app, lparam);
                 LRESULT(0)
             } else if msg == tray::TRAY_CALLBACK {
                 // left click toggles the island, right click opens the menu
                 let lowword = (lparam.0 & 0xFFFF) as u16 as i32;
                 if lowword == WM_RBUTTONUP as i32 {
                     handle_tray_menu(app);
-                } else if lowword == WM_LBUTTONUP as i32 {
+                } else if lowword == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP as i32
+                {
                     app.expanded = !app.expanded;
                     ISLAND_ACTIVE.store(app.expanded, Ordering::Release);
-                    // animation clock first, then the launch frame (same
-                    // choreography as the hover paths)
                     render::animate(app.expanded);
                     render::draw_now(app);
                     if app.expanded {
-                        after_state_change(app); // island region now, so it stays clickable while the clip animates open
-                        start_fade_pump(app.hwnd, app, state::open_settle(), state::CONTENT_FADE + 0.05);
+                        unsafe {
+                            KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
+                        }
+                        after_state_change(app);
+                        island_web::layout(app.scale);
+                        schedule_web_show(hwnd);
                     } else {
-                        // the region swaps only after the shrink settles, so
-                        // the collapse isn't clipped by the idle strip
-                        schedule_idle_region(app.hwnd, state::CLOSE_SETTLE + state::CLOSE_DELAY + 0.12);
-                        start_fade_pump(app.hwnd, app, 0.0, state::CLOSE_DELAY + 0.05);
+                        collapse(app);
                     }
                 }
                 LRESULT(0)
@@ -649,6 +403,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
     }
+}
+
+/// Shared collapse path: hover-out, tray toggle, and the page's own
+/// mouseleave all land here.
+fn collapse(app: &mut state::App) {
+    app.mouse_inside = false;
+    ISLAND_ACTIVE.store(false, Ordering::Release);
+    app.expanded = false;
+    // the island left mid-stream: default cancel — the partial
+    // stream is discarded silently
+    if app.chat.streaming {
+        CHAT_CANCEL.store(true, Ordering::Release);
+        app.chat.streaming = false;
+        app.chat.stream.clear();
+    }
+    // Fade the page instead of hiding it: destroying the live Chromium
+    // surface mid-spring hitches DWM in the first frames of the shrink
+    // (the close lag). Opacity is composited inside Chromium — no DWM
+    // topology change. The real hide is deferred to TIMER_IDLE_RGN,
+    // post-settle, next to the region swap. This mirrors the frozen
+    // choreography: content leaves during the CLOSE_DELAY hold, shell
+    // shrinks alone after.
+    island_web::fade_out();
+    unsafe {
+        KillTimer(Some(app.hwnd), TIMER_WEB_SHOW).ok();
+    }
+    render::animate(false);
+    render::draw_now(app);
+    // the region swaps only after the shrink settles, so the collapse
+    // isn't clipped by the idle strip
+    unsafe {
+        schedule_idle_region(
+            app.hwnd,
+            state::CLOSE_SETTLE + state::CLOSE_DELAY + 0.12,
+        )
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -672,7 +462,7 @@ fn handle_tray_menu(app: &mut state::App) {
 }
 
 // ---------------------------------------------------------------------------
-// chat handling (Milestones 1–3)
+// chat handling
 // ---------------------------------------------------------------------------
 
 fn disconnect(app: &mut state::App) {
@@ -688,17 +478,14 @@ fn disconnect(app: &mut state::App) {
     app.chat.stream.clear();
     app.chat.history.clear();
     app.chat.notice = None;
-    app.chat.clear_selection();
-    app.chat.input_sel.clear();
     CHAT_CANCEL.store(true, Ordering::Release);
     app.chat.error = Some("Disconnected from ChatGPT.".into());
-    render::draw_now(app);
+    push_web(app);
 }
 
 /// Tray "Connect ChatGPT": browser-based SIWC authorization on a worker
 /// thread. Fresh installs register dynamically; saved accounts reauthorize
-/// with their issued client id (also the path for authorizing plan usage
-/// after an identity-only sign-in).
+/// with their issued client id.
 fn start_signin(app: &mut state::App) {
     if app.chat.signing_in || app.chat.streaming {
         return;
@@ -708,13 +495,18 @@ fn start_signin(app: &mut state::App) {
     }
     app.chat.signing_in = true;
     app.chat.error = None;
-    render::draw_now(app);
+    push_web(app);
     let hwnd = app.hwnd.0 as isize;
     let saved = app.chat.tokens.clone();
     std::thread::spawn(move || unsafe {
         let hwnd_raw = HWND(hwnd as *mut _);
         let fail = |m: String| {
-            let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_ERROR), LPARAM(Box::into_raw(Box::new(m)) as isize));
+            let _ = PostMessageW(
+                Some(hwnd_raw),
+                WM_CHAT,
+                WPARAM(CHAT_ERROR),
+                LPARAM(Box::into_raw(Box::new(m)) as isize),
+            );
         };
         let host_id = match connector::auth::load_or_create_host_id() {
             Ok(h) => h,
@@ -730,15 +522,11 @@ fn start_signin(app: &mut state::App) {
                 return;
             }
         };
-        // Keep the redirect target and verifier before the blocking wait.
         eprintln!("[notchbud] signin: listener on {}", pending.redirect_uri);
-        // Open the approval page in the default browser; the clipboard
-        // keeps a silent copy in case the handoff is blocked. The same
-        // loopback callback completes either path.
         open_browser(&url);
         let _ = copy_text_to_clipboard(&url);
         let _ = PostMessageW(
-            hwnd_raw,
+            Some(hwnd_raw),
             WM_CHAT,
             WPARAM(CHAT_STATUS),
             LPARAM(Box::into_raw(Box::new(
@@ -761,23 +549,32 @@ fn start_signin(app: &mut state::App) {
                 return;
             }
         };
-        match connector::auth::finish_signin(&data, &cb.client_id, &nonce, &host_id, saved.as_ref()) {
+        match connector::auth::finish_signin(&data, &cb.client_id, &nonce, &host_id, saved.as_ref())
+        {
             Ok(t) => {
-                // Persistence must not fail silently: without the saved grant
-                // the next launch would be signed out again. Still connect
-                // this session so a storage hiccup doesn't waste an approval.
                 if let Err(e) = connector::auth::save_tokens(&t) {
                     eprintln!("[notchbud] credentials could not be saved ({e}); session continues without persistence");
-                    let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_CONNECTED), LPARAM(Box::into_raw(Box::new(t)) as isize));
+                    let _ = PostMessageW(
+                        Some(hwnd_raw),
+                        WM_CHAT,
+                        WPARAM(CHAT_CONNECTED),
+                        LPARAM(Box::into_raw(Box::new(t)) as isize),
+                    );
                     fail("Signed in for now, but credentials could not be saved — sign-in won't survive a restart.".into());
                     return;
                 }
-                let _ = PostMessageW(hwnd_raw, WM_CHAT, WPARAM(CHAT_CONNECTED), LPARAM(Box::into_raw(Box::new(t)) as isize));
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_CHAT,
+                    WPARAM(CHAT_CONNECTED),
+                    LPARAM(Box::into_raw(Box::new(t)) as isize),
+                );
             }
             Err(e) => fail(e.msg),
         }
     });
 }
+
 fn copy_text_to_clipboard(text: &str) -> bool {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{
@@ -797,7 +594,7 @@ fn copy_text_to_clipboard(text: &str) -> bool {
             if !p.is_null() {
                 std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
                 let _ = GlobalUnlock(h);
-                if SetClipboardData(13 /* CF_UNICODETEXT */, HANDLE(h.0)).is_ok() {
+                if SetClipboardData(13 /* CF_UNICODETEXT */, Some(HANDLE(h.0))).is_ok() {
                     ok = true;
                 }
             }
@@ -807,8 +604,7 @@ fn copy_text_to_clipboard(text: &str) -> bool {
     }
 }
 
-/// Read Unicode text off the clipboard (for field paste). System-owned
-/// handle: lock/unlock only, never freed.
+/// Read Unicode text off the clipboard (for hook paste injection).
 fn get_clipboard_text() -> Option<String> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
@@ -837,248 +633,160 @@ fn get_clipboard_text() -> Option<String> {
     }
 }
 
-/// Open the URL the way any app opens a link: hand it to the OS, which
-/// routes it to the already-running default browser.
 fn open_browser(url: &str) {
     use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    let op: Vec<u16> = "open\0".encode_utf16().collect();
-    let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        ShellExecuteW(
-            HWND(std::ptr::null_mut()),
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let mut file: Vec<u16> = url.encode_utf16().collect();
+        file.push(0);
+        let _ = ShellExecuteW(
+            None,
             windows::core::PCWSTR(op.as_ptr()),
             windows::core::PCWSTR(file.as_ptr()),
-            windows::core::PCWSTR::null(),
-            windows::core::PCWSTR::null(),
-            SW_SHOWNORMAL,
+            None,
+            None,
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
     }
 }
 
-/// WM_KEY from the hook: onboarding edits the name field, otherwise the chat
-/// input line. Enter submits. Chat keys only work while signed in — a
-/// signed-out island shows just the sign-in pill, with nothing to type in.
-/// Field shortcuts: Ctrl+C copies the field highlight (else the transcript
-/// on Chat / the whole line elsewhere), Ctrl+X cuts it, Ctrl+V pastes,
-/// Ctrl+A selects the line first, then the transcript.
+/// WM_KEY from the hook: the page owns editing, so forward printable keys
+/// and shortcuts straight into it. Paste injects via the hook path so it
+/// works without OS focus; everything else is browser-native.
 fn handle_chat_key(app: &mut state::App, code: usize) {
     if app.needs_onboarding() {
-        handle_name_key(app, code);
+        // Onboarding has no Rust-side draft: the page owns the name field.
+        match code {
+            KEY_COPY => island_web::forward_shortcut("copy"),
+            KEY_SELECT_ALL => island_web::forward_shortcut("selectAll"),
+            KEY_CUT => island_web::forward_shortcut("cut"),
+            KEY_PASTE => paste_into_page(),
+            c if c == VK_BACK.0 as usize || c == VK_RETURN.0 as usize || c == VK_ESCAPE.0 as usize => {
+                island_web::forward_key(c)
+            }
+            c if (32..=0x10FFFF).contains(&c) => island_web::forward_key(c),
+            _ => {}
+        }
         return;
     }
-    if code == KEY_COPY || code == KEY_SELECT_ALL || code == KEY_CUT || code == KEY_PASTE {
-        // CUT/PASTE edit the visible input line: needs a field and no
-        // running stream (typing is gated the same way).
-        if code == KEY_CUT || code == KEY_PASTE {
-            if !app.chat.connected() || app.chat.streaming {
-                return;
-            }
-            if code == KEY_CUT {
-                if let Some(text) = app.chat.input_sel.selected(&app.chat.input) {
-                    if copy_text_to_clipboard(&text) {
-                        let _ = app.chat.input_sel.delete_selected(&mut app.chat.input);
-                        app.chat.error = None;
-                        render::draw_now(app);
-                    }
-                }
-            } else if let Some(clip) = get_clipboard_text() {
-                app.chat
-                    .input_sel
-                    .replace_selected(&mut app.chat.input, &clip, 400);
-                app.chat.error = None;
-                render::draw_now(app);
-            }
-            return;
-        }
-        // Input highlight wins over the viewport for copy; select-all takes
-        // the line first and the transcript on the repeat.
-        if code == KEY_COPY {
-            if let Some(t) = app.chat.input_sel.selected(&app.chat.input) {
-                if !t.is_empty() {
-                    copy_text_to_clipboard(&t);
-                }
-                return;
-            }
-            if app.screen() == state::Screen::Chat {
-                // COPY/SELECT-ALL on the Chat viewport work mid-stream, so
-                // a partial reply can be grabbed while it arrives.
-                let text = app.chat.copy_text();
-                if !text.trim().is_empty() {
-                    copy_text_to_clipboard(&text);
-                }
-            } else if !app.chat.input.trim().is_empty() {
-                copy_text_to_clipboard(&app.chat.input.clone());
-            }
-            return;
-        }
-        if app.screen() == state::Screen::Chat {
-            let total = state::utf16_len(&app.chat.input);
-            let line_full =
-                total > 0 && app.chat.input_sel.normalized(&app.chat.input) == Some((0, total));
-            if total > 0 && !line_full {
-                app.chat.input_sel.select_all(&app.chat.input);
-            } else {
-                app.chat.input_sel.clear();
-                app.chat.select_all();
-            }
-            render::draw_now(app);
-        } else if app.chat.connected() {
-            app.chat.input_sel.select_all(&app.chat.input);
-            render::draw_now(app);
-        }
+    if code == KEY_COPY {
+        island_web::forward_shortcut("copy");
+        return;
+    }
+    if code == KEY_SELECT_ALL {
+        island_web::forward_shortcut("selectAll");
+        return;
+    }
+    if code == KEY_CUT {
+        island_web::forward_shortcut("cut");
+        return;
+    }
+    if code == KEY_PASTE {
+        paste_into_page();
         return;
     }
     if !app.chat.connected() || app.chat.streaming {
         return; // no field to type in; silent while a stream runs
     }
-    // typing targets the input line at the bottom of the slot; snap back
-    app.chat.scroll = 0.0;
     match code {
-        c if c == VK_BACK.0 as usize => {
-            // Backspace clears a highlight, else pops a char.
-            if app.chat.input_sel.normalized(&app.chat.input).is_some() {
-                let _ = app.chat.input_sel.delete_selected(&mut app.chat.input);
-            } else {
-                app.chat.input.pop();
-            }
-            app.chat.error = None;
+        c if c == VK_BACK.0 as usize || c == VK_RETURN.0 as usize || c == VK_ESCAPE.0 as usize => {
+            island_web::forward_key(c)
         }
-        c if c == VK_ESCAPE.0 as usize => {
-            app.chat.input.clear();
-            app.chat.error = None;
-            app.chat.clear_selection();
-            app.chat.input_sel.clear();
-        }
-        c if c == VK_RETURN.0 as usize => submit_chat(app),
-        c if (32..=0x10FFFF).contains(&c) => {
-            if let Some(ch) = char::from_u32(c as u32) {
-                if !ch.is_control() {
-                    // Typing over a highlight replaces it (standard edit).
-                    if app.chat.input_sel.normalized(&app.chat.input).is_some() {
-                        let mut s = String::new();
-                        s.push(ch);
-                        app.chat
-                            .input_sel
-                            .replace_selected(&mut app.chat.input, &s, 400);
-                        app.chat.error = None;
-                    } else if app.chat.input.chars().count() < 400 {
-                        app.chat.input.push(ch);
-                        app.chat.error = None;
-                    }
-                }
-            }
-        }
+        c if (32..=0x10FFFF).contains(&c) => island_web::forward_key(c),
         _ => {}
     }
-    render::draw_now(app);
 }
 
-/// WM_KEY while the island asks for a name: same editing keys, capped at
-/// NAME_MAX_CHARS. Enter persists (greeting and chat wait for sign-in);
-/// Escape clears the draft. The draft is selectable/copyable/cuttable like
-/// the chat line.
-fn handle_name_key(app: &mut state::App, code: usize) {
-    if code == KEY_COPY {
-        if let Some(t) = app.name_sel.selected(&app.name_draft) {
-            if !t.is_empty() {
-                copy_text_to_clipboard(&t);
-            }
-        } else if !app.name_draft.trim().is_empty() {
-            copy_text_to_clipboard(&app.name_draft.clone());
-        }
-        return;
-    }
-    if code == KEY_CUT {
-        if let Some(text) = app.name_sel.selected(&app.name_draft) {
-            if copy_text_to_clipboard(&text) {
-                let _ = app.name_sel.delete_selected(&mut app.name_draft);
-                app.name_error = None;
-                render::draw_now(app);
-            }
-        }
-        return;
-    }
-    if code == KEY_PASTE {
-        if let Some(clip) = get_clipboard_text() {
-            app.name_sel
-                .replace_selected(&mut app.name_draft, &clip, user::NAME_MAX_CHARS);
-            app.name_error = None;
-            render::draw_now(app);
-        }
-        return;
-    }
-    if code == KEY_SELECT_ALL {
-        app.name_sel.select_all(&app.name_draft);
-        render::draw_now(app);
-        return;
-    }
-    match code {
-        c if c == VK_BACK.0 as usize => {
-            if app.name_sel.normalized(&app.name_draft).is_some() {
-                let _ = app.name_sel.delete_selected(&mut app.name_draft);
+/// Paste without focus: read the clipboard in Rust and inject it through
+/// the same key path as physical typing (respects the page's 400-char cap).
+fn paste_into_page() {
+    if let Some(clip) = get_clipboard_text() {
+        for ch in clip.chars().filter(|c| !c.is_control()).take(400) {
+            if let Some(c) = char_to_code(ch) {
+                island_web::forward_key(c);
             } else {
-                app.name_draft.pop();
+                break;
             }
-            app.name_error = None;
         }
-        c if c == VK_ESCAPE.0 as usize => {
-            app.name_draft.clear();
-            app.name_error = None;
-            app.name_sel.clear();
+    } else {
+        island_web::forward_shortcut("paste");
+    }
+}
+
+fn char_to_code(ch: char) -> Option<usize> {
+    let v = ch as u32 as usize;
+    if (32..=0x10FFFF).contains(&v) {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// WM_WEBMSG from the page: signin / submit / name / mouseleave intents.
+fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
+    let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
+    let v: serde_json::Value = match serde_json::from_str(&s) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[notchbud] webmsg parse: {e:#}");
+            return;
         }
-        c if c == VK_RETURN.0 as usize => submit_name(app),
-        c if (32..=0x10FFFF).contains(&c) => {
-            if let Some(ch) = char::from_u32(c as u32) {
-                if !ch.is_control() {
-                    if app.name_sel.normalized(&app.name_draft).is_some() {
-                        let mut s = String::new();
-                        s.push(ch);
-                        app.name_sel.replace_selected(
-                            &mut app.name_draft,
-                            &s,
-                            user::NAME_MAX_CHARS,
-                        );
-                        app.name_error = None;
-                    } else if app.name_draft.chars().count() < user::NAME_MAX_CHARS
-                    {
-                        app.name_draft.push(ch);
-                        app.name_error = None;
-                    }
-                }
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("signin") => start_signin(app),
+        Some("submit") => {
+            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            submit_chat(app, &text);
+        }
+        Some("name") => {
+            let raw = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            submit_name(app, &raw);
+        }
+        Some("mouseleave") => {
+            if !app.expanded {
+                return;
+            }
+            // The page can't tell "left to desktop" from "left to the parent
+            // surface" — the child is inset in the island, so most exits
+            // cross parent strips first. Collapsing here thrashed
+            // close->open->close on every downward exit (page leave, then a
+            // parent MOUSEMOVE re-expand, then the true leave). Only a cursor
+            // outside the island bar is a true exit (see
+            // state::page_leave_collapses); otherwise just make sure the
+            // parent catches it.
+            if state::page_leave_collapses(&app.bar_area, cursor_client_px(app)) {
+                collapse(app);
+            } else {
+                app.mouse_inside = false;
+                unsafe { arm_leave_tracking(app.hwnd) };
             }
         }
         _ => {}
     }
-    render::draw_now(app);
 }
 
 /// Onboarding submit: persist the name so the next launch greets directly.
-/// Blank/too-long drafts stay on the prompt with the reason underneath.
-fn submit_name(app: &mut state::App) {
-    match user::save_name(&app.name_draft) {
+fn submit_name(app: &mut state::App, raw: &str) {
+    match user::save_name(raw) {
         Ok(canonical) => {
             app.user_name = Some(canonical);
-            app.name_draft.clear();
             app.name_error = None;
-            app.name_sel.clear();
         }
         Err(e) => {
             eprintln!("[notchbud] save name failed: {}", e.detail);
             app.name_error = Some(e.ui.to_owned());
         }
     }
-    render::draw_now(app);
+    push_web(app);
 }
+
 /// Enter: push the user turn, spawn the connector thread for one streaming
 /// response. Refresh happens on the chat thread (5-min margin), never UI.
-fn submit_chat(app: &mut state::App) {
-    let text = app.chat.input.trim().to_string();
+fn submit_chat(app: &mut state::App, raw: &str) {
+    let text = raw.trim().to_string();
     if text.is_empty() {
         return;
     }
-    // Keys only reach here while signed in (handle_chat_key gates), so a
-    // missing connection just drops a stale turn instead of stranding it.
     let Some(tokens) = app.chat.tokens.clone() else { return };
     if app.chat.streaming {
         return;
@@ -1087,18 +795,16 @@ fn submit_chat(app: &mut state::App) {
         // Identity-only sign-in: inference stays off until plan usage is
         // authorized (tray Connect re-runs OAuth with the full scope set).
         app.chat.error = Some("ChatGPT plan use isn't enabled — Connect again to authorize it.".into());
-        render::draw_now(app);
+        push_web(app);
         return;
     }
-    app.chat.input.clear();
-    app.chat.input_sel.clear();
     app.chat.push_history(state::Role::User, text);
     app.chat.streaming = true;
     app.chat.stream.clear();
     app.chat.error = None;
     app.chat.notice = None;
     CHAT_CANCEL.store(false, Ordering::Release);
-    render::draw_now(app);
+    push_web(app);
 
     let hwnd = app.hwnd.0 as isize;
     let history: Vec<state::Msg> = app
@@ -1120,14 +826,24 @@ fn submit_chat(app: &mut state::App) {
                     if let Err(e) = connector::auth::save_tokens(&t) {
                         eprintln!("[notchbud] refreshed credentials could not be saved ({e}); this session continues, but the sign-in may not survive a restart");
                     }
-                    let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_CONNECTED), LPARAM(Box::into_raw(Box::new(t.clone())) as isize));
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_CHAT,
+                        WPARAM(CHAT_CONNECTED),
+                        LPARAM(Box::into_raw(Box::new(t.clone())) as isize),
+                    );
                     t
                 }
                 Err(e) if e.expired => {
                     // Terminal: the saved grant is unusable. Clear it so the
                     // island falls back to the sign-in prompt.
                     connector::auth::delete_tokens();
-                    let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_SIGNED_OUT), LPARAM(Box::into_raw(Box::new(e.msg)) as isize));
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_CHAT,
+                        WPARAM(CHAT_SIGNED_OUT),
+                        LPARAM(Box::into_raw(Box::new(e.msg)) as isize),
+                    );
                     return;
                 }
                 // transient: the still-valid access token usually works
@@ -1140,15 +856,32 @@ fn submit_chat(app: &mut state::App) {
                 // The account catalog decides; no hardcoded fallback.
                 match connector::auth::pick_model(&tokens) {
                     Ok(m) => {
-                        let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_MODEL), LPARAM(Box::into_raw(Box::new(m.clone())) as isize));
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_CHAT,
+                            WPARAM(CHAT_MODEL),
+                            LPARAM(Box::into_raw(Box::new(m.clone())) as isize),
+                        );
                         m
                     }
                     Err(msg) => {
                         if msg == "expired" {
                             connector::auth::delete_tokens();
-                            let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_SIGNED_OUT), LPARAM(Box::into_raw(Box::new("Sign-in expired. Connect again from the tray.".to_owned())) as isize));
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_CHAT,
+                                WPARAM(CHAT_SIGNED_OUT),
+                                LPARAM(Box::into_raw(Box::new(
+                                    "Sign-in expired. Connect again from the tray.".to_owned(),
+                                )) as isize),
+                            );
                         } else {
-                            let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_ERROR), LPARAM(Box::into_raw(Box::new(msg)) as isize));
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_CHAT,
+                                WPARAM(CHAT_ERROR),
+                                LPARAM(Box::into_raw(Box::new(msg)) as isize),
+                            );
                         }
                         return;
                     }
@@ -1156,7 +889,12 @@ fn submit_chat(app: &mut state::App) {
             }
         };
         let post_delta = |d: String| {
-            let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_DELTA), LPARAM(Box::into_raw(Box::new(d)) as isize));
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_CHAT,
+                WPARAM(CHAT_DELTA),
+                LPARAM(Box::into_raw(Box::new(d)) as isize),
+            );
         };
         let cancelled = || CHAT_CANCEL.load(Ordering::Relaxed);
         let result = connector::chat::stream_chat(&tokens, &model, &history, user_name.as_deref(), |ev| match ev {
@@ -1170,16 +908,26 @@ fn submit_chat(app: &mut state::App) {
             }
             connector::chat::StreamEvent::Done => false,
             connector::chat::StreamEvent::Error(m) => {
-                let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_ERROR), LPARAM(Box::into_raw(Box::new(m)) as isize));
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_CHAT,
+                    WPARAM(CHAT_ERROR),
+                    LPARAM(Box::into_raw(Box::new(m)) as isize),
+                );
                 false
             }
         });
         match result {
             Ok(()) => {
-                let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_DONE), LPARAM(0));
+                let _ = PostMessageW(Some(hwnd), WM_CHAT, WPARAM(CHAT_DONE), LPARAM(0));
             }
             Err(m) => {
-                let _ = PostMessageW(hwnd, WM_CHAT, WPARAM(CHAT_ERROR), LPARAM(Box::into_raw(Box::new(m)) as isize));
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_CHAT,
+                    WPARAM(CHAT_ERROR),
+                    LPARAM(Box::into_raw(Box::new(m)) as isize),
+                );
             }
         }
     });
@@ -1192,7 +940,7 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
             if app.chat.streaming {
                 app.chat.stream.push_str(&s);
-                render::draw_now(app);
+                push_web_throttled(app);
             }
         }
         CHAT_DONE => {
@@ -1202,7 +950,7 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
                     app.chat.push_history(state::Role::Assistant, done);
                 }
                 app.chat.streaming = false;
-                render::draw_now(app);
+                push_web(app);
             }
         }
         CHAT_ERROR => {
@@ -1212,15 +960,14 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
                 app.chat.stream.clear();
                 app.chat.error = Some(*s);
                 // A failed sign-in must be retryable: drop the in-progress
-                // flag so the island falls back to the
-                // "Sign in with ChatGPT" prompt (click to retry).
+                // flag so the island falls back to the sign-in prompt.
                 app.chat.signing_in = false;
                 app.chat.notice = None;
             } else {
                 // a cancelled leave: swallow the failure quietly
                 CHAT_CANCEL.store(false, Ordering::Release);
             }
-            render::draw_now(app);
+            push_web(app);
         }
         CHAT_CONNECTED => {
             let t = unsafe { Box::from_raw(lparam.0 as *mut connector::auth::Tokens) };
@@ -1228,12 +975,12 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             app.chat.signing_in = false;
             app.chat.notice = None;
             app.chat.error = None;
-            render::draw_now(app);
+            push_web(app);
         }
         CHAT_STATUS => {
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
             app.chat.notice = Some(*s);
-            render::draw_now(app);
+            push_web(app);
         }
         CHAT_SIGNED_OUT => {
             // Terminal auth failure (expired/revoked grant): the saved grant
@@ -1246,7 +993,7 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             app.chat.signing_in = false;
             app.chat.notice = None;
             app.chat.error = Some(*s);
-            render::draw_now(app);
+            push_web(app);
         }
         CHAT_MODEL => {
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
@@ -1264,9 +1011,12 @@ fn reflow_on_dpi_change(app: &mut state::App, lparam: LPARAM) {
         app.width = w.round() as i32;
         app.height = h.round() as i32;
         let _ = SetWindowPos(
-            app.hwnd, None,
-            suggested.left, suggested.top,
-            app.width, app.height,
+            app.hwnd,
+            None,
+            suggested.left,
+            suggested.top,
+            app.width,
+            app.height,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
         // refresh the cached origin the hit-test reads (avoids GetWindowRect
@@ -1276,6 +1026,7 @@ fn reflow_on_dpi_change(app: &mut state::App, lparam: LPARAM) {
         app.win_x = wr.left;
         app.win_y = wr.top;
         render::draw_now(app); // resizes its renderer on dim/scale change
+        island_web::layout(app.scale);
         after_state_change(app);
     }
 }
@@ -1286,7 +1037,10 @@ fn reflow_on_dpi_change(app: &mut state::App, lparam: LPARAM) {
 
 fn dpi_scale() -> f32 {
     unsafe {
-        let monitor = MonitorFromPoint(windows::Win32::Foundation::POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let monitor = MonitorFromPoint(
+            windows::Win32::Foundation::POINT { x: 0, y: 0 },
+            MONITOR_DEFAULTTOPRIMARY,
+        );
         let (mut dx, mut dy) = (96u32, 96u32);
         if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_ok() && dx > 0 {
             dx as f32 / 96.0
@@ -1325,11 +1079,30 @@ fn main() -> Result<()> {
         let scale = dpi_scale();
 
         // --- class "NotchWindow" + our wndproc ---
+        // Cat-logo icon from the exe resources (assets/app.rc, group id 1).
+        let hicon_big = LoadImageW(
+            Some(hinstance),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            32,
+            32,
+            LR_DEFAULTCOLOR,
+        )?;
+        let hicon_sm = LoadImageW(
+            Some(hinstance),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            16,
+            16,
+            LR_DEFAULTCOLOR,
+        )?;
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
-            hCursor: LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_ARROW)?,
+            hIcon: HICON(hicon_big.0),
+            hIconSm: HICON(hicon_sm.0),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: w!("NotchbudWindow"),
             ..Default::default()
         };
@@ -1351,7 +1124,7 @@ fn main() -> Result<()> {
             height,
             None,
             None,
-            hinstance,
+            Some(hinstance),
             None,
         )?;
 
@@ -1366,9 +1139,7 @@ fn main() -> Result<()> {
         // --- one-time Run-key self-heal (exe moved -> rewrite the path) ---
         prefs::heal_start_with_windows();
 
-        // --- tray icon + explorer-restart hook (non-fatal: the island
-        // runs fine without it; Shell_NotifyIcon NIM_ADD can return
-        // E_ACCESSDENIED on machines where Explorer blocks the icon) ---
+        // --- tray icon + explorer-restart hook (non-fatal) ---
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         if let Err(e) = tray::add_tray(hwnd) {
             eprintln!("[notchbud] tray unavailable, continuing without it: {e:#}");
@@ -1376,8 +1147,12 @@ fn main() -> Result<()> {
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
         TASKBAR_MSG.store(taskbar_created, Ordering::Relaxed);
 
-        // --- keyboard hook for the chat input (never activates the window) ---
+        // --- keyboard hook for the island input (never activates the window) ---
         install_key_hook(hwnd, hinstance);
+
+        // --- WebView2 content host (transparent child over the island) ---
+        island_web::init(hwnd, scale);
+        island_web::layout(scale);
 
         // first frame
         if let Some(app) = app_from(hwnd) {
@@ -1389,7 +1164,7 @@ fn main() -> Result<()> {
         let mut msg = MSG::default();
         loop {
             let r = GetMessageW(&mut msg, None, 0, 0);
-            if r.as_bool() {
+            if r.0 != 0 {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             } else {

@@ -1,4 +1,8 @@
 // state.rs — minimal notch state: idle sliver -> hover-expanding island.
+//
+// Shell motion (springs, scales) is unchanged. Content now lives in
+// HTML/CSS inside WebView2: this file keeps only the backend state the
+// page renders (greeting inputs come from the page, not from Rust edits).
 
 use windows::Win32::Foundation::POINT;
 
@@ -16,12 +20,6 @@ pub const ISLAND_H: f32 = 140.4;
 pub const ISLAND_X: f32 = (WINDOW_UNITS_W - ISLAND_W) / 2.0;
 pub const ISLAND_FLARE_R: f32 = 16.8; // top swoop radius (unit-scaled, not px-fixed)
 pub const ISLAND_BOT_R: f32 = 35.2; // bottom corner radius
-
-/// Uniform island content inset, layout units: the text field keeps this
-/// margin on the left, right, AND bottom so the spacing reads even on all
-/// sides (one spacing value, no optical exceptions). Small enough that the
-/// field stretches close to the island borders.
-pub const FIELD_INSET: f32 = 16.0;
 
 pub const SLIVER_W: f32 = 45.6; // idle tab 57x5 physical px
 pub const SLIVER_H: f32 = 14.0; // hover strip height — matches Nusa's idle hit area
@@ -205,8 +203,9 @@ pub fn scale_swell() -> [f32; 2] {
 }
 
 // ---------------------------------------------------------------------------
-// Chat state — everything the streaming panel inside the frozen island needs.
-// Geometry, springs, scale choreography above are untouched.
+// Chat state — backend only. Editing, selection, scrolling and all text
+// measurement now live in the WebView2 page; Rust keeps tokens, history,
+// the live stream and status lines, and pushes them as JSON.
 // ---------------------------------------------------------------------------
 
 pub use crate::connector::chat::{Msg, Role, StreamEvent};
@@ -217,9 +216,7 @@ const HISTORY_MAX: usize = 8;
 /// Which island section owns the frame. Every visual state maps to exactly
 /// one of these — no overlaps, no bare fallbacks:
 /// * Onboarding — no saved name yet: "What should we call you?" + name field.
-///   Enter submits; there is no button.
-/// * SignIn — name known but not connected: status + the "Sign in with
-///   ChatGPT" pill, exactly like before. No greeting, no chat field.
+/// * SignIn — name known but not connected: status + the sign-in pill.
 /// * Home — signed in, no chat yet: time-based greeting + chat field.
 /// * Chat — signed in and chatting: history/stream + chat field pinned down.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -235,7 +232,6 @@ pub struct Chat {
     pub tokens: Option<crate::connector::auth::Tokens>,
     /// Resolved plan model from the account catalog, cached per sign-in.
     pub model: Option<String>,
-    pub input: String,
     /// Assistant text currently arriving.
     pub stream: String,
     /// Finished turns, oldest first.
@@ -248,21 +244,6 @@ pub struct Chat {
     pub notice: Option<String>,
     /// One-line error/status for the slot.
     pub error: Option<String>,
-    /// Scroll offset in px; 0 = pinned to the newest line (bottom-anchored),
-    /// larger values reveal older lines. Wheel hook adjusts, draw clamps.
-    pub scroll: f32,
-    /// Content height beyond the island viewport; refreshed every frame.
-    pub max_scroll: f32,
-    /// Highlight in the chat input line (UTF-16 offsets into `input`).
-    pub input_sel: FieldSel,
-    /// Mouse text selection in the Chat viewport, as UTF-16 offsets into
-    /// `viewport_text()` (the unit DirectWrite hit-testing counts in),
-    /// sorted, end-exclusive. None = no highlight.
-    pub selection: Option<(usize, usize)>,
-    /// Anchor caret offset where the current drag started (UTF-16 units).
-    pub selection_anchor: Option<usize>,
-    /// True between WM_LBUTTONDOWN and WM_LBUTTONUP of a select drag.
-    pub selecting: bool,
 }
 
 impl Chat {
@@ -270,19 +251,12 @@ impl Chat {
         Chat {
             tokens: None,
             model: None,
-            input: String::new(),
             stream: String::new(),
             history: Vec::new(),
             streaming: false,
             signing_in: false,
             notice: None,
             error: None,
-            scroll: 0.0,
-            max_scroll: 0.0,
-            selection: None,
-            selection_anchor: None,
-            selecting: false,
-            input_sel: FieldSel::default(),
         }
     }
 
@@ -300,7 +274,6 @@ impl Chat {
             self.history.remove(0);
         }
         self.history.push((role, text));
-        self.scroll = 0.0; // a new turn snaps the view back to the newest line
     }
 
     /// True once a conversation owns the island: finished turns, a live
@@ -316,307 +289,52 @@ impl Chat {
         !self.connected() && !self.signing_in
     }
 
-    /// The text shown in the slot when the island is open, ready for
-    /// render::draw_content.
-    pub fn slot_text(&self) -> String {
+    /// Status lines shared by every screen: transient notice, error, and
+    /// the identity-only plan gate. Empty when there is nothing to say.
+    pub fn status_text(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
         if let Some(n) = &self.notice {
-            lines.push(n.clone());
-        }
-        if let Some(e) = &self.error {
-            lines.push(e.clone());
-        }
-        // Identity-only sign-in (no plan scope): inference stays off until
-        // the user authorizes plan usage via Connect.
-        if self.connected() && !self.plan_ready() && self.error.is_none() {
-            lines.push("ChatGPT plan use isn't enabled — Connect again to authorize it.".into());
-        }
-        for (role, text) in &self.history {
-            match role {
-                Role::User => lines.push(format!("› {text}")),
-                Role::Assistant => lines.push(text.clone()),
-            }
-        }
-        if self.streaming && !self.stream.is_empty() {
-            lines.push(self.stream.clone());
-        }
-        if self.connected() && !self.streaming {
-            lines.push(format!("› {}▏", self.input));
-        }
-        if lines.is_empty() {
-            if self.signing_in {
-                "Connecting to ChatGPT…".into()
-            } else if !self.connected() {
-                "Sign in with ChatGPT".into()
-            } else {
-                // Connected with nothing to show yet — normally unreachable
-                // (the input line above covers it); kept as a safe fallback.
-                format!("› {}▏", self.input)
-            }
-        } else {
-            // Signed-out error states (e.g. "Disconnected…", expired session)
-            // still offer the next action underneath the status line.
-            if !self.connected() && !self.signing_in {
-                lines.push("Sign in with ChatGPT".into());
-            }
-            lines.join("\n")
-        }
-    }
-
-    /// The exact string the Chat viewport draws: status lines above the
-    /// history + live stream, bottom-anchored. Mouse selection maps into
-    /// this string (UTF-16 offsets, matching DirectWrite hit-testing).
-    pub fn viewport_text(&self) -> String {
-        let mut status: Vec<String> = Vec::new();
-        if let Some(n) = &self.notice {
             if !n.trim().is_empty() {
-                status.push(n.clone());
+                lines.push(n.clone());
             }
         }
         if let Some(e) = &self.error {
             if !e.trim().is_empty() {
-                status.push(e.clone());
+                lines.push(e.clone());
             }
         }
         if self.connected() && !self.plan_ready() && self.error.is_none() {
-            status.push("ChatGPT plan use isn't enabled — Connect again to authorize it.".into());
+            lines.push("ChatGPT plan use isn't enabled — Connect again to authorize it.".into());
         }
-        let status_block = status.join("\n");
-        let mut lines: Vec<String> = Vec::new();
-        for (role, text) in &self.history {
-            match role {
-                Role::User => lines.push(format!("› {text}")),
-                Role::Assistant => lines.push(text.clone()),
-            }
-        }
-        if self.streaming {
-            if self.stream.is_empty() {
-                lines.push("…".into());
-            } else {
-                lines.push(self.stream.clone());
-            }
-        } else if !self.stream.is_empty() {
-            lines.push(self.stream.clone());
-        }
-        let history = lines.join("\n");
-        if status_block.is_empty() {
-            history
-        } else if history.is_empty() {
-            status_block
-        } else {
-            format!("{status_block}\n{history}")
-        }
+        lines.join("\n")
     }
 
-    /// Drop any highlight (click elsewhere, Escape, disconnect).
-    pub fn clear_selection(&mut self) {
-        self.selection = None;
-        self.selection_anchor = None;
-        self.selecting = false;
-    }
-
-    /// Highlight the whole viewport (Ctrl+A).
-    pub fn select_all(&mut self) {
-        let n = utf16_len(&self.viewport_text());
-        if n == 0 {
-            self.clear_selection();
-        } else {
-            self.selection = Some((0, n));
-            self.selection_anchor = Some(0);
-            self.selecting = false;
-        }
-    }
-
-    /// Clamped, sorted, non-empty selection — None when there is nothing
-    /// to highlight or copy. Clamping (not clearing) keeps a highlight
-    /// valid while the stream grows underneath it.
-    pub fn normalized_selection(&self) -> Option<(usize, usize)> {
-        let (a, b) = self.selection?;
-        let n = utf16_len(&self.viewport_text());
-        let (lo, hi) = (a.min(b).min(n), a.max(b).min(n));
-        if hi > lo {
-            Some((lo, hi))
-        } else {
-            None
-        }
-    }
-
-    /// The highlighted slice, if any.
-    pub fn selected_text(&self) -> Option<String> {
-        let (lo, hi) = self.normalized_selection()?;
-        Some(utf16_slice(&self.viewport_text(), lo, hi))
-    }
-
-    /// Ctrl+C payload: the highlight when there is one, else the whole
-    /// viewport transcript.
-    pub fn copy_text(&self) -> String {
-        match self.selected_text() {
-            Some(t) if !t.is_empty() => t,
-            _ => self.viewport_text(),
-        }
-    }
-}
-
-/// Length in UTF-16 code units — the unit DirectWrite hit-testing counts
-/// in (an emoji is 2, "›" is 1).
-pub fn utf16_len(s: &str) -> usize {
-    s.encode_utf16().count()
-}
-
-/// Substring for a UTF-16 [start, end) range. Ends clamp; chars are kept
-/// whole (a range can only split a surrogate pair if the caller passes a
-/// mid-pair offset, which caret hit-testing never produces).
-pub fn utf16_slice(s: &str, start: usize, end: usize) -> String {
-    let total = utf16_len(s);
-    let (lo, hi) = (start.min(end).min(total), start.max(end).min(total));
-    if hi <= lo {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut cu = 0usize;
-    for ch in s.chars() {
-        let (cs, ce) = (cu, cu + ch.len_utf16());
-        if cs >= lo && ce <= hi {
-            out.push(ch);
-        }
-        cu = ce;
-        if cu >= hi {
-            break;
-        }
-    }
-    out
-}
-
-/// Byte range for a UTF-16 [start, end) range, snapped to char boundaries
-/// (for delete/replace edits). Ends clamp; zero-width maps to an insertion
-/// point.
-pub fn utf16_byte_range(s: &str, start: usize, end: usize) -> (usize, usize) {
-    let total = utf16_len(s);
-    let (lo, hi) = (start.min(end).min(total), start.max(end).min(total));
-    let mut bs = s.len();
-    let mut be = s.len();
-    let mut cu = 0usize;
-    for (i, ch) in s.char_indices() {
-        if cu == lo {
-            bs = i;
-        }
-        if cu == hi {
-            be = i;
-        }
-        cu += ch.len_utf16();
-    }
-    if lo == total {
-        bs = s.len();
-    }
-    if hi == total {
-        be = s.len();
-    }
-    (bs.min(be), bs.max(be))
-}
-
-/// Selection state for a single-line input field (name prompt, chat
-/// input). Offsets are UTF-16 units into the field's raw text, matching
-/// DirectWrite; the "› " prefix and "▏" caret the island draws are layout
-/// decoration, mapped at draw/hit-test time.
-#[derive(Clone, Copy, Default)]
-pub struct FieldSel {
-    /// Highlighted range, sorted, end-exclusive. None = no highlight.
-    pub range: Option<(usize, usize)>,
-    /// Caret offset where the current drag started.
-    pub anchor: Option<usize>,
-    /// True between WM_LBUTTONDOWN and WM_LBUTTONUP of a select drag.
-    pub dragging: bool,
-}
-
-impl FieldSel {
-    pub fn clear(&mut self) {
-        self.range = None;
-        self.anchor = None;
-        self.dragging = false;
-    }
-
-    pub fn select_all(&mut self, text: &str) {
-        let n = utf16_len(text);
-        if n == 0 {
-            self.clear();
-        } else {
-            self.range = Some((0, n));
-            self.anchor = Some(0);
-            self.dragging = false;
-        }
-    }
-
-    /// Clamped, sorted, non-empty range — None when there is nothing to
-    /// act on.
-    pub fn normalized(&self, text: &str) -> Option<(usize, usize)> {
-        let (a, b) = self.range?;
-        let n = utf16_len(text);
-        let (lo, hi) = (a.min(b).min(n), a.max(b).min(n));
-        if hi > lo {
-            Some((lo, hi))
-        } else {
-            None
-        }
-    }
-
-    pub fn selected(&self, text: &str) -> Option<String> {
-        let (lo, hi) = self.normalized(text)?;
-        Some(utf16_slice(text, lo, hi))
-    }
-
-    /// Cut: remove the highlight and return it for the clipboard.
-    pub fn delete_selected(&mut self, text: &mut String) -> Option<String> {
-        let (lo, hi) = self.normalized(text)?;
-        let (bs, be) = utf16_byte_range(text, lo, hi);
-        let removed = text[bs..be].to_owned();
-        text.replace_range(bs..be, "");
-        self.clear();
-        Some(removed)
-    }
-
-    /// Paste/type-over: replace the highlight with `insert`, else append.
-    /// Control characters never enter a single-line field, and the result
-    /// is capped at `cap_chars` chars (the selection counts as freed room).
-    pub fn replace_selected(&mut self, text: &mut String, insert: &str, cap_chars: usize) {
-        let clean: String = insert.chars().filter(|c| !c.is_control()).collect();
-        match self.normalized(text) {
-            Some((lo, hi)) => {
-                let (bs, be) = utf16_byte_range(text, lo, hi);
-                let kept = text.chars().count() - text[bs..be].chars().count();
-                let room = cap_chars.saturating_sub(kept);
-                let take: String = clean.chars().take(room).collect();
-                text.replace_range(bs..be, &take);
-            }
-            None => {
-                let room = cap_chars.saturating_sub(text.chars().count());
-                let take: String = clean.chars().take(room).collect();
-                text.push_str(&take);
-            }
-        }
-        self.clear();
-    }
-}
-
-/// Last-frame geometry of the visible input field (name prompt or chat
-/// input — only one shows at a time), published by draw_field for mouse
-/// hit-testing and the I-beam cursor.
-pub struct InputFieldGeom {
-    /// Field rounded-rect bounds, window px.
-    pub rect: [f32; 4],
-    /// Text layout origin (tail-shifted), window px.
-    pub origin: [f32; 2],
-    /// Decorative prefix drawn ahead of the raw text ("› " or "").
-    pub prefix: &'static str,
-    pub placeholder: &'static str,
-}
-
-/// The exact string an input field draws (and hit-tests): the placeholder
-/// when empty, else prefix + raw + caret.
-pub fn field_shown(raw: &str, prefix: &'static str, placeholder: &'static str) -> String {
-    if raw.is_empty() {
-        format!("{placeholder}▏")
-    } else {
-        format!("{prefix}{raw}▏")
+    /// Full page state for `window.notchbud.render(state)`.
+    pub fn ui_state(&self, greeting: &str) -> serde_json::Value {
+        let history: Vec<serde_json::Value> = self
+            .history
+            .iter()
+            .map(|(role, text)| {
+                serde_json::json!({
+                    "role": match role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                    },
+                    "text": text,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "greeting": greeting,
+            "status": self.status_text(),
+            "history": history,
+            "stream": self.stream,
+            "streaming": self.streaming,
+            "signingIn": self.signing_in,
+            "connected": self.connected(),
+            "nameError": null,
+            "nameDraft": "",
+        })
     }
 }
 
@@ -629,31 +347,15 @@ pub struct App {
     pub expanded: bool, // false = idle sliver, true = island shown
     pub mouse_inside: bool,
 
-    // island chat (frozen slot content + history); tokens live here too
+    // island chat backend (history + tokens); content renders in WebView2
     pub chat: Chat,
 
     // first-run identity: None until onboarding saves it (persists at
     // %APPDATA%\notchbud\user.json). While None the island shows the name
     // prompt instead of chat/sign-in.
     pub user_name: Option<String>,
-    /// Raw onboarding draft (what the name field currently holds).
-    pub name_draft: String,
-    /// Why the last name submit was rejected (shown under the field).
+    /// Last onboarding validation message, shown under the name field.
     pub name_error: Option<String>,
-
-    // last-frame pill bounds in window px (for click routing). Refreshed by
-    // every draw; None when the pill isn't on screen.
-    pub signin_rect: Option<[f32; 4]>,
-
-    // last-frame chat viewport bounds in window px (for select-drag hit
-    // gating and the I-beam cursor). Refreshed by every Chat draw; None
-    // on every other screen.
-    pub chat_viewport: Option<[f32; 4]>,
-    /// Last-frame input field geometry (name prompt or chat input).
-    /// Refreshed by every draw_field; None on the SignIn screen.
-    pub input_field: Option<InputFieldGeom>,
-    /// Highlight in the onboarding name field.
-    pub name_sel: FieldSel,
 
     // geometry snapshot refreshed each frame (NCHITTEST hit surface)
     pub bar_area: [f32; 4],
@@ -663,9 +365,10 @@ pub struct App {
     // GetWindowRect — seeded at startup, refreshed on WM_DPICHANGED reflow
     pub win_x: i32,
     pub win_y: i32,
-
-    // remaining repaint steps of the active content-fade pump (WM_TIMER)
-    pub pump_steps: usize,
+    /// Last UI-thread push into the WebView2 page (GetTickCount64 ms).
+    /// Used to coalesce streaming deltas so Chromium isn't re-rendered
+    /// per token.
+    pub last_web_push_ms: u64,
 }
 
 impl App {
@@ -684,17 +387,12 @@ impl App {
             mouse_inside: false,
             chat: Chat::new(),
             user_name: None,
-            name_draft: String::new(),
             name_error: None,
-            signin_rect: None,
-            chat_viewport: None,
-            input_field: None,
-            name_sel: FieldSel::default(),
             bar_area: [0.0; 4],
             rgn_area: [0.0; 4],
             win_x: 0,
             win_y: 0,
-            pump_steps: 0,
+            last_web_push_ms: 0,
         }
     }
 
@@ -735,8 +433,20 @@ impl App {
         }
     }
 
-    /// Point-in-rect for pill click routing (window px, same space as the
-    /// rects draw_content publishes).
+    /// Page state for the WebView2 island (screen + greeting + chat).
+    pub fn page_state(&self) -> String {
+        let mut v = self.chat.ui_state(&self.greeting());
+        v["screen"] = serde_json::json!(match self.screen() {
+            Screen::Onboarding => "onboarding",
+            Screen::SignIn => "signin",
+            Screen::Home => "home",
+            Screen::Chat => "chat",
+        });
+        v["nameError"] = self.name_error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+        v.to_string()
+    }
+
+    /// Point-in-rect for click routing (window px).
     pub fn hit(rect: &[f32; 4], x: f32, y: f32) -> bool {
         x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3]
     }
@@ -744,6 +454,24 @@ impl App {
     pub fn layout_size(&self) -> (f32, f32) {
         (self.scale * WINDOW_UNITS_W, self.scale * WINDOW_UNITS_H)
     }
+}
+
+/// Page mouseleave decision: the child is inset in the island, so leaving
+/// the document usually means landing on parent surface, not leaving the
+/// island. Collapse only on a cursor truly outside the island bar.
+/// `None` (position unreadable) collapses — fail closed, never stuck open.
+pub fn page_leave_collapses(bar: &[f32; 4], cursor: Option<(f32, f32)>) -> bool {
+    match cursor {
+        None => true,
+        Some((x, y)) => !App::hit(bar, x, y),
+    }
+}
+
+/// Mousemove choreography decision: closed->open transitions only. Moves
+/// while already expanded (e.g. the parent strips around the WebView
+/// child) must not restart the open spring.
+pub fn expand_on_mousemove(expanded: bool) -> bool {
+    !expanded
 }
 
 // lParam of a CLIENT-area mouse message (WM_MOUSEMOVE, WM_LBUTTONUP, ...):
@@ -766,25 +494,42 @@ pub fn screen_pt(app: &App, lparam: windows::Win32::Foundation::LPARAM) -> POINT
 mod tests {
     use super::*;
 
+    /// Both leave paths (parent WM_MOUSELEAVE and the page's mouseleave)
+    /// collapse on exactly this predicate. Half-open on right/bottom,
+    /// matching NCHITTEST hit-testing — pin it so the two tracking domains
+    /// can never disagree again (that disagreement thrashed
+    /// close->open->close on every downward exit).
+    #[test]
+    fn hit_is_half_open_and_shared_by_leave_paths() {
+        let bar = [10.0, 0.0, 20.0, 14.0];
+        assert!(App::hit(&bar, 10.0, 0.0));
+        assert!(App::hit(&bar, 15.0, 13.9));
+        assert!(!App::hit(&bar, 20.0, 7.0), "right edge exclusive");
+        assert!(!App::hit(&bar, 15.0, 14.0), "bottom edge exclusive");
+        assert!(!App::hit(&bar, 9.9, 7.0));
+        // parent strips around an inset WebView child count as inside:
+        // a child->strip move must not collapse.
+        let island = [110.0, 0.0, 530.0, 140.4];
+        assert!(App::hit(&island, 115.0, 70.0));
+        assert!(App::hit(&island, 525.0, 5.0));
+        assert!(!App::hit(&island, 531.0, 70.0));
+    }
+
     #[test]
     fn signing_in_hides_the_pill_and_failures_restore_it() {
         let mut c = Chat::new();
         // idle: pill only
         assert!(c.shows_signin_button());
-        assert_eq!(c.slot_text(), "Sign in with ChatGPT");
-        // in flight: connecting text, no pill
+
+        // in flight: no pill
         c.signing_in = true;
-        c.notice = Some("Approve in your browser to finish signing in.".into());
-        let t = c.slot_text();
-        assert!(t.contains("Approve in your browser"));
-        assert!(!t.contains("Sign in with ChatGPT"));
         assert!(!c.shows_signin_button());
+
         // failure clears back to the pill
         c.signing_in = false;
-        c.notice = None;
         c.error = Some("That approval already expired. Connect again.".into());
         assert!(c.shows_signin_button());
-        assert!(c.slot_text().contains("Sign in with ChatGPT"));
+        assert!(c.status_text().contains("That approval already expired"));
     }
 
     fn blank_app() -> App {
@@ -866,5 +611,20 @@ mod tests {
         assert_eq!(app.screen(), Screen::Chat);
         app.chat.tokens = None;
         assert_eq!(app.screen(), Screen::SignIn);
+    }
+
+    #[test]
+    fn page_state_matches_screen() {
+        let mut app = blank_app();
+        app.user_name = Some("Alex".into());
+        sign_in(&mut app);
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["screen"], "home");
+        assert!(v["greeting"].as_str().unwrap().contains("Alex"));
+        app.chat.push_history(Role::User, "hi".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["screen"], "chat");
     }
 }

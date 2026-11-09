@@ -43,8 +43,10 @@ CloseApplications=yes
 RestartApplications=no
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExe}
-; Icon for the Setup.exe itself. web\public\favicon.ico ships with the repo.
-SetupIconFile=..\web\public\favicon.ico
+; Icon for the Setup.exe itself: the cat logo (multi-size .ico).
+; Shortcuts + Add/Remove Programs read the icon embedded in notchbud.exe
+; (assets/app.rc, linked by build.rs), so they need no separate setting.
+SetupIconFile=..\assets\notchbud.ico
 WizardStyle=modern
 
 [Languages]
