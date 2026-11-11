@@ -8,11 +8,13 @@
 // The low-level keyboard hook never calls in directly — it posts WM_KEY
 // like before, and the wndproc forwards into `forward_key`.
 
+use std::cell::RefCell;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::cell::RefCell;
 
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT, WPARAM, LPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -74,16 +76,95 @@ fn composed_html() -> String {
         .replace("__NOTCHBUD_LOGO__", LOGO_DATAURI.trim())
 }
 
-/// Island content bounds in physical px: the shell with a small inset so
-/// text never kisses the rounded corners.
+/// Island content bounds in physical px: edge-to-edge with the shell body
+/// (ISLAND_X..ISLAND_X+ISLAND_W, 0..ISLAND_H) so the page draws to the
+/// island edges. The WebView is rectangular while the shell has rounded
+/// bottom corners (ISLAND_BOT_R) — the page clips itself with a matching
+/// CSS border-radius + overflow:hidden (see ui/styles.css #island), so
+/// content never overfloats outside the silhouette. ceil/floor keeps the
+/// rect just inside the shell AA edge.
 pub fn island_rect(scale: f32) -> RECT {
-    let left = (ISLAND_X + 12.0) * scale;
-    let right = (ISLAND_X + ISLAND_W - 12.0) * scale;
+    let left = (ISLAND_X * scale).ceil() as i32;
+    let right = ((ISLAND_X + ISLAND_W) * scale).floor() as i32;
     RECT {
-        left: left.round() as i32,
-        top: (10.0 * scale).round() as i32,
-        right: right.round() as i32,
-        bottom: ((ISLAND_H - 12.0) * scale).round() as i32,
+        left,
+        top: 0,
+        right,
+        bottom: (ISLAND_H * scale).floor() as i32,
+    }
+}
+
+/// Explicit per-user profile dir for WebView2. `None` means "no usable
+/// base" — the caller falls back to the default environment.
+///
+/// The dir must exist AND pass the write probe: a dir that exists but is
+/// held by another live instance (or carries foreign ACLs) makes
+/// environment creation fail, which used to abort init silently and leave
+/// a black island. Rejecting it here routes init to the fallback instead.
+pub fn pick_user_data_dir(base: Option<&OsStr>) -> Option<PathBuf> {
+    pick_user_data_dir_with(base, &default_write_probe)
+}
+
+pub fn pick_user_data_dir_with(base: Option<&OsStr>, probe: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    let base = base?;
+    // Explicit user data folder under LOCALAPPDATA so WebView2 never
+    // depends on the executable-relative default. The installer default
+    // (installer/notchbud.iss DefaultDirName) is
+    // {localappdata}\Programs\Notchbud — writable today — but the folder
+    // picker lets the user choose any directory, so an exe-relative folder
+    // could land somewhere non-writable. LOCALAPPDATA is always writable
+    // for this per-user (PrivilegesRequired=lowest) install.
+    let mut dir = PathBuf::from(base);
+    dir.push("notchbud");
+    dir.push("EBWebView");
+    // Ensure the path exists; on failure the caller falls back to the
+    // default environment creation.
+    std::fs::create_dir_all(&dir).ok()?;
+    if !dir.is_absolute() {
+        return None;
+    }
+    if !probe(&dir) {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Writability probe: the dir must accept a file create+remove. Cheap,
+/// synchronous, and the exact capability WebView2 needs from the profile.
+pub fn default_write_probe(dir: &Path) -> bool {
+    let probe = dir.join(".notchbud-write-probe");
+    match std::fs::OpenOptions::new().write(true).create(true).open(&probe) {
+        Ok(_) => std::fs::remove_file(&probe).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Ordered environment attempts: the explicit dir first, the default
+/// environment as the fallback that keeps the island alive instead of
+/// black when the explicit dir is held/walled at runtime.
+#[derive(Debug, PartialEq, Clone)]
+pub enum EnvDir {
+    Explicit(PathBuf),
+    Default,
+}
+
+pub fn env_attempt_order(primary: Option<PathBuf>) -> Vec<EnvDir> {
+    match primary {
+        Some(dir) => vec![EnvDir::Explicit(dir), EnvDir::Default],
+        None => vec![EnvDir::Default],
+    }
+}
+
+/// Diagnostics for WebView2 startup. Release builds have no console
+/// (windows_subsystem), so every environment outcome is also appended to
+/// %TEMP%\notchbud-webview.log — a black island finally leaves a trace.
+fn log_webview_event(line: &str) {
+    eprintln!("[notchbud] {line}");
+    let mut path = std::env::temp_dir();
+    path.push("notchbud-webview.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "[notchbud] {line}");
     }
 }
 
@@ -96,30 +177,72 @@ pub fn init(parent: HWND, scale: f32) {
     PARENT_HWND.store(parent.0 as isize, Ordering::Relaxed);
 
     // --- environment ---
-    let (etx, erx) = mpsc::channel();
-    let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
-        move |result: windows::core::Result<()>, env: Option<ICoreWebView2Environment>| {
-            let _ = etx.send((result, env));
-            Ok(())
-        },
-    ));
-    let env = unsafe {
-        match CreateCoreWebView2Environment(&env_handler) {
-            Ok(()) => match webview2_com::wait_with_pump(erx) {
-                Ok((Ok(()), Some(env))) => env,
-                Ok((Err(e), _)) => {
-                    eprintln!("[notchbud] webview env failed: {e:#}");
-                    return;
-                }
-                _ => {
-                    eprintln!("[notchbud] webview env failed: no environment");
-                    return;
-                }
+    // Explicit per-user profile dir when usable; otherwise (or when the
+    // explicit dir is held by another live instance at runtime) fall back
+    // to the default environment. A failed env used to abort init silently
+    // and leave a black island; now every attempt is logged (release
+    // builds have no console — see %TEMP%\notchbud-webview.log) and the
+    // default is always tried before giving up.
+    let primary = pick_user_data_dir(std::env::var_os("LOCALAPPDATA").as_deref());
+    let mut env_opt: Option<ICoreWebView2Environment> = None;
+    for attempt in env_attempt_order(primary) {
+        let user_data_wide: Option<Vec<u16>> = match &attempt {
+            EnvDir::Explicit(dir) => Some(
+                dir.to_string_lossy()
+                    .into_owned()
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect(),
+            ),
+            EnvDir::Default => None,
+        };
+        let (etx, erx) = mpsc::channel();
+        let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+            move |result: windows::core::Result<()>, env: Option<ICoreWebView2Environment>| {
+                let _ = etx.send((result, env));
+                Ok(())
             },
-            Err(e) => {
-                eprintln!("[notchbud] CreateCoreWebView2Environment: {e:#}");
-                return;
+        ));
+        let outcome = unsafe {
+            // Keep the wide string alive for the whole creation call.
+            let create_result = match user_data_wide.as_ref() {
+                Some(wide) => CreateCoreWebView2EnvironmentWithOptions(
+                    PCWSTR::null(),
+                    PCWSTR(wide.as_ptr()),
+                    None::<&ICoreWebView2EnvironmentOptions>,
+                    &env_handler,
+                ),
+                None => CreateCoreWebView2Environment(&env_handler),
+            };
+            match create_result {
+                Ok(()) => match webview2_com::wait_with_pump(erx) {
+                    Ok((Ok(()), Some(env))) => Some(env),
+                    Ok((Err(e), _)) => {
+                        log_webview_event(&format!("webview env failed ({attempt:?}): {e:#}"));
+                        None
+                    }
+                    _ => {
+                        log_webview_event(&format!("webview env failed ({attempt:?}): no environment"));
+                        None
+                    }
+                },
+                Err(e) => {
+                    log_webview_event(&format!("CreateCoreWebView2Environment ({attempt:?}): {e:#}"));
+                    None
+                }
             }
+        };
+        if let Some(env) = outcome {
+            log_webview_event(&format!("webview env ready ({attempt:?})"));
+            env_opt = Some(env);
+            break;
+        }
+    }
+    let env = match env_opt {
+        Some(env) => env,
+        None => {
+            log_webview_event("webview env unavailable in all attempts; island content disabled");
+            return;
         }
     };
 

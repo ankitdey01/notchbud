@@ -128,13 +128,27 @@ pub struct Renderer {
     br_black: ID2D1SolidColorBrush, // island shell — always opaque
 }
 
-pub fn hermite(t0: f32, t1: f32, v0: f32, v1: f32, m0: f32, m1: f32) -> [f32; 4] {
+/// Hermite segment in the 0–1 basis: `p(u) = d + c*u + b*u² + a*u³`
+/// with `u = (t - t0) / (t1 - t0)`. Kept for the bounce-tail resampling
+/// below, where [`hermite_pos`] / [`hermite_vel`] evaluate in `u`.
+fn hermite_unit(t0: f32, t1: f32, v0: f32, v1: f32, m0: f32, m1: f32) -> [f32; 4] {
     let dt = t1 - t0;
     let a = 2.0 * (v0 - v1) + (m0 + m1) * dt;
     let b = 3.0 * (v1 - v0) - (2.0 * m0 + m1) * dt;
     let c = m0 * dt;
     let d = v0;
     [d, c, b, a]
+}
+
+/// Hermite segment in seconds, as `AddCubic` expects:
+/// `p(s) = d + c*s + b*s² + a*s³` with `s = t - t0` in seconds.
+pub fn hermite(t0: f32, t1: f32, v0: f32, v1: f32, m0: f32, m1: f32) -> [f32; 4] {
+    let dt = t1 - t0;
+    let [d, c_u, b_u, a_u] = hermite_unit(t0, t1, v0, v1, m0, m1);
+    if dt == 0.0 || !dt.is_finite() {
+        return [d, 0.0, 0.0, 0.0];
+    }
+    [d, c_u / dt, b_u / (dt * dt), a_u / (dt * dt * dt)]
 }
 
 /// Programming quantum for the shell scale animation: finer than any
@@ -250,7 +264,7 @@ pub fn sample_shell_animation(expand: bool, from: [f32; 2]) -> (Vec<SpringSeg>, 
             (CLOSE_COLLAPSE_END, CLOSE_DIP_T, idle, dip),
             (CLOSE_DIP_T, CLOSE_RECOVER_T, dip, idle),
         ] {
-            let base = hermite(a, b, 0.0, 1.0, 0.0, 0.0);
+            let base = hermite_unit(a, b, 0.0, 1.0, 0.0, 0.0);
             let span = b - a;
             let mut t0 = a;
             while t0 < b - 1e-9 {

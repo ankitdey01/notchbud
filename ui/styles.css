@@ -10,6 +10,209 @@
     padding: 0;
 }
 
+/* The `hidden` attribute must always win — component display rules
+   (.btn's inline-flex, .notif-list/.empty flex, …) would otherwise
+   override the UA `[hidden] { display: none }` and leak hidden nodes
+   (e.g. the Cancel link, the notifications list) onto the island. */
+[hidden] {
+    display: none !important;
+}
+
+/* ---------- Coss Button port (plain-CSS build of @coss/button) ----------
+   Source: https://coss.com/ui/docs/components/button.md
+   (registry/default/ui/button.tsx — cva base/sizes/variants, sm: compact
+   values used throughout since the island is a small surface).
+   Same API shape: `btn` + one size + one variant. Island shapes stay
+   pill/circle via btn-pill / btn-circle composition (like passing a
+   rounded-full className to the React component). Tokens below are the
+   island's Coss theme (documented override, same mechanism as @coss/style):
+   primary = notch blue, secondary = high-contrast white for the dark card. */
+:root {
+    --cb-primary: #007AFF;
+    --cb-primary-fg: #ffffff;
+    --cb-secondary: #f2f2f7;
+    --cb-secondary-fg: #000000;
+    --cb-accent: rgba(255, 255, 255, 0.08);
+    --cb-foreground: #ececf1;
+    --cb-destructive: #ff5a52;
+    --cb-ring: #007AFF;
+    --cb-radius: 10px;
+}
+
+.btn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border: 1px solid transparent;
+    border-radius: var(--cb-radius);
+    background: transparent;
+    color: var(--cb-foreground);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    transition: box-shadow 150ms ease-out;
+}
+
+.btn svg {
+    display: block;
+    width: 16px;
+    height: 16px;
+    opacity: 0.8;
+    flex: none;
+    pointer-events: none;
+}
+
+.btn:hover {
+    text-decoration: none;
+}
+
+.btn:active {
+    filter: brightness(0.92);
+}
+
+.btn:focus-visible {
+    outline: 2px solid var(--cb-ring);
+    outline-offset: 2px;
+}
+
+.btn:disabled {
+    opacity: 0.64;
+    pointer-events: none;
+}
+
+/* Coss sizes (compact sm: scale — h-8/28px icon) */
+.btn-md {
+    height: 32px;
+    padding: 0 11px;
+}
+
+.btn-sm {
+    height: 28px;
+    padding: 0 9px;
+    gap: 6px;
+}
+
+.btn-lg {
+    height: 36px;
+    padding: 0 13px;
+}
+
+.btn-icon {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    gap: 0;
+}
+
+.btn-icon-sm {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    gap: 0;
+}
+
+/* Coss variants */
+.btn-primary {
+    background: var(--cb-primary);
+    border-color: var(--cb-primary);
+    color: var(--cb-primary-fg);
+    box-shadow: 0 1px 2px rgba(0, 122, 255, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+
+.btn-primary:hover {
+    background: rgba(0, 122, 255, 0.9);
+}
+
+.btn-secondary {
+    background: var(--cb-secondary);
+    border-color: var(--cb-secondary);
+    color: var(--cb-secondary-fg);
+}
+
+.btn-secondary:hover {
+    filter: brightness(0.94);
+}
+
+.btn-ghost {
+    background: transparent;
+    border-color: transparent;
+    color: var(--cb-foreground);
+}
+
+.btn-ghost:hover {
+    background: var(--cb-accent);
+}
+
+.btn-outline {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: var(--cb-foreground);
+}
+
+.btn-outline:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.btn-destructive {
+    background: var(--cb-destructive);
+    border-color: var(--cb-destructive);
+    color: #fff;
+}
+
+.btn-destructive:hover {
+    background: rgba(255, 90, 82, 0.9);
+}
+
+.btn-destructive-outline {
+    background: transparent;
+    border-color: rgba(255, 90, 82, 0.5);
+    color: var(--cb-destructive);
+}
+
+.btn-destructive-outline:hover {
+    background: rgba(255, 90, 82, 0.12);
+}
+
+.btn-link {
+    background: transparent;
+    border-color: transparent;
+    color: var(--cb-link-fg, var(--cb-foreground));
+    text-decoration: none;
+    text-underline-offset: 4px;
+}
+
+.btn-link:hover {
+    text-decoration: underline;
+    filter: brightness(1.12);
+}
+
+.btn-link-danger {
+    --cb-link-fg: #ff5a52;
+}
+
+/* island shape compositions */
+.btn-pill {
+    border-radius: 999px;
+}
+
+.btn-circle {
+    border-radius: 999px;
+}
+
+/* selected nav state (aria-pressed topbar buttons) */
+.btn.active {
+    background: var(--cb-accent);
+    border-color: transparent;
+    color: #fff;
+}
+
 html,
 body {
     width: 100%;
@@ -28,7 +231,13 @@ body {
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 4px 10px 6px;
+    padding: 6px 12px 12px;
+    /* Edge-to-edge: the WebView rect now matches the shell body exactly.
+       Clip to the same silhouette so nothing overfloats: flat top (flush
+       with the screen), bottom corners mirror ISLAND_BOT_R (35.2 units =
+       35.2 CSS px, rounded up to 36px to stay just inside the AA edge). */
+    border-radius: 0 0 36px 36px;
+    overflow: hidden;
     animation: island-in 0.18s ease-out;
 }
 
@@ -68,19 +277,35 @@ body {
 }
 
 /* Short pre-home screens never overflow: plain centering is safe there. */
-#screen-onboarding,
 #screen-signin,
 #screen-home {
     justify-content: center;
 }
 
-#screen-onboarding> :first-child,
+/* Optical middle vs the shell: the WebView ends above the shell's bottom
+   curve, so the sign-in button gets a nudge down to sit truly centered
+   between the navbar and the island's bottom edge. */
+#screen-signin {
+    padding-top: 8px;
+    align-items: center;
+}
+
+/* Sign-in pill is a centered compact button, never full-bleed:
+   .screen uses align-items:stretch, so without this the pill stretches
+   to the full island width. */
+#signin-btn {
+    align-self: center;
+    width: auto;
+    max-width: 280px;
+    padding-left: 22px;
+    padding-right: 22px;
+}
+
 #screen-signin> :first-child,
 #screen-home> :first-child {
     margin-top: 0;
 }
 
-#screen-onboarding> :last-child,
 #screen-signin> :last-child,
 #screen-home> :last-child {
     margin-bottom: 0;
@@ -122,31 +347,9 @@ body {
     justify-self: start;
 }
 
+/* layout hook only — visuals now come from .btn .btn-ghost .btn-icon-sm */
 .iconbtn {
-    position: relative;
-    display: grid;
-    place-items: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    background: rgba(255, 255, 255, 0.06);
-    color: #ececf1;
-    cursor: pointer;
-    padding: 0;
     flex: none;
-}
-
-.iconbtn:hover {
-    background: rgba(255, 255, 255, 0.1);
-}
-
-.iconbtn:active {
-    transform: scale(0.94);
-}
-
-.iconbtn svg {
-    display: block;
 }
 
 .bell .dot {
@@ -159,10 +362,13 @@ body {
     background: #007AFF;
 }
 
+/* brand row layout — button visuals now from .btn .btn-ghost .btn-pill */
 .brand {
     display: flex;
     align-items: center;
     gap: 8px;
+    padding: 2px 6px;
+    margin: 0;
 }
 
 .brand-logo {
@@ -178,15 +384,6 @@ body {
     font-weight: 600;
     color: #fff;
     letter-spacing: 0.1px;
-}
-
-.beta {
-    font-size: 10px;
-    font-weight: 500;
-    color: #a1a1aa;
-    background: rgba(255, 255, 255, 0.09);
-    border-radius: 999px;
-    padding: 2px 8px;
 }
 
 .topactions {
@@ -294,40 +491,17 @@ body {
     white-space: nowrap;
 }
 
+/* send buttons are .btn .btn-primary .btn-icon-sm .btn-circle;
+   only the paper-plane optical nudge stays here */
 .send {
     flex: none;
-    display: grid;
-    place-items: center;
-    width: 30px;
-    height: 30px;
-    border-radius: 999px;
-    border: none;
-    background: #007AFF;
-    color: #fff;
-    cursor: pointer;
-    padding: 0;
-}
-
-.send:hover {
-    filter: brightness(1.08);
-}
-
-.send:active {
-    transform: scale(0.94);
 }
 
 .send svg {
-    display: block;
     margin-left: 2px;
 }
 
-/* ---------- legacy bits (onboarding / signin / chat) ---------- */
-
-.title {
-    font-size: 17px;
-    font-weight: 600;
-    text-align: center;
-}
+/* ---------- legacy bits (signin / chat) ---------- */
 
 .status {
     font-size: 14px;
@@ -338,51 +512,9 @@ body {
     max-width: 100%;
 }
 
-.error {
-    font-size: 13px;
-    text-align: center;
-    opacity: 0.7;
-}
+/* sign-in pills are .btn .btn-secondary .btn-lg .btn-pill — no local rules */
 
-/* white pill — the only button in the pre-home island */
-.pill {
-    border: none;
-    border-radius: 999px;
-    background: #f2f2f7;
-    color: #000;
-    font-size: 14px;
-    font-weight: 600;
-    font-family: inherit;
-    padding: 10px 22px;
-    cursor: pointer;
-}
-
-.pill:hover {
-    background: #fff;
-}
-
-/* rounded prompt line (onboarding) */
-.field {
-    width: min(320px, 100%);
-    height: 34px;
-    border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    background: rgba(255, 255, 255, 0.10);
-    color: #f2f2f7;
-    font-size: 14px;
-    font-family: inherit;
-    padding: 0 16px;
-    outline: none;
-    margin: 0 auto;
-}
-
-.field::placeholder {
-    color: rgba(242, 242, 247, 0.45);
-}
-
-.field:focus {
-    border-color: rgba(255, 255, 255, 0.35);
-}
+/* cancel link is .btn .btn-link .btn-link-danger — no local rules */
 
 /* chat history: bottom-anchored, scrolls natively */
 .history {
@@ -435,4 +567,357 @@ body {
     50% {
         opacity: 0;
     }
+}
+
+/* ---------- island pages (menu / notifications / settings) ---------- */
+
+.page {
+    justify-content: flex-start;
+    gap: 8px;
+    padding-top: 8px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+}
+
+/* Overlay pages (menu / notifications / settings) ride the tall shell with
+   compact content: the base .screen auto margins vertically center it, so
+   short pages sit in the optical middle instead of stranded at the top.
+   When a page outgrows the shell (a long notifications feed), the autos
+   resolve to zero and it top-anchors with internal scroll, same as chat.
+   The bottom half MUST sit on the last VISIBLE block: the Back link is
+   display:none and a hidden box absorbs no space, so a margin there
+   silently un-centers the whole page (see tests/island_layout.rs). */
+#screen-menu .menugrid,
+#screen-notifications #notif-empty,
+#screen-notifications #notif-list,
+#screen-settings .profile-card {
+    margin-bottom: auto;
+}
+
+/* ---------- overlay page fit (menu / notifications / settings) ----------
+   The shell is 140 units tall: ~94px remain below the topbar, so every
+   overlay page must fit without scrolling, or its action row gets sheared
+   by the shell's bottom edge. What goes: page sub-lines, the settings
+   head (the highlighted topbar icon already says where you are), and the
+   Back links (tapping the active topbar icon toggles its page closed, Esc
+   does the same). Settings keeps one row: the sign in/out pill lives
+   inside the profile card instead of on its own row. */
+#screen-menu .page-sub,
+#screen-notifications .page-sub {
+    display: none;
+}
+
+#screen-settings .page-head {
+    display: none;
+}
+
+#screen-menu .backlink,
+#screen-notifications .backlink,
+#screen-settings .backlink {
+    display: none;
+}
+
+#screen-menu {
+    gap: 6px;
+}
+
+/* Equal gaps above and below the settings card: the page's top padding
+   matches the island's bottom padding (12px), and the auto margins split
+   whatever remains evenly — so topbar-to-card always equals card-to-shell
+   no matter how the card's height changes. */
+#screen-settings {
+    padding-top: 12px;
+}
+
+#screen-settings .profile-card {
+    gap: 8px;
+}
+
+#screen-settings .avatar {
+    width: 30px;
+    height: 30px;
+    font-size: 14px;
+}
+
+#screen-settings .profile-name {
+    font-size: 13px;
+}
+
+#screen-settings .profile-sub,
+#screen-settings .profile-plan {
+    font-size: 11px;
+}
+
+/* One visible pill at a time (sign in XOR sign out); it rides in the
+   profile row so the page stays a single card. */
+#screen-settings .profile-card .btn {
+    flex: none;
+}
+
+/* Notifications empty state: one compact row (icon + stacked texts) so
+   the page ends well above the shell's bottom curve. */
+#notif-empty {
+    flex-direction: row;
+    align-items: center;
+    text-align: left;
+    padding: 8px 10px;
+    gap: 10px;
+}
+
+#notif-empty .empty-icon {
+    flex: none;
+    width: 32px;
+    height: 32px;
+}
+
+#notif-empty .empty-icon svg {
+    width: 18px;
+    height: 18px;
+}
+
+.empty-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+.page::-webkit-scrollbar {
+    width: 4px;
+}
+
+.page::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 2px;
+}
+
+.page-head {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 0 2px;
+    text-align: left;
+    width: 100%;
+}
+
+.page-title {
+    font-size: 17px;
+    line-height: 1.15;
+    font-weight: 700;
+    color: #fff;
+    text-align: left;
+}
+
+.page-sub {
+    font-size: 12px;
+    font-weight: 400;
+    color: #9ca3af;
+    text-align: left;
+}
+
+/* menu launcher — single borderless row: icon alongside name.
+   Start-aligned (never center): a centered row that overflows clips its
+   leading items out of scroll reach in Chromium. Compact sizing so all
+   five tiles fit the ~396-unit content width with no scrolling. */
+.menugrid {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 2px;
+    width: 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+
+.menugrid::-webkit-scrollbar {
+    display: none;
+}
+
+/* menu items are .btn .btn-ghost — icon alongside name, no borders */
+.tile {
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    min-height: 0;
+    padding: 6px 8px;
+    font-size: 12px;
+    white-space: nowrap;
+    flex: none;
+    background: transparent;
+    border-color: transparent;
+}
+
+.tile svg {
+    display: block;
+    flex: none;
+    color: #007AFF;
+}
+
+/* notifications empty state (hardcoded until a dynamic feed lands) */
+.empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    border-radius: 14px;
+    border: 1px dashed rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.03);
+    padding: 12px 10px;
+    text-align: center;
+}
+
+.empty-icon {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 999px;
+    background: rgba(0, 122, 255, 0.14);
+    color: #5eb0ff;
+}
+
+.empty-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+}
+
+.empty-sub {
+    font-size: 12px;
+    font-weight: 400;
+    color: #9ca3af;
+    line-height: 1.45;
+    max-width: 320px;
+}
+
+.notif-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+}
+
+.notif-item {
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.05);
+    padding: 8px 10px;
+    font-size: 13px;
+    line-height: 1.4;
+    color: #ececf1;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* settings profile */
+/* settings profile: compact so the whole page (topbar + head + card +
+   actions + back) fits the 140-unit shell with minimal internal scroll —
+   a scrolled page pinned against the viewport bottom is what made the
+   bottom edge read as a hard leftover border. */
+.profile-card {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.05);
+    padding: 8px 10px;
+}
+
+.avatar {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 999px;
+    background: rgba(0, 122, 255, 0.25);
+    color: #fff;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+.profile-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    flex: 1;
+}
+
+.profile-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.profile-sub {
+    font-size: 12px;
+    font-weight: 400;
+    color: #9ca3af;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.profile-plan {
+    font-size: 12px;
+    font-weight: 400;
+    color: #9ca3af;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.profile-plan svg {
+    display: inline-block;
+    vertical-align: -2px;
+    color: #30d158;
+}
+
+.presence {
+    flex: none;
+    width: 9px;
+    height: 9px;
+    border-radius: 999px;
+    background: #636366;
+}
+
+.presence.on {
+    background: #30d158;
+}
+
+.presence.off {
+    background: #636366;
+}
+
+/* sign-out is .btn .btn-destructive .btn-sm .btn-pill — no local rules */
+
+/* back links are .btn .btn-link — gray, never underlined (island density) */
+.backlink {
+    gap: 6px;
+    padding: 4px 10px;
+    align-self: center;
+    color: #a1a1aa;
+    text-decoration: none;
+    font-size: 13px;
+}
+
+.backlink svg {
+    display: block;
+}
+
+.backlink:hover {
+    color: #fff;
+    text-decoration: none;
 }

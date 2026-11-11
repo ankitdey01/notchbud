@@ -27,7 +27,9 @@ fn main() {
     println!("Open this URL in your browser:\n\n    {url}\n");
     // Also try to open it directly.
     let _ = open::that(&url);
-    let (cb, meta) = match auth::wait_callback(pending) {
+    // CLI companion: no UI cancel link, so never cancelled.
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let (cb, meta) = match auth::wait_callback(pending, &never) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("sign-in failed: {e}");

@@ -26,6 +26,7 @@ fn toks(expires_in_secs: i64, plan_allowed: bool, access: &str, refresh: &str) -
         client_id: "oaiapp_test".into(),
         subject: "sub".into(),
         email: None,
+        name: Some("Alex".into()),
         scopes: vec![PLAN_SCOPE.into()],
         plan_allowed,
         host_id: "host".into(),

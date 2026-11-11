@@ -1,8 +1,9 @@
 // chat.rs — the island chat: a Responses request to the public OpenAI API
 // with the user's authorized ChatGPT-plan token, and the SSE stream decoded
-// into StreamEvents. A turn counts only after `response.completed`; notch
-// chat has no tool calls. Never any other billing path: plan-usage errors
-// surface as-is, never a silent switch to API-key billing.
+// into StreamEvents. A turn counts only after `response.completed`; web
+// search is always on via the hosted `web_search` tool. Never any other
+// billing path: plan-usage errors surface as-is, never a silent switch to
+// API-key billing.
 
 use std::io::BufRead;
 use std::time::Duration;
@@ -19,8 +20,9 @@ const INSTRUCTIONS: &str = "You are notchbud, the tiny assistant inside a notch 
 
 /// System prompt, with the user's name folded in: `instructions` rides every
 /// request (Responses keeps no server-side state), so the model always knows
-/// who it serves. The name is one user-supplied line (control characters are
-/// rejected at save), quoted so it reads as data, never as an instruction.
+/// who it serves. The name is the signed-in account's display name (control
+/// characters are rejected at sign-in), quoted so it reads as data, never as
+/// an instruction.
 pub fn instructions_for(user_name: Option<&str>) -> String {
     match user_name.map(str::trim).filter(|n| !n.is_empty()) {
         Some(name) => format!(
@@ -73,8 +75,8 @@ fn chat_agent() -> Agent {
 }
 
 /// The Responses body for the island chat: the whole short history, nothing
-/// stored server-side (`store: false`), streamed. `user_name` (the saved
-/// onboarding name) is folded into `instructions` on every turn.
+/// stored server-side (`store: false`), streamed. `user_name` (the signed-in
+/// account's display name) is folded into `instructions` on every turn.
 pub fn responses_body(model: &str, history: &[Msg], user_name: Option<&str>) -> Value {
     let input: Vec<Value> = history
         .iter()
@@ -89,6 +91,7 @@ pub fn responses_body(model: &str, history: &[Msg], user_name: Option<&str>) -> 
         "model": model,
         "instructions": instructions_for(user_name),
         "input": input,
+        "tools": [{"type": "web_search"}],
         "store": false,
         "stream": true,
     })

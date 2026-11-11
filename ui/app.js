@@ -1,6 +1,11 @@
 /* notchbud island content — owns every pixel inside the shell.
    Rust pushes state via window.notchbud.render(state);
-   this side owns editing + posts intents back via chrome.webview. */
+   this side owns editing + posts intents back via chrome.webview.
+
+   Pages: home + chat + auth (signin) are the base flow;
+   menu / notifications / settings are overlay pages opened from the
+   topbar. Rust is the source of truth (`s.page`); this side only
+   renders it and posts {type:"nav", target} intents back. */
 
 (function () {
   "use strict";
@@ -13,16 +18,18 @@
 
   const el = (id) => document.getElementById(id);
   const screens = {
-    onboarding: el("screen-onboarding"),
     signin: el("screen-signin"),
     home: el("screen-home"),
     chat: el("screen-chat"),
+    menu: el("screen-menu"),
+    notifications: el("screen-notifications"),
+    settings: el("screen-settings"),
   };
-  const nameInput = el("name-input");
-  const nameError = el("name-error");
   const signinStatus = el("signin-status");
   const signinBtn = el("signin-btn");
+  const signinCancel = el("signin-cancel");
   const greeting = el("greeting");
+  const greetIcon = el("greet-icon");
   const homeStatus = el("home-status");
   const homeInput = el("chat-input-home");
   const chatStatus = el("chat-status");
@@ -31,48 +38,177 @@
   const homeSend = el("home-send");
   const chatSend = el("chat-send");
 
+  // topbar navigation
+  const navMenu = el("nav-menu");
+  const navNotifications = el("nav-notifications");
+  const navSettings = el("nav-settings");
+
+  // notifications page (hardcoded empty state until a dynamic feed lands)
+  const notifEmpty = el("notif-empty");
+  const notifList = el("notif-list");
+
+  // settings page: profile, login status, sign out
+  const settingsAvatar = el("settings-avatar");
+  const settingsName = el("settings-name");
+  const settingsEmail = el("settings-email");
+  const settingsPlan = el("settings-plan");
+  const settingsDot = el("settings-dot");
+  const settingsStatus = el("settings-status");
+  const settingsSignin = el("settings-signin");
+  const settingsDisconnect = el("settings-disconnect");
+
   let lastScreen = "";
 
   function show(name) {
-    for (const k of Object.keys(screens)) screens[k].hidden = (k !== name);
+    for (const k of Object.keys(screens)) {
+      if (screens[k]) screens[k].hidden = (k !== name);
+    }
     lastScreen = name;
   }
 
   function setStatus(node, text) {
+    if (!node) return;
     if (!text) { node.hidden = true; node.textContent = ""; return; }
     node.hidden = false;
     node.textContent = text;
   }
 
+  function setTopbarActive(page) {
+    const map = [
+      [navMenu, "menu"],
+      [navNotifications, "notifications"],
+      [navSettings, "settings"],
+    ];
+    for (const [btn, key] of map) {
+      if (!btn) continue;
+      const on = page === key;
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  }
+
+  // Greeting tile icons (Pikaicons, stroke): sun = morning/afternoon,
+  // cloud-sun = evening, moon = night ("Sleep Already").
+  const GREET_ICONS = {
+    sun: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><g clip-path="url(#greet-sun)"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 23v-1m-7.778-2.222.707-.707M1 12h1m2.222-7.778.707.707M12 2V1m7.071 3.929.707-.707M22 12h1m-3.929 7.071.707.707M18 12a6 6 0 1 1-12 0 6 6 0 0 1 12 0Z" fill="none" /></g><defs><clipPath id="greet-sun"><path fill="none" d="M0 0h24v24H0z" /></clipPath></defs></svg>',
+    "cloud-sun": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m10.582 2.27.022-.097M2.173 7.496l.097.022m3.015-4.43.054.085m9.588 2.166.084-.053M3.087 12.814l.085-.054m5.115 2.173a5.7 5.7 0 0 1-.136-1.71m0 0A3.9 3.9 0 0 0 8.57 21h8.666a4.767 4.767 0 0 0 1.88-9.149 5.636 5.636 0 0 0-6.167-3.792m-4.798 5.163q.011-.16.032-.318m4.766-4.845a4 4 0 1 0-4.77 4.844h.004M12.95 8.06a5.64 5.64 0 0 0-4.766 4.845" fill="none" /></svg>',
+    moon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 11.966A6.5 6.5 0 1 1 12.035 3H12a9 9 0 1 0 9 9z" fill="none" /></svg>',
+  };
+
+  // Auth Ready icon (Pikaicons check-tick-square, stroke) for the island
+  // settings plan line — replaces the old "Ready ✓" text tick.
+  const PLAN_READY_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m8.5 12.512 2.341 2.339A15 15 0 0 1 15.4 9.915l.101-.069M12 21c-2.796 0-4.193 0-5.296-.457a6 6 0 0 1-3.247-3.247C3 16.194 3 14.796 3 12s0-4.193.457-5.296a6 6 0 0 1 3.247-3.247C7.807 3 9.204 3 12 3s4.194 0 5.296.457a6 6 0 0 1 3.247 3.247C21 7.807 21 9.204 21 12s0 4.194-.457 5.296a6 6 0 0 1-3.247 3.247C16.194 21 14.796 21 12 21Z" fill="none" /></svg>';
+
+  function setGreetIcon(text) {
+    if (!greetIcon) return;
+    const t = String(text || "");
+    let key = "sun";
+    if (/^sleep already/i.test(t)) key = "moon";
+    else if (/^good evening/i.test(t)) key = "cloud-sun";
+    else if (/^good (morning|afternoon)/i.test(t)) key = "sun";
+    else {
+      const h = new Date().getHours();
+      key = (h >= 22 || h < 5) ? "moon" : (h >= 17 ? "cloud-sun" : "sun");
+    }
+    if (greetIcon.dataset.icon !== key) {
+      greetIcon.dataset.icon = key;
+      greetIcon.innerHTML = GREET_ICONS[key];
+    }
+  }
+
   function activeInput() {
-    if (lastScreen === "onboarding") return nameInput;
     if (lastScreen === "home") return homeInput;
     if (lastScreen === "chat") return chatInput;
     return null;
   }
 
-  // Rust -> web: full state render. Inputs keep focus/caret: we only
-  // overwrite a value when it differs from what the user sees.
+  function isOverlayPage(page) {
+    return page === "menu" || page === "notifications" || page === "settings";
+  }
+
+  function renderNotifications(s) {
+    const items = Array.isArray(s.notifications) ? s.notifications : [];
+    if (!notifEmpty || !notifList) return;
+    if (items.length === 0) {
+      // Hardcoded until dynamic: the empty state owns the page.
+      notifEmpty.hidden = false;
+      notifList.hidden = true;
+      notifList.innerHTML = "";
+      return;
+    }
+    notifEmpty.hidden = true;
+    notifList.hidden = false;
+    notifList.innerHTML = "";
+    for (const n of items.slice(0, 20)) {
+      const d = document.createElement("div");
+      d.className = "notif-item";
+      d.textContent = typeof n === "string" ? n : (n && n.text) || "";
+      notifList.appendChild(d);
+    }
+  }
+
+  function renderSettings(s) {
+    const name = (s.userName && String(s.userName)) || "";
+    const email = (s.email && String(s.email)) || "";
+    const connected = !!s.connected;
+    const planReady = !!s.planReady;
+    const signingIn = !!s.signingIn;
+
+    if (settingsAvatar) settingsAvatar.textContent = name ? [...name][0].toUpperCase() : "?";
+    if (settingsName) settingsName.textContent = name || "Not set yet";
+    if (settingsEmail) {
+      if (connected && email) settingsEmail.textContent = "Signed in as " + email;
+      else if (connected) settingsEmail.textContent = "Signed in ✓";
+      else settingsEmail.textContent = "Not signed in";
+    }
+    if (settingsPlan) {
+      if (!connected) settingsPlan.textContent = "ChatGPT plan: sign in to check";
+      else if (planReady) settingsPlan.innerHTML = "ChatGPT plan: Ready " + PLAN_READY_ICON;
+      else settingsPlan.textContent = "ChatGPT plan: Not enabled";
+    }
+    if (settingsDot) {
+      settingsDot.classList.toggle("on", connected);
+      settingsDot.classList.toggle("off", !connected);
+    }
+    // Transient Rust notice/error (e.g. "Approve in your browser…").
+    setStatus(settingsStatus, s.status);
+    if (settingsSignin) settingsSignin.style.display = (!connected && !signingIn) ? "" : "none";
+    if (settingsDisconnect) settingsDisconnect.style.display = connected && !signingIn ? "" : "none";
+    if (signingIn && settingsStatus) {
+      settingsStatus.hidden = false;
+      if (!settingsStatus.textContent) settingsStatus.textContent = "Connecting to ChatGPT…";
+    }
+  }
+
+  // Rust -> web: full state render. Inputs are owned by key()/typing:
+  // render() never syncs input values so state pushes cannot overwrite
+  // text entered while the inputs are unfocused; submitInput() clears
+  // after submission.
   function render(s) {
-    show(s.screen);
-    if (s.screen === "onboarding") {
-      if (document.activeElement !== nameInput && nameInput.value !== (s.nameDraft || "")) {
-        nameInput.value = s.nameDraft || "";
-      }
-      if (s.nameError) { nameError.hidden = false; nameError.textContent = s.nameError; }
-      else { nameError.hidden = true; nameError.textContent = ""; }
-    } else if (s.screen === "signin") {
-      setStatus(signinStatus, s.status);
-      signinBtn.style.display = s.signingIn ? "none" : "";
-      if (s.signingIn && signinStatus.hidden) {
+    const page = (s.page && String(s.page)) || (s.screen && String(s.screen)) || "home";
+    show(page);
+    setTopbarActive(page);
+    if (page === "signin") {
+      // No persistent status line (e.g. "Disconnected from ChatGPT.") —
+      // the button speaks for itself. While auth is in flight the live
+      // notice (e.g. "Approve in your browser…") shows with a Cancel
+      // link under it so the user can abort and restart in control.
+      if (s.signingIn) {
+        const t = (s.status && String(s.status).trim()) ? s.status : "Connecting to ChatGPT…";
         signinStatus.hidden = false;
-        signinStatus.textContent = "Connecting to ChatGPT…";
+        signinStatus.textContent = t;
+        signinCancel.hidden = false;
+      } else {
+        signinStatus.hidden = true;
+        signinStatus.textContent = "";
+        signinCancel.hidden = true;
       }
-    } else if (s.screen === "home") {
+      signinBtn.style.display = s.signingIn ? "none" : "";
+    } else if (page === "home") {
       greeting.textContent = s.greeting || "";
+      setGreetIcon(s.greeting);
       setStatus(homeStatus, s.status);
-      if (document.activeElement !== homeInput && homeInput.value !== "") homeInput.value = "";
-    } else if (s.screen === "chat") {
+    } else if (page === "chat") {
       setStatus(chatStatus, s.status);
       history.innerHTML = "";
       for (const t of (s.history || [])) {
@@ -88,13 +224,26 @@
         history.appendChild(d);
       }
       history.scrollTop = history.scrollHeight;
-      if (document.activeElement !== chatInput && chatInput.value !== "") chatInput.value = "";
+    } else if (page === "menu") {
+      // static launcher — nothing to fill.
+    } else if (page === "notifications") {
+      renderNotifications(s);
+    } else if (page === "settings") {
+      renderSettings(s);
+    } else {
+      // Unknown page from an older/newer host: fall back to home visuals
+      // rather than a blank island.
+      show("home");
     }
   }
 
   // Rust hook -> web: the window never activates, so physical keys arrive
   // here via ExecuteScript. Mirrors a real keypress in the visible input.
   function key(code) {
+    if (isOverlayPage(lastScreen)) {
+      if (code === 27) { post({ type: "nav", target: "back" }); } // Escape closes the page
+      return;
+    }
     const input = activeInput();
     if (!input) return;
     if (code === 13) { submitInput(); return; }       // Return
@@ -114,7 +263,7 @@
     if (code >= 32 && code <= 0x10FFFF) {
       const ch = String.fromCodePoint(code);
       if (ch.length && !/\p{Cc}/u.test(ch)) {
-        const cap = lastScreen === "onboarding" ? 30 : 400;
+        const cap = 400;
         const a = input.selectionStart == null ? input.value.length : input.selectionStart;
         const b = input.selectionEnd == null ? input.value.length : input.selectionEnd;
         const next = input.value.slice(0, a) + ch + input.value.slice(b);
@@ -178,9 +327,7 @@
   }
 
   function submitInput() {
-    if (lastScreen === "onboarding") {
-      post({ type: "name", text: nameInput.value });
-    } else if (lastScreen === "home") {
+    if (lastScreen === "home") {
       const t = homeInput.value;
       homeInput.value = "";
       post({ type: "submit", text: t });
@@ -191,10 +338,6 @@
     }
   }
 
-  nameInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); submitInput(); }
-    if (e.key === "Escape") { nameInput.value = ""; }
-  });
   homeInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); submitInput(); }
     if (e.key === "Escape") { homeInput.value = ""; }
@@ -204,8 +347,20 @@
     if (e.key === "Escape") { chatInput.value = ""; }
   });
   signinBtn.addEventListener("click", () => post({ type: "signin" }));
+  if (signinCancel) signinCancel.addEventListener("click", () => post({ type: "cancel_signin" }));
   if (homeSend) homeSend.addEventListener("click", () => submitInput());
   if (chatSend) chatSend.addEventListener("click", () => submitInput());
+
+  // Every [data-nav] button (topbar, menu tiles, back links, brand) posts
+  // a nav intent; Rust owns the overlay and pushes the new page back.
+  document.querySelectorAll("[data-nav]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.getAttribute("data-nav") || "back";
+      post({ type: "nav", target });
+    });
+  });
+  if (settingsSignin) settingsSignin.addEventListener("click", () => post({ type: "signin" }));
+  if (settingsDisconnect) settingsDisconnect.addEventListener("click", () => post({ type: "disconnect" }));
 
   // Leaving the island collapses it (parent has no mouse tracking inside us).
   document.addEventListener("mouseleave", () => post({ type: "mouseleave" }));

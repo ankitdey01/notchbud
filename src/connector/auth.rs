@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -67,6 +68,10 @@ pub struct Tokens {
     /// Validated ID-token `sub`: the stable account identity.
     pub subject: String,
     pub email: Option<String>,
+    /// Display name from the OpenAI ID token (`name`, else given/family,
+    /// else preferred_username/nickname). Used for the greeting, the model
+    /// instructions and Settings — never a credential, never typed by hand.
+    pub name: Option<String>,
     /// Granted scopes from the token response.
     pub scopes: Vec<String>,
     /// True when the grant includes `chatgpt.tokens.use.direct`.
@@ -404,8 +409,12 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
 
 /// Block until the browser returns to the loopback callback. Validates `state`
 /// before trusting anything else; surfaces OAuth declines as errors. Query
-/// values (which may carry tokens) are never logged.
-pub fn wait_callback(pending: PendingAuth) -> Result<(Callback, PendingAuthMeta), AuthError> {
+/// values (which may carry tokens) are never logged. `cancelled` is polled
+/// every loop turn so the island's Cancel link aborts promptly.
+pub fn wait_callback(
+    pending: PendingAuth,
+    cancelled: &AtomicBool,
+) -> Result<(Callback, PendingAuthMeta), AuthError> {
     let PendingAuth {
         listener,
         redirect_uri,
@@ -417,6 +426,9 @@ pub fn wait_callback(pending: PendingAuth) -> Result<(Callback, PendingAuthMeta)
     } = pending;
     let _ = listener.set_nonblocking(true);
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(AuthError::new("Sign-in cancelled.", false));
+        }
         if std::time::Instant::now() >= deadline {
             return Err(AuthError::new(
                 "ChatGPT sign-in timed out. Connect again from the tray.",
@@ -694,6 +706,78 @@ pub fn exchange_code(
 pub struct IdClaims {
     pub subject: String,
     pub email: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Display-name width for the island greeting line (same 420u budget the
+/// manual name box used to enforce).
+const NAME_MAX_CHARS: usize = 30;
+
+fn non_empty_str(v: &Value) -> Option<&str> {
+    v.as_str().filter(|s| !s.trim().is_empty())
+}
+
+/// Sanitize an OpenAI account display name for the island: squeeze
+/// whitespace, reject control characters, truncate to the greeting width.
+/// Returns None when nothing displayable remains.
+pub fn sanitize_account_name(raw: &str) -> Option<String> {
+    if raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let squeezed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if squeezed.is_empty() {
+        return None;
+    }
+    let truncated: String = squeezed.chars().take(NAME_MAX_CHARS).collect();
+    let truncated = truncated.trim_end().to_owned();
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
+}
+
+/// Pick the display name out of validated ID-token claims: `name` first,
+/// then given+family, then the OpenID username fallbacks.
+pub fn account_name_from_claims(claims: &Value) -> Option<String> {
+    if let Some(n) = non_empty_str(&claims["name"]) {
+        if let Some(s) = sanitize_account_name(n) {
+            return Some(s);
+        }
+    }
+    let given = non_empty_str(&claims["given_name"]);
+    let family = non_empty_str(&claims["family_name"]);
+    match (given, family) {
+        (Some(g), Some(f)) => {
+            let joined = format!("{g} {f}");
+            if let Some(s) = sanitize_account_name(&joined) {
+                return Some(s);
+            }
+        }
+        (Some(g), None) => {
+            if let Some(s) = sanitize_account_name(g) {
+                return Some(s);
+            }
+        }
+        (None, Some(f)) => {
+            if let Some(s) = sanitize_account_name(f) {
+                return Some(s);
+            }
+        }
+        (None, None) => {}
+    }
+    for key in ["preferred_username", "nickname"] {
+        if let Some(n) = non_empty_str(&claims[key]) {
+            // Usernames often arrive as an email; greet with the local part.
+            let handle = n.split('@').next().unwrap_or(n);
+            // Underscores/dots read as spaces in a greeting ("alex_kumar").
+            let spaced = handle.replace(['_', '.', '-'], " ");
+            if let Some(s) = sanitize_account_name(&spaced) {
+                return Some(s);
+            }
+        }
+    }
+    None
 }
 
 fn fetch_jwks() -> Result<Value, AuthError> {
@@ -814,7 +898,12 @@ pub fn validate_id_token(
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    Ok(IdClaims { subject, email })
+    let name = account_name_from_claims(&claims);
+    Ok(IdClaims {
+        subject,
+        email,
+        name,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -882,6 +971,7 @@ pub fn finish_signin(
         client_id: client_id.to_owned(),
         subject: claims.subject,
         email: claims.email,
+        name: claims.name,
         scopes,
         plan_allowed,
         host_id: host_id.to_owned(),
@@ -969,6 +1059,7 @@ pub fn refresh_tokens(prev: &Tokens) -> Result<Tokens, AuthError> {
         client_id: prev.client_id.clone(),
         subject: prev.subject.clone(),
         email: prev.email.clone(),
+        name: prev.name.clone(),
         scopes: scopes.clone(),
         plan_allowed: scopes.iter().any(|s| s == PLAN_SCOPE),
         host_id: prev.host_id.clone(),
@@ -1135,7 +1226,7 @@ unsafe fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>, String> {
 
 pub fn save_tokens(tokens: &Tokens) -> Result<(), String> {
     let plain = serde_json::json!({
-        "v": 2,
+        "v": 3,
         "accessToken": tokens.access,
         "refreshToken": tokens.refresh,
         "idToken": tokens.id_token,
@@ -1143,6 +1234,7 @@ pub fn save_tokens(tokens: &Tokens) -> Result<(), String> {
         "clientId": tokens.client_id,
         "subject": tokens.subject,
         "email": tokens.email,
+        "name": tokens.name,
         "scopes": tokens.scopes,
         "planAllowed": tokens.plan_allowed,
         "hostId": tokens.host_id,
@@ -1161,9 +1253,11 @@ pub fn load_tokens() -> Option<Tokens> {
     let blob = std::fs::read(&path).ok()?;
     let plain = unsafe { dpapi(&blob, false) }.ok()?;
     let value = serde_json::from_slice::<Value>(&plain).ok()?;
-    // v1 (Codex device-flow) blobs cannot be used with the SIWC endpoints;
-    // drop them so the user signs in again through the browser flow.
-    if value.get("v")?.as_i64()? != 2 {
+    // v1 (Codex device-flow) and v2 (pre-name) blobs cannot be used as-is:
+    // v1 cannot use the SIWC endpoints at all, and v2 has no account name
+    // for the greeting — drop either so the user signs in again through
+    // the browser flow and the name is captured.
+    if value.get("v")?.as_i64()? != 3 {
         let _ = std::fs::remove_file(&path);
         return None;
     }
@@ -1177,6 +1271,11 @@ pub fn load_tokens() -> Option<Tokens> {
         email: value
             .get("email")
             .and_then(Value::as_str)
+            .map(str::to_owned),
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(str::to_owned),
         scopes: value
             .get("scopes")
@@ -1265,5 +1364,33 @@ mod tests {
         let p = query_params("code=abc%20123&state=xyz&client_id=oaiapp_1");
         assert_eq!(p.len(), 3);
         assert_eq!(p[0], ("code".to_owned(), "abc 123".to_owned()));
+    }
+
+    #[test]
+    fn account_name_prefers_name_claim() {
+        let c = serde_json::json!({"name": "  Alex   Kumar  ", "given_name": "Alex"});
+        assert_eq!(account_name_from_claims(&c).as_deref(), Some("Alex Kumar"));
+    }
+
+    #[test]
+    fn account_name_falls_back_to_given_family_and_handles() {
+        let c = serde_json::json!({"given_name": "Alex", "family_name": "Kumar"});
+        assert_eq!(account_name_from_claims(&c).as_deref(), Some("Alex Kumar"));
+        let c = serde_json::json!({"preferred_username": "alex_kumar@example.com"});
+        assert_eq!(account_name_from_claims(&c).as_deref(), Some("alex kumar"));
+        let c = serde_json::json!({"nickname": "Alex"});
+        assert_eq!(account_name_from_claims(&c).as_deref(), Some("Alex"));
+        let c = serde_json::json!({});
+        assert_eq!(account_name_from_claims(&c), None);
+    }
+
+    #[test]
+    fn account_name_sanitizes_and_truncates() {
+        assert_eq!(sanitize_account_name("   "), None);
+        assert_eq!(sanitize_account_name("a\nb"), None);
+        assert_eq!(sanitize_account_name("José-O'Brien Jr."), Some("José-O'Brien Jr.".into()));
+        let long = "a".repeat(40);
+        let got = sanitize_account_name(&long).unwrap();
+        assert_eq!(got.len(), 30);
     }
 }

@@ -9,9 +9,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuItem, CreatePopupMenu, DestroyMenu, EnableMenuItem, GetCursorPos,
-    LoadImageW, PostMessageW, TrackPopupMenu, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_BYCOMMAND, MF_UNCHECKED,
-    TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RETURNCMD, WM_NULL,
+    LoadIconW, LoadImageW, PostMessageW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MF_BYCOMMAND, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RETURNCMD, WM_NULL,
 };
 
 pub const TRAY_CALLBACK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 9; // 0x8009
@@ -27,22 +27,28 @@ fn wide(s: &str) -> Vec<u16> {
 
 pub unsafe fn add_tray(hwnd: HWND) -> windows::core::Result<()> {
     // Cat logo from the exe resources (assets/app.rc, group id 1).
+    // Falls back to the default application icon so tray registration
+    // proceeds without resource ID 1. LR_SHARED keeps the handle shared
+    // so re-adding the tray never leaks an owned HICON; the fallback is
+    // shared too, so remove_tray needs no DestroyIcon to stay consistent.
     let hmodule = GetModuleHandleW(None)?;
-    let hicon = LoadImageW(
+    let hicon: HICON = LoadImageW(
         Some(HINSTANCE(hmodule.0)),
         PCWSTR(1 as *const u16),
         IMAGE_ICON,
         32,
         32,
-        LR_DEFAULTCOLOR,
-    )?;
+        LR_DEFAULTCOLOR | LR_SHARED,
+    )
+    .map(|h| HICON(h.0))
+    .or_else(|_| LoadIconW(None, IDI_APPLICATION))?;
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: TRAY_CALLBACK,
-        hIcon: HICON(hicon.0),
+        hIcon: hicon,
         ..Default::default()
     };
     let tip = wide("Notchbud");

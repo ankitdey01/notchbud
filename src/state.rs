@@ -215,16 +215,50 @@ const HISTORY_MAX: usize = 8;
 
 /// Which island section owns the frame. Every visual state maps to exactly
 /// one of these — no overlaps, no bare fallbacks:
-/// * Onboarding — no saved name yet: "What should we call you?" + name field.
-/// * SignIn — name known but not connected: status + the sign-in pill.
+/// * SignIn — not connected: status + the sign-in pill.
 /// * Home — signed in, no chat yet: time-based greeting + chat field.
 /// * Chat — signed in and chatting: history/stream + chat field pinned down.
+///
+/// Auth is not a separate screen: sign-in IS the auth page (nav target
+/// "auth" resolves to it when signed out, to home/chat when signed in).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
-    Onboarding,
     SignIn,
     Home,
     Chat,
+}
+
+/// Topbar overlay pages. These sit ON TOP of the base [`Screen`] without
+/// destroying it — opening Settings from Home then going Back returns to
+/// Home, not to a reset island. The user-facing pages are therefore:
+/// home, chat, auth (signin), menu, notifications, settings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Overlay {
+    #[default]
+    None,
+    Menu,
+    Notifications,
+    Settings,
+}
+
+impl Overlay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Overlay::None => "none",
+            Overlay::Menu => "menu",
+            Overlay::Notifications => "notifications",
+            Overlay::Settings => "settings",
+        }
+    }
+
+    pub fn from_target(target: &str) -> Option<Overlay> {
+        match target {
+            "menu" => Some(Overlay::Menu),
+            "notifications" => Some(Overlay::Notifications),
+            "settings" => Some(Overlay::Settings),
+            _ => None,
+        }
+    }
 }
 
 pub struct Chat {
@@ -332,8 +366,6 @@ impl Chat {
             "streaming": self.streaming,
             "signingIn": self.signing_in,
             "connected": self.connected(),
-            "nameError": null,
-            "nameDraft": "",
         })
     }
 }
@@ -350,12 +382,10 @@ pub struct App {
     // island chat backend (history + tokens); content renders in WebView2
     pub chat: Chat,
 
-    // first-run identity: None until onboarding saves it (persists at
-    // %APPDATA%\notchbud\user.json). While None the island shows the name
-    // prompt instead of chat/sign-in.
-    pub user_name: Option<String>,
-    /// Last onboarding validation message, shown under the name field.
-    pub name_error: Option<String>,
+    /// Topbar overlay page (menu / notifications / settings). `None` means
+    /// the base [`Screen`] owns the frame. Set via the "nav" web intent,
+    /// cleared on Back, on collapse, and on auth transitions.
+    pub overlay: Overlay,
 
     // geometry snapshot refreshed each frame (NCHITTEST hit surface)
     pub bar_area: [f32; 4],
@@ -386,8 +416,7 @@ impl App {
             expanded: false,
             mouse_inside: false,
             chat: Chat::new(),
-            user_name: None,
-            name_error: None,
+            overlay: Overlay::None,
             bar_area: [0.0; 4],
             rgn_area: [0.0; 4],
             win_x: 0,
@@ -396,27 +425,31 @@ impl App {
         }
     }
 
-    /// No usable saved name -> the island must ask for it. A missing file,
-    /// a corrupt file, and a blank name all land here.
-    pub fn needs_onboarding(&self) -> bool {
-        self.user_name
+    /// First name shown in the island UI (greeting + settings). The account
+    /// may be "Ankit Dey" — the island says "Ankit". Empty when signed out
+    /// or when the account has no name claim — the greeting then shows the
+    /// day part alone ("Good Evening").
+    pub fn display_name(&self) -> &str {
+        self.chat
+            .tokens
             .as_ref()
-            .is_none_or(|n| n.trim().is_empty())
+            .and_then(|t| t.name.as_deref())
+            .filter(|n| !n.trim().is_empty())
+            .and_then(|n| n.split_whitespace().next())
+            .unwrap_or("")
     }
 
     /// Greeting owns the top of the island only once signed in and before
     /// any chat does — the first submitted prompt hides it for the session.
     pub fn shows_greeting(&self) -> bool {
-        !self.needs_onboarding() && self.chat.connected() && !self.chat.has_chatted()
+        self.chat.connected() && !self.chat.has_chatted()
     }
 
     /// Which section owns this frame (see Screen). The greeting and chat
-    /// field wait behind the sign-in: after the name, a signed-out island
-    /// shows only the sign-in prompt, exactly like before.
+    /// field wait behind the sign-in: a signed-out island shows only the
+    /// sign-in prompt.
     pub fn screen(&self) -> Screen {
-        if self.needs_onboarding() {
-            Screen::Onboarding
-        } else if !self.chat.connected() {
+        if !self.chat.connected() {
             Screen::SignIn
         } else if self.chat.has_chatted() {
             Screen::Chat
@@ -425,24 +458,89 @@ impl App {
         }
     }
 
-    /// "Good Evening, Alex" for right now; empty when onboarding.
-    pub fn greeting(&self) -> String {
-        match self.user_name.as_deref() {
-            Some(n) if !n.trim().is_empty() => crate::user::greeting_now(n),
-            _ => String::new(),
+    /// Effective UI page the WebView2 router shows. The overlay wins when
+    /// open; otherwise the base screen owns the frame. Auth is an alias:
+    /// signin is the auth page when signed out.
+    pub fn page(&self) -> &'static str {
+        match self.overlay {
+            Overlay::Menu => "menu",
+            Overlay::Notifications => "notifications",
+            Overlay::Settings => "settings",
+            Overlay::None => match self.screen() {
+                Screen::SignIn => "signin",
+                Screen::Home => "home",
+                Screen::Chat => "chat",
+            },
         }
     }
 
-    /// Page state for the WebView2 island (screen + greeting + chat).
+    /// Close the overlay and return to the base screen.
+    pub fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    /// Topbar / menu navigation. Targets:
+    /// * "menu" | "notifications" | "settings" — open (toggle: tapping the
+    ///   active icon closes it back to the base screen).
+    /// * "auth" — close the overlay so the base auth step shows (signin
+    ///   when signed out, home/chat when signed in).
+    /// * "home" | "chat" | "back" | "" — close the overlay, stay on base.
+    /// Returns true when the overlay changed.
+    pub fn navigate(&mut self, target: &str) -> bool {
+        let prev = self.overlay;
+        match Overlay::from_target(target) {
+            Some(next) => {
+                self.overlay = if prev == next {
+                    Overlay::None
+                } else {
+                    next
+                };
+            }
+            None => {
+                // "auth" / "home" / "chat" / "back" all resolve to the base
+                // screen — the base Screen enum already picks the right one.
+                self.overlay = Overlay::None;
+            }
+        }
+        self.overlay != prev
+    }
+
+    /// "Good Evening, Alex" for right now, using the signed-in account's
+    /// name. Without a name (signed out, or no claim) the day part alone
+    /// shows ("Good Evening"); the sign-in screen owns the frame then.
+    pub fn greeting(&self) -> String {
+        crate::user::greeting_now(self.display_name())
+    }
+
+    /// Page state for the WebView2 island (screen + overlay page + chat).
+    /// `screen` stays for backwards compat; `page` is what the router
+    /// shows. `overlay` is "none" on the base flow. Settings reads
+    /// `userName` / `email` / `connected` / `planReady`; notifications
+    /// reads `notifications` (empty until dynamic — the page shows its
+    /// hardcoded empty state meanwhile).
     pub fn page_state(&self) -> String {
         let mut v = self.chat.ui_state(&self.greeting());
         v["screen"] = serde_json::json!(match self.screen() {
-            Screen::Onboarding => "onboarding",
             Screen::SignIn => "signin",
             Screen::Home => "home",
             Screen::Chat => "chat",
         });
-        v["nameError"] = self.name_error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+        v["overlay"] = serde_json::json!(self.overlay.as_str());
+        v["page"] = serde_json::json!(self.page());
+        v["userName"] = if self.display_name().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::from(self.display_name())
+        };
+        v["email"] = self
+            .chat
+            .tokens
+            .as_ref()
+            .and_then(|t| t.email.clone())
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        v["planReady"] = serde_json::json!(self.chat.plan_ready());
+        v["notifications"] = serde_json::json!([] as [serde_json::Value; 0]);
         v.to_string()
     }
 
@@ -542,8 +640,13 @@ mod tests {
     }
 
     /// Test-only sign-in: real tokens come from the browser flow, but the
-    /// routing below only needs `connected()` to be true.
+    /// routing below only needs `connected()` to be true. The account name
+    /// rides on the tokens, like the real ID-token `name` claim.
     fn sign_in(app: &mut App) {
+        sign_in_as(app, Some("Alex"));
+    }
+
+    fn sign_in_as(app: &mut App, name: Option<&str>) {
         app.chat.tokens = Some(crate::connector::auth::Tokens {
             access: "a".into(),
             refresh: "r".into(),
@@ -552,6 +655,7 @@ mod tests {
             client_id: "c".into(),
             subject: "s".into(),
             email: None,
+            name: name.map(str::to_owned),
             scopes: vec![crate::connector::auth::PLAN_SCOPE.into()],
             plan_allowed: true,
             host_id: "h".into(),
@@ -559,28 +663,33 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_until_a_name_is_saved() {
+    fn greeting_comes_from_the_account_name() {
+        // Signed out: the sign-in prompt owns the frame, no greeting name.
         let mut app = blank_app();
-        assert!(app.needs_onboarding());
-        assert_eq!(app.screen(), Screen::Onboarding);
-        assert!(!app.shows_greeting());
-        app.user_name = Some("   ".into());
-        assert!(app.needs_onboarding());
-        app.user_name = Some("Alex".into());
-        assert!(!app.needs_onboarding());
-        // Named but signed out: only the sign-in prompt, no greeting.
         assert_eq!(app.screen(), Screen::SignIn);
         assert!(!app.shows_greeting());
-        // Greeting waits for the sign-in.
+        assert_eq!(app.display_name(), "");
+        // Greeting waits for the sign-in, then uses the account name.
         sign_in(&mut app);
         assert_eq!(app.screen(), Screen::Home);
         assert!(app.shows_greeting());
+        assert_eq!(app.display_name(), "Alex");
+        // Multi-word account names show the first name only in the island.
+        let mut full = blank_app();
+        sign_in_as(&mut full, Some("Ankit Dey"));
+        assert_eq!(full.display_name(), "Ankit");
+        assert!(full.greeting().contains("Ankit"));
+        assert!(!full.greeting().contains("Dey"));
+        // Accounts without a name claim still greet (day part alone).
+        let mut nameless = blank_app();
+        sign_in_as(&mut nameless, None);
+        assert_eq!(nameless.display_name(), "");
+        assert!(nameless.greeting().contains("Good"));
     }
 
     #[test]
     fn first_chat_hides_the_greeting() {
         let mut app = blank_app();
-        app.user_name = Some("Alex".into());
         sign_in(&mut app);
         assert_eq!(app.screen(), Screen::Home);
         app.chat.push_history(Role::User, "hello who are you".into());
@@ -592,7 +701,6 @@ mod tests {
     #[test]
     fn streaming_counts_as_chatted() {
         let mut app = blank_app();
-        app.user_name = Some("Alex".into());
         sign_in(&mut app);
         app.chat.streaming = true;
         app.chat.stream = "Hi".into();
@@ -605,7 +713,6 @@ mod tests {
         // An expired grant mid-chat keeps its history but routes back to
         // the sign-in prompt (which shows the history above its pill).
         let mut app = blank_app();
-        app.user_name = Some("Alex".into());
         sign_in(&mut app);
         app.chat.push_history(Role::User, "hi".into());
         assert_eq!(app.screen(), Screen::Chat);
@@ -616,15 +723,82 @@ mod tests {
     #[test]
     fn page_state_matches_screen() {
         let mut app = blank_app();
-        app.user_name = Some("Alex".into());
         sign_in(&mut app);
         let v: serde_json::Value =
             serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["screen"], "home");
+        assert_eq!(v["page"], "home");
+        assert_eq!(v["overlay"], "none");
         assert!(v["greeting"].as_str().unwrap().contains("Alex"));
         app.chat.push_history(Role::User, "hi".into());
         let v: serde_json::Value =
             serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["screen"], "chat");
+        assert_eq!(v["page"], "chat");
+    }
+
+    #[test]
+    fn overlay_wins_over_base_screen_and_toggles() {
+        let mut app = blank_app();
+        sign_in(&mut app);
+        assert_eq!(app.page(), "home");
+
+        // open settings from home
+        assert!(app.navigate("settings"));
+        assert_eq!(app.overlay, Overlay::Settings);
+        assert_eq!(app.page(), "settings");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["overlay"], "settings");
+        assert_eq!(v["page"], "settings");
+        assert_eq!(v["screen"], "home", "base screen survives under the overlay");
+        assert_eq!(v["userName"], "Alex");
+
+        // tapping the active icon toggles back
+        assert!(app.navigate("settings"));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.page(), "home");
+
+        // notifications + menu
+        app.navigate("notifications");
+        assert_eq!(app.page(), "notifications");
+        app.navigate("menu");
+        assert_eq!(app.page(), "menu", "switching overlay replaces it");
+
+        // back / home / chat / auth all close the overlay
+        for target in ["back", "home", "chat", "auth", ""] {
+            app.close_overlay();
+            app.navigate("menu");
+            assert_eq!(app.page(), "menu");
+            app.navigate(target);
+            assert_eq!(app.overlay, Overlay::None);
+        }
+    }
+
+    #[test]
+    fn auth_target_resolves_to_base_auth_step() {
+        // signed out -> signin owns the frame even via "auth"
+        let mut app = blank_app();
+        app.navigate("auth");
+        assert_eq!(app.screen(), Screen::SignIn);
+        assert_eq!(app.page(), "signin");
+
+        // signed in -> home (auth has nothing to do)
+        sign_in(&mut app);
+        app.navigate("auth");
+        assert_eq!(app.page(), "home");
+    }
+
+    #[test]
+    fn page_state_carries_settings_fields() {
+        let mut app = blank_app();
+        sign_in(&mut app);
+        app.chat.tokens.as_mut().unwrap().email = Some("alex@example.com".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["userName"], "Alex");
+        assert_eq!(v["email"], "alex@example.com");
+        assert_eq!(v["planReady"], true);
+        assert!(v["notifications"].as_array().unwrap().is_empty());
     }
 }

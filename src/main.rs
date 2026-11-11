@@ -11,7 +11,7 @@
 // Debug builds keep the console so the [notchbud] log lines stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use notchbud::{connector, island_web, render, state, user};
+use notchbud::{connector, island_web, render, state};
 
 mod prefs;
 mod tray;
@@ -76,6 +76,7 @@ const CHAT_STATUS: usize = 7; // *String (transient notice, keeps signing_in)
 
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
 static CHAT_CANCEL: AtomicBool = AtomicBool::new(false); // island left mid-stream
+static SIGNIN_CANCEL: AtomicBool = AtomicBool::new(false); // island Cancel during OAuth
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0); // where the hook posts
 static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on quit)
 
@@ -411,6 +412,8 @@ fn collapse(app: &mut state::App) {
     app.mouse_inside = false;
     ISLAND_ACTIVE.store(false, Ordering::Release);
     app.expanded = false;
+    // Next open starts on the base screen, never a stale overlay page.
+    app.close_overlay();
     // the island left mid-stream: default cancel — the partial
     // stream is discarded silently
     if app.chat.streaming {
@@ -480,6 +483,8 @@ fn disconnect(app: &mut state::App) {
     app.chat.notice = None;
     CHAT_CANCEL.store(true, Ordering::Release);
     app.chat.error = Some("Disconnected from ChatGPT.".into());
+    // Back to the base auth step (signin), never a stale settings page.
+    app.close_overlay();
     push_web(app);
 }
 
@@ -534,7 +539,7 @@ fn start_signin(app: &mut state::App) {
             )) as isize),
         );
         eprintln!("[notchbud] signin: waiting for callback");
-        let (cb, meta) = match connector::auth::wait_callback(pending) {
+        let (cb, meta) = match connector::auth::wait_callback(pending, &SIGNIN_CANCEL) {
             Ok(c) => c,
             Err(e) => {
                 fail(e.msg);
@@ -573,6 +578,21 @@ fn start_signin(app: &mut state::App) {
             Err(e) => fail(e.msg),
         }
     });
+}
+
+/// Island "Cancel" under the sign-in prompt: aborts the in-flight OAuth
+/// round-trip so the user can restart in control. The worker polls
+/// SIGNIN_CANCEL and exits within ~100ms; its late result is swallowed
+/// via the flag (see CHAT_ERROR / CHAT_CONNECTED), so no stale success
+/// or failure can land after the abort.
+fn cancel_signin(app: &mut state::App) {
+    if !app.chat.signing_in {
+        return;
+    }
+    SIGNIN_CANCEL.store(true, Ordering::Release);
+    app.chat.signing_in = false;
+    app.chat.notice = None;
+    push_web(app);
 }
 
 fn copy_text_to_clipboard(text: &str) -> bool {
@@ -654,21 +674,6 @@ fn open_browser(url: &str) {
 /// and shortcuts straight into it. Paste injects via the hook path so it
 /// works without OS focus; everything else is browser-native.
 fn handle_chat_key(app: &mut state::App, code: usize) {
-    if app.needs_onboarding() {
-        // Onboarding has no Rust-side draft: the page owns the name field.
-        match code {
-            KEY_COPY => island_web::forward_shortcut("copy"),
-            KEY_SELECT_ALL => island_web::forward_shortcut("selectAll"),
-            KEY_CUT => island_web::forward_shortcut("cut"),
-            KEY_PASTE => paste_into_page(),
-            c if c == VK_BACK.0 as usize || c == VK_RETURN.0 as usize || c == VK_ESCAPE.0 as usize => {
-                island_web::forward_key(c)
-            }
-            c if (32..=0x10FFFF).contains(&c) => island_web::forward_key(c),
-            _ => {}
-        }
-        return;
-    }
     if code == KEY_COPY {
         island_web::forward_shortcut("copy");
         return;
@@ -722,7 +727,8 @@ fn char_to_code(ch: char) -> Option<usize> {
     }
 }
 
-/// WM_WEBMSG from the page: signin / submit / name / mouseleave intents.
+/// WM_WEBMSG from the page: nav / signin / cancel_signin / disconnect /
+/// submit / mouseleave intents.
 fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
     let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
     let v: serde_json::Value = match serde_json::from_str(&s) {
@@ -734,13 +740,20 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
     };
     match v.get("type").and_then(|t| t.as_str()) {
         Some("signin") => start_signin(app),
+        Some("cancel_signin") => cancel_signin(app),
+        Some("disconnect") => disconnect(app),
+        Some("nav") => {
+            let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("back");
+            app.navigate(target);
+            push_web(app);
+        }
+        Some("back") => {
+            app.close_overlay();
+            push_web(app);
+        }
         Some("submit") => {
             let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
             submit_chat(app, &text);
-        }
-        Some("name") => {
-            let raw = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
-            submit_name(app, &raw);
         }
         Some("mouseleave") => {
             if !app.expanded {
@@ -763,21 +776,6 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
         }
         _ => {}
     }
-}
-
-/// Onboarding submit: persist the name so the next launch greets directly.
-fn submit_name(app: &mut state::App, raw: &str) {
-    match user::save_name(raw) {
-        Ok(canonical) => {
-            app.user_name = Some(canonical);
-            app.name_error = None;
-        }
-        Err(e) => {
-            eprintln!("[notchbud] save name failed: {}", e.detail);
-            app.name_error = Some(e.ui.to_owned());
-        }
-    }
-    push_web(app);
 }
 
 /// Enter: push the user turn, spawn the connector thread for one streaming
@@ -804,6 +802,9 @@ fn submit_chat(app: &mut state::App, raw: &str) {
     app.chat.error = None;
     app.chat.notice = None;
     CHAT_CANCEL.store(false, Ordering::Release);
+    // A sent prompt owns the island — drop any overlay (menu/notifications/
+    // settings) so the live stream shows on the chat page.
+    app.close_overlay();
     push_web(app);
 
     let hwnd = app.hwnd.0 as isize;
@@ -814,7 +815,9 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         .map(|(role, text)| state::Msg { role: *role, text: text.clone() })
         .collect();
     let model = app.chat.model.clone();
-    let user_name = app.user_name.clone();
+    // The account display name rides every request so the model knows its
+    // user; it comes from the sign-in, never from a manual name box.
+    let user_name = app.chat.tokens.as_ref().and_then(|t| t.name.clone());
     std::thread::spawn(move || unsafe {
         let hwnd = HWND(hwnd as *mut _);
         // 5-min-margin refresh; OpenAI rotates the refresh token per use, and
@@ -955,7 +958,14 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
         }
         CHAT_ERROR => {
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
-            if !CHAT_CANCEL.load(Ordering::Relaxed) {
+            if SIGNIN_CANCEL.swap(false, Ordering::AcqRel) {
+                // user-aborted sign-in: drop the late failure quietly,
+                // back to the sign-in prompt with no error text
+                app.chat.signing_in = false;
+                app.chat.streaming = false;
+                app.chat.stream.clear();
+                app.chat.notice = None;
+            } else if !CHAT_CANCEL.load(Ordering::Relaxed) {
                 app.chat.streaming = false;
                 app.chat.stream.clear();
                 app.chat.error = Some(*s);
@@ -971,10 +981,16 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
         }
         CHAT_CONNECTED => {
             let t = unsafe { Box::from_raw(lparam.0 as *mut connector::auth::Tokens) };
-            app.chat.tokens = Some(*t);
-            app.chat.signing_in = false;
-            app.chat.notice = None;
-            app.chat.error = None;
+            if SIGNIN_CANCEL.swap(false, Ordering::AcqRel) {
+                // aborted after the browser approved: drop the late grant
+                app.chat.signing_in = false;
+                app.chat.notice = None;
+            } else {
+                app.chat.tokens = Some(*t);
+                app.chat.signing_in = false;
+                app.chat.notice = None;
+                app.chat.error = None;
+            }
             push_web(app);
         }
         CHAT_STATUS => {
@@ -1080,28 +1096,34 @@ fn main() -> Result<()> {
 
         // --- class "NotchWindow" + our wndproc ---
         // Cat-logo icon from the exe resources (assets/app.rc, group id 1).
-        let hicon_big = LoadImageW(
+        // Missing resources fall back to null so startup never aborts; the
+        // window-creation flow accepts null icon handles.
+        let hicon_big: HICON = LoadImageW(
             Some(hinstance),
             PCWSTR(1 as *const u16),
             IMAGE_ICON,
             32,
             32,
             LR_DEFAULTCOLOR,
-        )?;
-        let hicon_sm = LoadImageW(
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default();
+        let hicon_sm: HICON = LoadImageW(
             Some(hinstance),
             PCWSTR(1 as *const u16),
             IMAGE_ICON,
             16,
             16,
             LR_DEFAULTCOLOR,
-        )?;
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
-            hIcon: HICON(hicon_big.0),
-            hIconSm: HICON(hicon_sm.0),
+            hIcon: hicon_big,
+            hIconSm: hicon_sm,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: w!("NotchbudWindow"),
             ..Default::default()
@@ -1131,7 +1153,6 @@ fn main() -> Result<()> {
         // --- App state ---
         let mut app = Box::new(state::App::new(hwnd, scale, width, height));
         app.chat.tokens = connector::auth::load_tokens(); // saved sign-in, if any
-        app.user_name = user::load_name(); // saved name; None = first run onboarding
         app.win_x = x;
         app.win_y = 0;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
