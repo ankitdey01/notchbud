@@ -1,69 +1,93 @@
-// auth_math.rs — pure auth math: refresh timing, plan gate, constants.
+// auth_math.rs — pure Groq key math: format gate, identity constants.
 // No network, no DPAPI, no %APPDATA% writes: safe on any dev machine.
-// (Deliberately NOT tested here: save/load/delete_tokens touch the real
-// login at %APPDATA%\notchbud\auth.bin, and refresh/list/revoke hit the
+// (Deliberately NOT tested here: save/load/delete_api_key touch the real
+// login at %APPDATA%\notchbud\auth.bin, and list/validate hit the
 // network. Those stay manual.)
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use notchbud::connector::auth::{is_valid_key_format, pick_model_from, ApiKey, USER_AGENT};
+use notchbud::connector::chat::GROQ_CHAT_URL;
 
-use notchbud::connector::auth::{
-    Tokens, PLAN_SCOPE, REFRESH_MARGIN_SECS, USER_AGENT,
-};
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn toks(expires_in_secs: i64, plan_allowed: bool, access: &str, refresh: &str) -> Tokens {
-    Tokens {
-        access: access.into(),
-        refresh: refresh.into(),
-        id_token: "id".into(),
-        expires_at: (now_secs() as i64 + expires_in_secs) as u64,
-        client_id: "oaiapp_test".into(),
-        subject: "sub".into(),
-        email: None,
-        name: Some("Alex".into()),
-        scopes: vec![PLAN_SCOPE.into()],
-        plan_allowed,
-        host_id: "host".into(),
-    }
+#[test]
+fn key_format_gate() {
+    assert!(is_valid_key_format("gsk_1234567890abcdef"));
+    assert!(is_valid_key_format("  gsk_1234567890abcdef  "));
+    assert!(!is_valid_key_format(""));
+    assert!(!is_valid_key_format("sk-abc"));
+    assert!(!is_valid_key_format("gsk_short"));
+    assert!(!is_valid_key_format("gsk_has space 1234567890"));
+    assert!(!is_valid_key_format("https://console.groq.com/keys"));
 }
 
 #[test]
-fn refresh_margin_is_five_minutes() {
-    assert_eq!(REFRESH_MARGIN_SECS, 5 * 60, "contract with the comment in auth.rs");
-}
-
-#[test]
-fn needs_refresh_boundaries() {
-    use notchbud::connector::auth::needs_refresh;
-    // expired / nearly expired -> refresh (tick-safe: far from the edge)
-    assert!(needs_refresh(&toks(-5, true, "a", "r")));
-    assert!(needs_refresh(&toks(0, true, "a", "r")));
-    assert!(needs_refresh(&toks(299, true, "a", "r")));
-    // comfortably fresh -> no refresh (310s survives any second-tick)
-    assert!(!needs_refresh(&toks(310, true, "a", "r")));
-    assert!(!needs_refresh(&toks(3600, true, "a", "r")));
-}
-
-#[test]
-fn plan_ready_gate() {
-    let good = toks(3600, true, "a", "r");
-    assert!(good.plan_ready());
-    assert!(!toks(3600, false, "a", "r").plan_ready(), "no plan scope");
-    assert!(!toks(3600, true, "", "r").plan_ready(), "empty access");
-    assert!(!toks(3600, true, "a", "").plan_ready(), "empty refresh");
+fn api_key_trims() {
+    let k = ApiKey::new("  gsk_1234567890abcdef  ").unwrap();
+    assert_eq!(k.key, "gsk_1234567890abcdef");
+    assert!(ApiKey::new("not-a-key").is_none());
 }
 
 #[test]
 fn identity_consts() {
-    assert_eq!(PLAN_SCOPE, "chatgpt.tokens.use.direct");
+    assert_eq!(GROQ_CHAT_URL, "https://api.groq.com/openai/v1/chat/completions");
     assert!(
         USER_AGENT.starts_with("notchbud/"),
         "server-side originator tag rides on this"
     );
+}
+
+/// RED for the wrong-model bug: `pick_model` took the first catalog entry,
+/// but Groq's server order is arbitrary — the first id can be whisper
+/// (audio, can't chat), a guard model, or a deprecated llama. Per
+/// https://console.groq.com/docs/models the production text models on a
+/// developer key are openai/gpt-oss-20b and openai/gpt-oss-120b
+/// (llama-3.1-8b-instant / llama-3.3-70b-versatile went enterprise-only and
+/// deprecated for dev tier in Aug 2026).
+#[test]
+fn model_pick_prefers_fast_production_chat_model() {
+    // Arrange: server-first junk, preferred model buried in the middle.
+    let catalog = [
+        "whisper-large-v3-turbo",
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "qwen/qwen3.8-27b",
+    ];
+    // Act + assert: fastest production chat model wins, not server order.
+    assert_eq!(
+        pick_model_from(catalog),
+        Some("openai/gpt-oss-20b".to_owned())
+    );
+}
+
+#[test]
+fn model_pick_falls_back_to_120b_without_20b() {
+    let catalog = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"];
+    assert_eq!(
+        pick_model_from(catalog),
+        Some("openai/gpt-oss-120b".to_owned())
+    );
+}
+
+#[test]
+fn model_pick_skips_non_chat_slugs() {
+    // Arrange: no preferred model; only speech/safety/tts entries plus one
+    // chat-capable preview model.
+    let catalog = [
+        "whisper-large-v3",
+        "meta-llama/llama-prompt-guard-2-86m",
+        "openai/gpt-oss-safeguard-20b",
+        "canopylabs/orpheus-v1-english",
+        "qwen/qwen3.8-27b",
+    ];
+    // Act + assert: first chat-capable entry, never whisper/guard/orpheus.
+    assert_eq!(pick_model_from(catalog), Some("qwen/qwen3.8-27b".to_owned()));
+}
+
+#[test]
+fn model_pick_is_none_without_any_chat_model() {
+    assert_eq!(
+        pick_model_from(["whisper-large-v3", "meta-llama/llama-prompt-guard-2-22m"]),
+        None
+    );
+    let empty: [&str; 0] = [];
+    assert_eq!(pick_model_from(empty), None);
 }

@@ -1,4 +1,5 @@
 /target
+installer/Output/
 .agents
 dev_run.log
 run*.log

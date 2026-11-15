@@ -1,12 +1,7 @@
 // user.rs — greeting helpers for the island.
 //
-// The name now comes from the signed-in OpenAI account (the ID-token `name`
-// claim, stored on `Tokens`), never typed by hand and never stored in a
-// separate file. This module keeps only the greeting math that formats it.
-
-/// Canonical display width for the greeting line: account names are
-/// truncated to this many characters so they fit inside the 420u island.
-pub const NAME_MAX_CHARS: usize = 30;
+// An API key carries no account name, so the greeting shows the day part
+// alone. This module keeps only the greeting math that formats it.
 
 /// Local hour in 0..=23 via the OS clock (no extra deps, respects the user's
 /// time zone and DST — the greeting follows "their" morning/evening).

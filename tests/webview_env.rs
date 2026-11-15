@@ -15,7 +15,10 @@
 //   2. Attempt order is explicit-dir-then-default: a failed explicit
 //      environment must fall back to the default environment, never abort.
 
-use notchbud::island_web::{env_attempt_order, pick_user_data_dir, pick_user_data_dir_with, EnvDir};
+use notchbud::island_web::{
+    busy_fallback_dir, env_attempt_order, is_busy_hresult, pick_user_data_dir,
+    pick_user_data_dir_with, EnvDir,
+};
 
 /// Writable scratch base for probe tests. NOTE: this deliberately avoids
 /// %TEMP%: child test binaries in this environment get
@@ -76,9 +79,13 @@ fn env_attempt_order_tries_explicit_then_default() {
     // Act.
     let order = env_attempt_order(Some(primary.clone()));
     // Assert: explicit first, default as the fallback that avoids black.
-    assert_eq!(order.len(), 2);
+    // A fresh per-process profile sits between them: when the primary
+    // profile is held by a stale process (controller BUSY 0x800700AA), the
+    // retry lands on a dir that cannot be locked instead of giving up.
+    assert_eq!(order.len(), 3);
     assert!(matches!(&order[0], EnvDir::Explicit(p) if p == &primary));
-    assert!(matches!(&order[1], EnvDir::Default));
+    assert!(matches!(&order[1], EnvDir::Explicit(p) if p == &busy_fallback_dir(&primary)));
+    assert!(matches!(&order[2], EnvDir::Default));
 }
 
 #[test]
@@ -88,4 +95,44 @@ fn env_attempt_order_is_default_only_without_primary() {
     // Assert.
     assert_eq!(order.len(), 1);
     assert!(matches!(&order[0], EnvDir::Default));
+}
+
+/// RED for the black-island-on-BUSY bug: `CreateCoreWebView2Controller`
+/// fails with HRESULT_FROM_WIN32(ERROR_BUSY) (0x800700AA) when the profile
+/// is held by another live WebView2 (stale notchbud/msedgewebview2 after a
+/// kill). The plain write probe still passes in that state, so the env
+/// loop succeeds and the single controller attempt dies — READY=false,
+/// black island. The controller error must be classified so init retries
+/// on a fresh profile instead of returning.
+#[test]
+fn busy_hresult_is_recognised_as_retryable() {
+    // Arrange: the exact code from the report.
+    let busy = windows::core::HRESULT(0x800700AAu32 as i32);
+    // Act + assert.
+    assert!(is_busy_hresult(busy));
+}
+
+#[test]
+fn other_hresults_are_not_busy() {
+    // Arrange: success + a generic failure.
+    // Act + assert.
+    assert!(!is_busy_hresult(windows::core::HRESULT(0)));
+    assert!(!is_busy_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
+}
+
+#[test]
+fn busy_fallback_dir_is_a_fresh_sibling_of_primary() {
+    // Arrange: the locked profile dir.
+    let primary = scratch_base("primary").join("EBWebView");
+    // Act.
+    let fallback = busy_fallback_dir(&primary);
+    // Assert: same parent (still per-user), different name (never locked),
+    // deterministic per process so a restart reuses it.
+    assert_ne!(fallback, primary);
+    assert_eq!(fallback.parent(), primary.parent());
+    let name = fallback
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    assert!(name.starts_with("EBWebView."), "fallback was {name}");
 }

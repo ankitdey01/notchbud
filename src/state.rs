@@ -97,28 +97,23 @@ pub const CLOSE_KNOTS: [(f32, f32); 10] = [
     (0.600, 0.0), // holds closed afterwards
 ];
 
-pub fn close_progress(t: f32) -> f32 {
-    let t = t.max(0.0);
+fn close_segment(t: f32) -> Option<(f32, f32, f32, f32)> {
     for w in CLOSE_KNOTS.windows(2) {
         if t < w[1].0 {
-            let (t0, v0) = w[0];
-            let (t1, v1) = w[1];
-            return v0 + (v1 - v0) * (t - t0) / (t1 - t0);
+            return Some((w[0].0, w[0].1, w[1].0, w[1].1));
         }
     }
-    0.0
+    None
+}
+
+pub fn close_progress(t: f32) -> f32 {
+    let t = t.max(0.0);
+    close_segment(t).map_or(0.0, |(t0, v0, t1, v1)| v0 + (v1 - v0) * (t - t0) / (t1 - t0))
 }
 
 pub fn close_velocity(t: f32) -> f32 {
     let t = t.max(0.0);
-    for w in CLOSE_KNOTS.windows(2) {
-        if t < w[1].0 {
-            let (t0, v0) = w[0];
-            let (t1, v1) = w[1];
-            return (v1 - v0) / (t1 - t0);
-        }
-    }
-    0.0
+    close_segment(t).map_or(0.0, |(t0, v0, t1, v1)| (v1 - v0) / (t1 - t0))
 }
 
 pub const CLOSE_SETTLE: f32 = 0.368; // collapse + bounce dip + recover
@@ -262,9 +257,9 @@ impl Overlay {
 }
 
 pub struct Chat {
-    /// The saved ChatGPT sign-in; None = not connected.
-    pub tokens: Option<crate::connector::auth::Tokens>,
-    /// Resolved plan model from the account catalog, cached per sign-in.
+    /// The saved Groq API key; None = not connected.
+    pub tokens: Option<crate::connector::auth::ApiKey>,
+    /// Resolved Groq model from the key's catalog, cached per key.
     pub model: Option<String>,
     /// Assistant text currently arriving.
     pub stream: String,
@@ -298,11 +293,6 @@ impl Chat {
         self.tokens.is_some()
     }
 
-    /// Signed in AND authorized for ChatGPT-plan inference.
-    pub fn plan_ready(&self) -> bool {
-        self.tokens.as_ref().is_some_and(|t| t.plan_ready())
-    }
-
     pub fn push_history(&mut self, role: Role, text: String) {
         if self.history.len() >= HISTORY_MAX {
             self.history.remove(0);
@@ -323,8 +313,8 @@ impl Chat {
         !self.connected() && !self.signing_in
     }
 
-    /// Status lines shared by every screen: transient notice, error, and
-    /// the identity-only plan gate. Empty when there is nothing to say.
+    /// Status lines shared by every screen: transient notice and error.
+    /// Empty when there is nothing to say.
     pub fn status_text(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
         if let Some(n) = &self.notice {
@@ -336,9 +326,6 @@ impl Chat {
             if !e.trim().is_empty() {
                 lines.push(e.clone());
             }
-        }
-        if self.connected() && !self.plan_ready() && self.error.is_none() {
-            lines.push("ChatGPT plan use isn't enabled — Connect again to authorize it.".into());
         }
         lines.join("\n")
     }
@@ -425,18 +412,11 @@ impl App {
         }
     }
 
-    /// First name shown in the island UI (greeting + settings). The account
-    /// may be "Ankit Dey" — the island says "Ankit". Empty when signed out
-    /// or when the account has no name claim — the greeting then shows the
-    /// day part alone ("Good Evening").
+    /// First name shown in the island UI. An API key carries no account
+    /// name, so this stays empty and the greeting shows the day part
+    /// alone ("Good Evening").
     pub fn display_name(&self) -> &str {
-        self.chat
-            .tokens
-            .as_ref()
-            .and_then(|t| t.name.as_deref())
-            .filter(|n| !n.trim().is_empty())
-            .and_then(|n| n.split_whitespace().next())
-            .unwrap_or("")
+        ""
     }
 
     /// Greeting owns the top of the island only once signed in and before
@@ -505,9 +485,9 @@ impl App {
         self.overlay != prev
     }
 
-    /// "Good Evening, Alex" for right now, using the signed-in account's
-    /// name. Without a name (signed out, or no claim) the day part alone
-    /// shows ("Good Evening"); the sign-in screen owns the frame then.
+    /// "Good Evening" for right now. An API key carries no account name,
+    /// so the day part alone shows; the sign-in screen owns the frame
+    /// when signed out.
     pub fn greeting(&self) -> String {
         crate::user::greeting_now(self.display_name())
     }
@@ -515,9 +495,10 @@ impl App {
     /// Page state for the WebView2 island (screen + overlay page + chat).
     /// `screen` stays for backwards compat; `page` is what the router
     /// shows. `overlay` is "none" on the base flow. Settings reads
-    /// `userName` / `email` / `connected` / `planReady`; notifications
-    /// reads `notifications` (empty until dynamic — the page shows its
-    /// hardcoded empty state meanwhile).
+    /// `connected` / `keyReady` (keyReady mirrors connected: a saved key
+    /// means ready); `userName` / `email` stay null (an API key carries
+    /// neither); notifications reads `notifications` (empty until dynamic
+    /// — the page shows its hardcoded empty state meanwhile).
     pub fn page_state(&self) -> String {
         let mut v = self.chat.ui_state(&self.greeting());
         v["screen"] = serde_json::json!(match self.screen() {
@@ -527,19 +508,9 @@ impl App {
         });
         v["overlay"] = serde_json::json!(self.overlay.as_str());
         v["page"] = serde_json::json!(self.page());
-        v["userName"] = if self.display_name().is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::from(self.display_name())
-        };
-        v["email"] = self
-            .chat
-            .tokens
-            .as_ref()
-            .and_then(|t| t.email.clone())
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null);
-        v["planReady"] = serde_json::json!(self.chat.plan_ready());
+        v["userName"] = serde_json::Value::Null;
+        v["email"] = serde_json::Value::Null;
+        v["keyReady"] = serde_json::json!(self.chat.connected());
         v["notifications"] = serde_json::json!([] as [serde_json::Value; 0]);
         v.to_string()
     }
@@ -625,9 +596,9 @@ mod tests {
 
         // failure clears back to the pill
         c.signing_in = false;
-        c.error = Some("That approval already expired. Connect again.".into());
+        c.error = Some("That Groq API key was rejected — enter a new key.".into());
         assert!(c.shows_signin_button());
-        assert!(c.status_text().contains("That approval already expired"));
+        assert!(c.status_text().contains("rejected"));
     }
 
     fn blank_app() -> App {
@@ -639,52 +610,26 @@ mod tests {
         )
     }
 
-    /// Test-only sign-in: real tokens come from the browser flow, but the
-    /// routing below only needs `connected()` to be true. The account name
-    /// rides on the tokens, like the real ID-token `name` claim.
+    /// Test-only sign-in: a saved Groq key is all `connected()` needs.
     fn sign_in(app: &mut App) {
-        sign_in_as(app, Some("Alex"));
-    }
-
-    fn sign_in_as(app: &mut App, name: Option<&str>) {
-        app.chat.tokens = Some(crate::connector::auth::Tokens {
-            access: "a".into(),
-            refresh: "r".into(),
-            id_token: "i".into(),
-            expires_at: u64::MAX,
-            client_id: "c".into(),
-            subject: "s".into(),
-            email: None,
-            name: name.map(str::to_owned),
-            scopes: vec![crate::connector::auth::PLAN_SCOPE.into()],
-            plan_allowed: true,
-            host_id: "h".into(),
+        app.chat.tokens = Some(crate::connector::auth::ApiKey {
+            key: "gsk_test1234567890abcdef".into(),
         });
     }
 
     #[test]
-    fn greeting_comes_from_the_account_name() {
+    fn greeting_shows_day_part_without_account_name() {
         // Signed out: the sign-in prompt owns the frame, no greeting name.
         let mut app = blank_app();
         assert_eq!(app.screen(), Screen::SignIn);
         assert!(!app.shows_greeting());
         assert_eq!(app.display_name(), "");
-        // Greeting waits for the sign-in, then uses the account name.
+        // Signed in with a key: greeting shows the day part alone.
         sign_in(&mut app);
         assert_eq!(app.screen(), Screen::Home);
         assert!(app.shows_greeting());
-        assert_eq!(app.display_name(), "Alex");
-        // Multi-word account names show the first name only in the island.
-        let mut full = blank_app();
-        sign_in_as(&mut full, Some("Ankit Dey"));
-        assert_eq!(full.display_name(), "Ankit");
-        assert!(full.greeting().contains("Ankit"));
-        assert!(!full.greeting().contains("Dey"));
-        // Accounts without a name claim still greet (day part alone).
-        let mut nameless = blank_app();
-        sign_in_as(&mut nameless, None);
-        assert_eq!(nameless.display_name(), "");
-        assert!(nameless.greeting().contains("Good"));
+        assert_eq!(app.display_name(), "");
+        assert!(app.greeting().contains("Good") || app.greeting().contains("Sleep"));
     }
 
     #[test]
@@ -729,7 +674,7 @@ mod tests {
         assert_eq!(v["screen"], "home");
         assert_eq!(v["page"], "home");
         assert_eq!(v["overlay"], "none");
-        assert!(v["greeting"].as_str().unwrap().contains("Alex"));
+        assert!(!v["greeting"].as_str().unwrap().is_empty());
         app.chat.push_history(Role::User, "hi".into());
         let v: serde_json::Value =
             serde_json::from_str(&app.page_state()).unwrap();
@@ -752,7 +697,8 @@ mod tests {
         assert_eq!(v["overlay"], "settings");
         assert_eq!(v["page"], "settings");
         assert_eq!(v["screen"], "home", "base screen survives under the overlay");
-        assert_eq!(v["userName"], "Alex");
+        assert!(v["userName"].is_null());
+        assert_eq!(v["email"], serde_json::Value::Null);
 
         // tapping the active icon toggles back
         assert!(app.navigate("settings"));
@@ -793,12 +739,11 @@ mod tests {
     fn page_state_carries_settings_fields() {
         let mut app = blank_app();
         sign_in(&mut app);
-        app.chat.tokens.as_mut().unwrap().email = Some("alex@example.com".into());
         let v: serde_json::Value =
             serde_json::from_str(&app.page_state()).unwrap();
-        assert_eq!(v["userName"], "Alex");
-        assert_eq!(v["email"], "alex@example.com");
-        assert_eq!(v["planReady"], true);
+        assert!(v["userName"].is_null());
+        assert!(v["email"].is_null());
+        assert_eq!(v["keyReady"], true);
         assert!(v["notifications"].as_array().unwrap().is_empty());
     }
 }

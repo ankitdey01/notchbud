@@ -283,22 +283,24 @@ body {
 }
 
 /* Optical middle vs the shell: the WebView ends above the shell's bottom
-   curve, so the sign-in button gets a nudge down to sit truly centered
-   between the navbar and the island's bottom edge. */
+   curve, so the sign-in stack gets a nudge down to sit truly centered
+   between the island top and bottom edge. */
 #screen-signin {
     padding-top: 8px;
     align-items: center;
 }
 
-/* Sign-in pill is a centered compact button, never full-bleed:
-   .screen uses align-items:stretch, so without this the pill stretches
-   to the full island width. */
-#signin-btn {
-    align-self: center;
-    width: auto;
-    max-width: 280px;
-    padding-left: 22px;
-    padding-right: 22px;
+/* Sign-in landing: one pill + one quiet link, nothing else. */
+.signin-landing {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+}
+
+/* Key entry reuses .askbox (same pill as the prompt input): input + up arrow. */
+#key-entry {
+    max-width: 340px;
 }
 
 #screen-signin> :first-child,
@@ -311,12 +313,19 @@ body {
     margin-bottom: 0;
 }
 
-/* Home: even 8px rhythm — topbar-to-greeting equals greeting-to-input.
-   Top-anchored so the equality holds at any island height. */
+/* Home: topbar at top, prompt pinned to bottom, greeting centered
+   in the free space between them. .greet stretches (flex:1) and its
+   row already uses align-items:center, so the icon+text sit at the
+   vertical middle between nav and prompt at any island height. */
 #screen-home {
     justify-content: flex-start;
     gap: 8px;
     padding-top: 8px;
+}
+
+#screen-home .greet {
+    flex: 1;
+    min-height: 0;
 }
 
 /* Chat owns its own layout (history flexes, ask box pins to the bottom). */
@@ -492,13 +501,18 @@ body {
 }
 
 /* send buttons are .btn .btn-primary .btn-icon-sm .btn-circle;
-   only the paper-plane optical nudge stays here */
+   only the paper-plane sends need the optical nudge — the up arrow stays centered */
 .send {
     flex: none;
 }
 
-.send svg {
+#home-send svg,
+#chat-send svg {
     margin-left: 2px;
+}
+
+.askinput:disabled {
+    opacity: 0.6;
 }
 
 /* ---------- legacy bits (signin / chat) ---------- */
@@ -513,6 +527,17 @@ body {
 }
 
 /* sign-in pills are .btn .btn-secondary .btn-lg .btn-pill — no local rules */
+
+.keyhint {
+    font-size: 12px;
+    color: #9ca3af;
+    text-decoration: none;
+}
+
+.keyhint:hover {
+    color: #fff;
+    text-decoration: underline;
+}
 
 /* cancel link is .btn .btn-link .btn-link-danger — no local rules */
 
@@ -580,11 +605,23 @@ body {
     scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
 }
 
+/* Menu + Notifications heads pin to the same top offset, so both titles
+   render at exactly the same (x, y) no matter how tall each page's body
+   is. Bodies keep their bottom auto margin, so leftover space absorbs
+   below the content, never above the title. Settings stays headless and
+   centered (see tests/island_layout.rs). */
+#screen-menu .page-head,
+#screen-notifications .page-head {
+    margin-top: 0;
+}
+
 /* Overlay pages (menu / notifications / settings) ride the tall shell with
-   compact content: the base .screen auto margins vertically center it, so
-   short pages sit in the optical middle instead of stranded at the top.
-   When a page outgrows the shell (a long notifications feed), the autos
-   resolve to zero and it top-anchors with internal scroll, same as chat.
+   compact content: the base .screen auto margins vertically center the
+   headless settings page, so it sits in the optical middle instead of
+   stranded at the top. Menu + Notifications pin their heads (above) and
+   their bodies flow beneath. When a page outgrows the shell (a long
+   notifications feed), the autos resolve to zero and it top-anchors with
+   internal scroll, same as chat.
    The bottom half MUST sit on the last VISIBLE block: the Back link is
    display:none and a hidden box absorbs no space, so a margin there
    silently un-centers the whole page (see tests/island_layout.rs). */

@@ -1,33 +1,15 @@
 // chat_state.rs — pure Chat backend + Roles + LPARAM math.
 // No window, no network, no registry: safe on any dev machine.
 // Content editing/selection now lives in the WebView2 page; Rust keeps
-// tokens, history, the live stream and status lines.
+// the API key, history, the live stream and status lines.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use notchbud::connector::auth::{Tokens, PLAN_SCOPE};
+use notchbud::connector::auth::ApiKey;
 use notchbud::connector::chat::Role;
 use notchbud::state::{client_pt, screen_pt, App, Chat};
 use windows::Win32::Foundation::{HWND, LPARAM};
 
-fn toks(expires_in_secs: i64, plan_allowed: bool) -> Tokens {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Tokens {
-        access: "acc".into(),
-        refresh: "ref".into(),
-        id_token: "id".into(),
-        expires_at: (now as i64 + expires_in_secs) as u64,
-        client_id: "oaiapp_test".into(),
-        subject: "sub".into(),
-        email: None,
-        name: Some("Alex".into()),
-        scopes: vec![PLAN_SCOPE.into()],
-        plan_allowed,
-        host_id: "host".into(),
-    }
+fn key() -> ApiKey {
+    ApiKey::new("gsk_test1234567890abcdef").unwrap()
 }
 
 // --- Role codes (persisted in history; must stay stable) ---
@@ -71,17 +53,13 @@ fn signin_pill_states() {
     assert!(c.status_text().contains("boom"), "error stays visible");
 }
 
-// --- status text: plan gate, notice, error ---
+// --- status text: notice + error ---
 
 #[test]
 fn status_text_branches() {
-    // identity-only sign-in (no plan scope) nags exactly once
-    let mut c = Chat::new();
-    c.tokens = Some(toks(3600, false));
-    assert!(c.status_text().contains("isn't enabled"));
-
     // notice + error both surface, notice first
-    c.tokens = Some(toks(3600, true));
+    let mut c = Chat::new();
+    c.tokens = Some(key());
     c.notice = Some("n1".into());
     c.error = Some("e1".into());
     let t = c.status_text();
@@ -93,13 +71,13 @@ fn status_text_branches() {
 #[test]
 fn ui_state_carries_history_and_stream() {
     let mut c = Chat::new();
-    c.tokens = Some(toks(3600, true));
+    c.tokens = Some(key());
     c.push_history(Role::User, "hi".into());
     c.push_history(Role::Assistant, "hey".into());
     c.streaming = true;
     c.stream = "half…".into();
-    let v = c.ui_state("Good evening, Alex");
-    assert_eq!(v["greeting"], "Good evening, Alex");
+    let v = c.ui_state("Good evening");
+    assert_eq!(v["greeting"], "Good evening");
     assert_eq!(v["streaming"], true);
     assert_eq!(v["history"][0]["role"], "user");
     assert_eq!(v["history"][0]["text"], "hi");

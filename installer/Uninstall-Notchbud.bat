@@ -33,10 +33,10 @@ echo [*] Removing shortcuts...
 del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Notchbud.lnk" 2^>nul
 del "%USERPROFILE%\Desktop\Notchbud.lnk" 2^>nul
 
-REM 4. Sign-in data: ask before deleting so a reinstall can stay signed in.
+REM 4. API-key data: ask before deleting so a reinstall can stay signed in.
 echo.
 if not exist "%APPDATA%\notchbud\auth.bin" goto noauth
-choice /M "Delete your ChatGPT sign-in data (%APPDATA%\notchbud\auth.bin)"
+choice /M "Delete your Groq API key (%APPDATA%\notchbud\auth.bin)"
 if errorlevel 2 goto keepauth
 if errorlevel 1 goto wipeauth
 :wipeauth
@@ -44,10 +44,10 @@ echo [*] Deleting %APPDATA%\notchbud...
 rmdir /s /q "%APPDATA%\notchbud" 2^>nul
 goto doneauth
 :keepauth
-echo [*] Keeping sign-in data.
+echo [*] Keeping API key.
 goto doneauth
 :noauth
-echo [*] No sign-in data found.
+echo [*] No API key found.
 rmdir "%APPDATA%\notchbud" 2^>nul
 :doneauth
 

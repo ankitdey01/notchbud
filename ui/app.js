@@ -27,7 +27,12 @@
   };
   const signinStatus = el("signin-status");
   const signinBtn = el("signin-btn");
-  const signinCancel = el("signin-cancel");
+  const keysBtn = el("keys-btn");
+  const signinLanding = el("signin-landing");
+  const keyEntry = el("key-entry");
+  const keySend = el("key-send");
+  const groqKey = el("groq-key");
+  const topbar = document.querySelector(".topbar");
   const greeting = el("greeting");
   const greetIcon = el("greet-icon");
   const homeStatus = el("home-status");
@@ -58,12 +63,26 @@
   const settingsDisconnect = el("settings-disconnect");
 
   let lastScreen = "";
+  // Local-only step: landing (two buttons) -> key entry (input + up arrow).
+  // Rust never sees this; submitKey posts save_key and Rust owns verify.
+  let keyEntering = false;
+
+  function setKeyEntering(on) {
+    keyEntering = on;
+    if (signinLanding) signinLanding.hidden = on;
+    if (keyEntry) keyEntry.hidden = !on;
+    if (on && groqKey) groqKey.focus();
+    else if (!on && groqKey) groqKey.value = "";
+  }
 
   function show(name) {
     for (const k of Object.keys(screens)) {
       if (screens[k]) screens[k].hidden = (k !== name);
     }
     lastScreen = name;
+    // Minimal signin: no navbar on either step; nothing competes with the key.
+    if (topbar) topbar.hidden = (name === "signin");
+    if (name !== "signin" && keyEntering) setKeyEntering(false);
   }
 
   function setStatus(node, text) {
@@ -96,8 +115,8 @@
   };
 
   // Auth Ready icon (Pikaicons check-tick-square, stroke) for the island
-  // settings plan line — replaces the old "Ready ✓" text tick.
-  const PLAN_READY_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m8.5 12.512 2.341 2.339A15 15 0 0 1 15.4 9.915l.101-.069M12 21c-2.796 0-4.193 0-5.296-.457a6 6 0 0 1-3.247-3.247C3 16.194 3 14.796 3 12s0-4.193.457-5.296a6 6 0 0 1 3.247-3.247C7.807 3 9.204 3 12 3s4.194 0 5.296.457a6 6 0 0 1 3.247 3.247C21 7.807 21 9.204 21 12s0 4.194-.457 5.296a6 6 0 0 1-3.247 3.247C16.194 21 14.796 21 12 21Z" fill="none" /></svg>';
+  // settings status line.
+  const READY_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m8.5 12.512 2.341 2.339A15 15 0 0 1 15.4 9.915l.101-.069M12 21c-2.796 0-4.193 0-5.296-.457a6 6 0 0 1-3.247-3.247C3 16.194 3 14.796 3 12s0-4.193.457-5.296a6 6 0 0 1 3.247-3.247C7.807 3 9.204 3 12 3s4.194 0 5.296.457a6 6 0 0 1 3.247 3.247C21 7.807 21 9.204 21 12s0 4.194-.457 5.296a6 6 0 0 1-3.247 3.247C16.194 21 14.796 21 12 21Z" fill="none" /></svg>';
 
   function setGreetIcon(text) {
     if (!greetIcon) return;
@@ -119,6 +138,7 @@
   function activeInput() {
     if (lastScreen === "home") return homeInput;
     if (lastScreen === "chat") return chatInput;
+    if (lastScreen === "signin") return groqKey;
     return null;
   }
 
@@ -148,35 +168,32 @@
   }
 
   function renderSettings(s) {
-    const name = (s.userName && String(s.userName)) || "";
-    const email = (s.email && String(s.email)) || "";
     const connected = !!s.connected;
-    const planReady = !!s.planReady;
+    const keyReady = !!(s.keyReady ?? s.planReady);
     const signingIn = !!s.signingIn;
 
-    if (settingsAvatar) settingsAvatar.textContent = name ? [...name][0].toUpperCase() : "?";
-    if (settingsName) settingsName.textContent = name || "Not set yet";
+    if (settingsAvatar) settingsAvatar.textContent = connected ? "G" : "?";
+    if (settingsName) settingsName.textContent = connected ? "Groq API key" : "Not set yet";
     if (settingsEmail) {
-      if (connected && email) settingsEmail.textContent = "Signed in as " + email;
-      else if (connected) settingsEmail.textContent = "Signed in ✓";
+      if (connected) settingsEmail.textContent = "Key sealed on this device";
       else settingsEmail.textContent = "Not signed in";
     }
     if (settingsPlan) {
-      if (!connected) settingsPlan.textContent = "ChatGPT plan: sign in to check";
-      else if (planReady) settingsPlan.innerHTML = "ChatGPT plan: Ready " + PLAN_READY_ICON;
-      else settingsPlan.textContent = "ChatGPT plan: Not enabled";
+      if (!connected) settingsPlan.textContent = "Groq: enter key to check";
+      else if (keyReady) settingsPlan.innerHTML = "Groq: Ready " + READY_ICON;
+      else settingsPlan.textContent = "Groq: checking…";
     }
     if (settingsDot) {
       settingsDot.classList.toggle("on", connected);
       settingsDot.classList.toggle("off", !connected);
     }
-    // Transient Rust notice/error (e.g. "Approve in your browser…").
+    // Transient Rust notice/error (e.g. "Checking key…").
     setStatus(settingsStatus, s.status);
     if (settingsSignin) settingsSignin.style.display = (!connected && !signingIn) ? "" : "none";
     if (settingsDisconnect) settingsDisconnect.style.display = connected && !signingIn ? "" : "none";
     if (signingIn && settingsStatus) {
       settingsStatus.hidden = false;
-      if (!settingsStatus.textContent) settingsStatus.textContent = "Connecting to ChatGPT…";
+      if (!settingsStatus.textContent) settingsStatus.textContent = "Checking key…";
     }
   }
 
@@ -189,21 +206,25 @@
     show(page);
     setTopbarActive(page);
     if (page === "signin") {
-      // No persistent status line (e.g. "Disconnected from ChatGPT.") —
-      // the button speaks for itself. While auth is in flight the live
-      // notice (e.g. "Approve in your browser…") shows with a Cancel
-      // link under it so the user can abort and restart in control.
-      if (s.signingIn) {
-        const t = (s.status && String(s.status).trim()) ? s.status : "Connecting to ChatGPT…";
-        signinStatus.hidden = false;
-        signinStatus.textContent = t;
-        signinCancel.hidden = false;
+      // Landing or key entry owns the frame; verification state rides the
+      // same box so nothing swaps mid-flight.
+      const signingIn = !!s.signingIn;
+      const t = (s.status && String(s.status).trim()) ? s.status : "";
+      if (signingIn) {
+        if (!keyEntering) setKeyEntering(true);
+        setStatus(signinStatus, t || "Checking key…");
+      } else if (t) {
+        // Error after verify: stay in entry so the fix is one paste away.
+        if (!keyEntering) setKeyEntering(true);
+        setStatus(signinStatus, t);
       } else {
-        signinStatus.hidden = true;
-        signinStatus.textContent = "";
-        signinCancel.hidden = true;
+        setStatus(signinStatus, "");
+        // Fresh landing only when no error is showing; keep entry open
+        // across unrelated pushes while the user types.
+        if (keyEntering && document.activeElement !== groqKey && !groqKey.value) setKeyEntering(false);
       }
-      signinBtn.style.display = s.signingIn ? "none" : "";
+      if (groqKey) groqKey.disabled = signingIn;
+      if (keySend) keySend.style.display = signingIn ? "none" : "";
     } else if (page === "home") {
       greeting.textContent = s.greeting || "";
       setGreetIcon(s.greeting);
@@ -327,27 +348,35 @@
   }
 
   function submitInput() {
-    if (lastScreen === "home") {
-      const t = homeInput.value;
-      homeInput.value = "";
+    const input =
+      lastScreen === "home" ? homeInput : lastScreen === "chat" ? chatInput : null;
+    if (input) {
+      const t = input.value;
+      input.value = "";
       post({ type: "submit", text: t });
-    } else if (lastScreen === "chat") {
-      const t = chatInput.value;
-      chatInput.value = "";
-      post({ type: "submit", text: t });
+    } else if (lastScreen === "signin") {
+      submitKey();
     }
   }
 
-  homeInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); submitInput(); }
-    if (e.key === "Escape") { homeInput.value = ""; }
+  for (const input of [homeInput, chatInput]) {
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); submitInput(); }
+      if (e.key === "Escape") { input.value = ""; }
+    });
+  }
+  function submitKey() {
+    const k = groqKey ? groqKey.value : "";
+    if (!k.trim()) return;
+    post({ type: "save_key", key: k });
+  }
+  if (groqKey) groqKey.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submitKey(); }
+    if (e.key === "Escape") { setKeyEntering(false); }
   });
-  chatInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); submitInput(); }
-    if (e.key === "Escape") { chatInput.value = ""; }
-  });
-  signinBtn.addEventListener("click", () => post({ type: "signin" }));
-  if (signinCancel) signinCancel.addEventListener("click", () => post({ type: "cancel_signin" }));
+  if (signinBtn) signinBtn.addEventListener("click", () => setKeyEntering(true));
+  if (keySend) keySend.addEventListener("click", submitKey);
+  if (keysBtn) keysBtn.addEventListener("click", () => post({ type: "open_keys" }));
   if (homeSend) homeSend.addEventListener("click", () => submitInput());
   if (chatSend) chatSend.addEventListener("click", () => submitInput());
 
@@ -359,7 +388,7 @@
       post({ type: "nav", target });
     });
   });
-  if (settingsSignin) settingsSignin.addEventListener("click", () => post({ type: "signin" }));
+  if (settingsSignin) settingsSignin.addEventListener("click", () => post({ type: "nav", target: "auth" }));
   if (settingsDisconnect) settingsDisconnect.addEventListener("click", () => post({ type: "disconnect" }));
 
   // Leaving the island collapses it (parent has no mouse tracking inside us).

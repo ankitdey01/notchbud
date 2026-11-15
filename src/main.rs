@@ -57,6 +57,11 @@ const TIMER_IDLE_RGN: usize = 3;
 // composites the live Chromium surface only after the shell stops moving
 const TIMER_WEB_SHOW: usize = 4;
 
+// Chat pane backend: Groq API key (https://console.groq.com/keys), sealed
+// with DPAPI. External URLs always open in the system browser, never in the
+// island WebView (navigating it away kills the island until restart).
+pub const GROQ_KEYS_URL: &str = "https://console.groq.com/keys";
+
 // chat wiring: connector thread(s) post into this pump via PostMessage.
 const WM_CHAT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10; // connector events
 const WM_KEY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 11; // keyboard hook chars
@@ -69,14 +74,12 @@ const KEY_PASTE: usize = 0x110003;
 const CHAT_DELTA: usize = 0; // *String
 const CHAT_DONE: usize = 1;
 const CHAT_ERROR: usize = 2; // *String
-const CHAT_CONNECTED: usize = 3; // *Tokens
+const CHAT_CONNECTED: usize = 3; // *ApiKey
 const CHAT_MODEL: usize = 5; // *String (resolved model)
 const CHAT_SIGNED_OUT: usize = 6; // *String (terminal auth failure: clear creds)
-const CHAT_STATUS: usize = 7; // *String (transient notice, keeps signing_in)
 
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
 static CHAT_CANCEL: AtomicBool = AtomicBool::new(false); // island left mid-stream
-static SIGNIN_CANCEL: AtomicBool = AtomicBool::new(false); // island Cancel during OAuth
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0); // where the hook posts
 static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on quit)
 
@@ -145,8 +148,16 @@ unsafe fn schedule_idle_region(hwnd: HWND, settle: f32) {
 // content choreography: greeting fades in only once the pop is done).
 unsafe fn schedule_web_show(hwnd: HWND) {
     KillTimer(Some(hwnd), TIMER_WEB_SHOW).ok();
-    let delay = state::open_settle() + state::CONTENT_FADE;
+    let delay = web_show_delay_secs();
     SetTimer(Some(hwnd), TIMER_WEB_SHOW, (delay * 1000.0).ceil() as u32, None);
+}
+
+// Reveal the page the moment the open spring settles, so the compositor
+// animates the shell alone. Kept small on purpose: every millisecond here is
+// black island the user stares at. (The fade itself plays after reveal via
+// fadeIn — waiting for it here too would double-count it.)
+fn web_show_delay_secs() -> f32 {
+    state::open_settle()
 }
 
 // One-shot hover-leave tracking for the parent window (consumed on fire).
@@ -295,6 +306,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     render::draw_now(app);
                     after_state_change(app); // island region now, stays clickable
                     island_web::layout(app.scale);
+                    push_web(app); // paint while hidden so reveal shows content, not a flash
                     schedule_web_show(hwnd);
                 }
             }
@@ -387,6 +399,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         after_state_change(app);
                         island_web::layout(app.scale);
+                        push_web(app); // paint while hidden so reveal shows content, not a flash
                         schedule_web_show(hwnd);
                     } else {
                         collapse(app);
@@ -450,13 +463,24 @@ fn collapse(app: &mut state::App) {
 
 fn handle_tray_menu(app: &mut state::App) {
     unsafe {
-        let chosen = tray::popup_menu(app.hwnd, app.chat.connected(), app.chat.plan_ready());
+        let chosen = tray::popup_menu(app.hwnd, app.chat.connected());
         match chosen as u32 {
             tray::ID_START => {
                 let on = !prefs::is_start_with_windows();
                 let _ = prefs::set_start_with_windows(on);
             }
-            tray::ID_CONNECT => start_signin(app),
+            tray::ID_CONNECT => {
+                // The key is entered in the island, not the tray: expand the
+                // island so the sign-in page shows.
+                app.expanded = true;
+                ISLAND_ACTIVE.store(true, Ordering::Release);
+                render::animate(true);
+                render::draw_now(app);
+                after_state_change(app);
+                island_web::layout(app.scale);
+                push_web(app); // paint while hidden so reveal shows content, not a flash
+                schedule_web_show(app.hwnd);
+            }
             tray::ID_DISCONNECT => disconnect(app),
             tray::ID_EXIT => PostQuitMessage(0),
             _ => {}
@@ -469,12 +493,7 @@ fn handle_tray_menu(app: &mut state::App) {
 // ---------------------------------------------------------------------------
 
 fn disconnect(app: &mut state::App) {
-    // Best-effort remote revocation off the UI thread; local credentials are
-    // cleared immediately either way.
-    if let Some(tokens) = app.chat.tokens.clone() {
-        std::thread::spawn(move || connector::auth::revoke_session(&tokens));
-    }
-    connector::auth::delete_tokens();
+    connector::auth::delete_api_key();
     app.chat.tokens = None;
     app.chat.model = None;
     app.chat.streaming = false;
@@ -482,27 +501,34 @@ fn disconnect(app: &mut state::App) {
     app.chat.history.clear();
     app.chat.notice = None;
     CHAT_CANCEL.store(true, Ordering::Release);
-    app.chat.error = Some("Disconnected from ChatGPT.".into());
+    app.chat.error = Some("Disconnected.".into());
     // Back to the base auth step (signin), never a stale settings page.
     app.close_overlay();
     push_web(app);
 }
 
-/// Tray "Connect ChatGPT": browser-based SIWC authorization on a worker
-/// thread. Fresh installs register dynamically; saved accounts reauthorize
-/// with their issued client id.
-fn start_signin(app: &mut state::App) {
+/// Island "Enter Groq API Key": validate the key against Groq's model
+/// catalog on a worker thread, then persist it sealed with DPAPI.
+fn save_api_key(app: &mut state::App, raw_key: &str) {
     if app.chat.signing_in || app.chat.streaming {
         return;
     }
-    if app.chat.plan_ready() {
+    let key = raw_key.trim().to_owned();
+    let Some(api_key) = connector::auth::ApiKey::new(&key) else {
+        app.chat.error = Some("That doesn't look like a Groq API key (it starts with gsk_).".into());
+        app.chat.notice = None;
+        push_web(app);
         return;
-    }
+    };
     app.chat.signing_in = true;
     app.chat.error = None;
+    app.chat.notice = Some("Checking key…".into());
+    // A stale cancel from a collapsed stream would swallow this validation's
+    // result (CHAT_ERROR treats a set flag as "leave, ignore me"). No chat
+    // stream can be live here (early return above), so clearing is safe.
+    CHAT_CANCEL.store(false, Ordering::Release);
     push_web(app);
     let hwnd = app.hwnd.0 as isize;
-    let saved = app.chat.tokens.clone();
     std::thread::spawn(move || unsafe {
         let hwnd_raw = HWND(hwnd as *mut _);
         let fail = |m: String| {
@@ -513,147 +539,34 @@ fn start_signin(app: &mut state::App) {
                 LPARAM(Box::into_raw(Box::new(m)) as isize),
             );
         };
-        let host_id = match connector::auth::load_or_create_host_id() {
-            Ok(h) => h,
-            Err(e) => {
-                fail(e.msg);
-                return;
-            }
-        };
-        let (pending, url) = match connector::auth::begin_authorize(saved.as_ref(), &host_id) {
-            Ok(p) => p,
-            Err(e) => {
-                fail(e.msg);
-                return;
-            }
-        };
-        eprintln!("[notchbud] signin: listener on {}", pending.redirect_uri);
-        open_browser(&url);
-        let _ = copy_text_to_clipboard(&url);
+        if let Err(e) = connector::auth::validate_api_key(&api_key.key) {
+            fail(e.msg);
+            return;
+        }
+        if let Err(e) = connector::auth::save_api_key(&api_key) {
+            eprintln!("[notchbud] API key could not be saved ({e}); session continues without persistence");
+            let _ = PostMessageW(
+                Some(hwnd_raw),
+                WM_CHAT,
+                WPARAM(CHAT_CONNECTED),
+                LPARAM(Box::into_raw(Box::new(api_key)) as isize),
+            );
+            fail("Signed in for now, but the key could not be saved — it won't survive a restart.".into());
+            return;
+        }
         let _ = PostMessageW(
             Some(hwnd_raw),
             WM_CHAT,
-            WPARAM(CHAT_STATUS),
-            LPARAM(Box::into_raw(Box::new(
-                "Approve in your browser to finish signing in.".to_string(),
-            )) as isize),
+            WPARAM(CHAT_CONNECTED),
+            LPARAM(Box::into_raw(Box::new(api_key)) as isize),
         );
-        eprintln!("[notchbud] signin: waiting for callback");
-        let (cb, meta) = match connector::auth::wait_callback(pending, &SIGNIN_CANCEL) {
-            Ok(c) => c,
-            Err(e) => {
-                fail(e.msg);
-                return;
-            }
-        };
-        let nonce = meta.nonce.clone();
-        let data = match connector::auth::exchange_code(&meta, &cb.code, &cb.client_id) {
-            Ok(d) => d,
-            Err(e) => {
-                fail(e.msg);
-                return;
-            }
-        };
-        match connector::auth::finish_signin(&data, &cb.client_id, &nonce, &host_id, saved.as_ref())
-        {
-            Ok(t) => {
-                if let Err(e) = connector::auth::save_tokens(&t) {
-                    eprintln!("[notchbud] credentials could not be saved ({e}); session continues without persistence");
-                    let _ = PostMessageW(
-                        Some(hwnd_raw),
-                        WM_CHAT,
-                        WPARAM(CHAT_CONNECTED),
-                        LPARAM(Box::into_raw(Box::new(t)) as isize),
-                    );
-                    fail("Signed in for now, but credentials could not be saved — sign-in won't survive a restart.".into());
-                    return;
-                }
-                let _ = PostMessageW(
-                    Some(hwnd_raw),
-                    WM_CHAT,
-                    WPARAM(CHAT_CONNECTED),
-                    LPARAM(Box::into_raw(Box::new(t)) as isize),
-                );
-            }
-            Err(e) => fail(e.msg),
-        }
     });
 }
 
-/// Island "Cancel" under the sign-in prompt: aborts the in-flight OAuth
-/// round-trip so the user can restart in control. The worker polls
-/// SIGNIN_CANCEL and exits within ~100ms; its late result is swallowed
-/// via the flag (see CHAT_ERROR / CHAT_CONNECTED), so no stale success
-/// or failure can land after the abort.
-fn cancel_signin(app: &mut state::App) {
-    if !app.chat.signing_in {
-        return;
-    }
-    SIGNIN_CANCEL.store(true, Ordering::Release);
-    app.chat.signing_in = false;
-    app.chat.notice = None;
-    push_web(app);
-}
-
-fn copy_text_to_clipboard(text: &str) -> bool {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-    };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return false;
-        }
-        let _ = EmptyClipboard();
-        let mut wide: Vec<u16> = text.encode_utf16().collect();
-        wide.push(0);
-        let mut ok = false;
-        if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) {
-            let p = GlobalLock(h) as *mut u16;
-            if !p.is_null() {
-                std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
-                let _ = GlobalUnlock(h);
-                if SetClipboardData(13 /* CF_UNICODETEXT */, Some(HANDLE(h.0))).is_ok() {
-                    ok = true;
-                }
-            }
-        }
-        let _ = CloseClipboard();
-        ok
-    }
-}
-
-/// Read Unicode text off the clipboard (for hook paste injection).
-fn get_clipboard_text() -> Option<String> {
-    use windows::Win32::Foundation::HGLOBAL;
-    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return None;
-        }
-        let text = (|| {
-            let h = GetClipboardData(13 /* CF_UNICODETEXT */).ok()?;
-            let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
-            if p.is_null() {
-                return None;
-            }
-            let mut len = 0usize;
-            while *p.add(len) != 0 {
-                len += 1;
-            }
-            let slice = std::slice::from_raw_parts(p, len);
-            let s = String::from_utf16(slice).ok();
-            let _ = GlobalUnlock(HGLOBAL(h.0));
-            s
-        })();
-        let _ = CloseClipboard();
-        text
-    }
-}
-
-fn open_browser(url: &str) {
+/// Open an external URL in the system browser. The island WebView must never
+/// navigate itself (one external click would replace the island page and
+/// deaden every intent until restart), so links go out through here.
+fn open_url_in_browser(url: &str) {
     use windows::Win32::UI::Shell::ShellExecuteW;
     unsafe {
         let op: Vec<u16> = "open\0".encode_utf16().collect();
@@ -667,6 +580,38 @@ fn open_browser(url: &str) {
             None,
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
+    }
+}
+
+/// Read Unicode text off the clipboard (for hook paste injection).
+fn get_clipboard_text() -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let text = (|| {
+            let h = GetClipboardData(13 /* CF_UNICODETEXT */).ok()?;
+            let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            // Bound the NUL scan by the allocation size so a malformed
+            // block without a terminator can't read out of bounds.
+            let max = (GlobalSize(HGLOBAL(h.0)) / 2).min(1 << 20);
+            let mut len = 0usize;
+            while len < max && *p.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(p, len);
+            let s = String::from_utf16(slice).ok();
+            let _ = GlobalUnlock(HGLOBAL(h.0));
+            s
+        })();
+        let _ = CloseClipboard();
+        text
     }
 }
 
@@ -690,15 +635,15 @@ fn handle_chat_key(app: &mut state::App, code: usize) {
         paste_into_page();
         return;
     }
-    if !app.chat.connected() || app.chat.streaming {
-        return; // no field to type in; silent while a stream runs
+    if app.chat.streaming {
+        return; // silent while a stream runs
     }
-    match code {
-        c if c == VK_BACK.0 as usize || c == VK_RETURN.0 as usize || c == VK_ESCAPE.0 as usize => {
-            island_web::forward_key(c)
-        }
-        c if (32..=0x10FFFF).contains(&c) => island_web::forward_key(c),
-        _ => {}
+    if code == VK_BACK.0 as usize
+        || code == VK_RETURN.0 as usize
+        || code == VK_ESCAPE.0 as usize
+        || (32..=0x10FFFF).contains(&code)
+    {
+        island_web::forward_key(code)
     }
 }
 
@@ -706,28 +651,17 @@ fn handle_chat_key(app: &mut state::App, code: usize) {
 /// the same key path as physical typing (respects the page's 400-char cap).
 fn paste_into_page() {
     if let Some(clip) = get_clipboard_text() {
+        // Filtered chars are always printable Unicode scalars, so every
+        // value fits the page's key range — forward directly.
         for ch in clip.chars().filter(|c| !c.is_control()).take(400) {
-            if let Some(c) = char_to_code(ch) {
-                island_web::forward_key(c);
-            } else {
-                break;
-            }
+            island_web::forward_key(ch as u32 as usize);
         }
     } else {
         island_web::forward_shortcut("paste");
     }
 }
 
-fn char_to_code(ch: char) -> Option<usize> {
-    let v = ch as u32 as usize;
-    if (32..=0x10FFFF).contains(&v) {
-        Some(v)
-    } else {
-        None
-    }
-}
-
-/// WM_WEBMSG from the page: nav / signin / cancel_signin / disconnect /
+/// WM_WEBMSG from the page: nav / save_key / open_keys / disconnect /
 /// submit / mouseleave intents.
 fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
     let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
@@ -739,8 +673,25 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
         }
     };
     match v.get("type").and_then(|t| t.as_str()) {
-        Some("signin") => start_signin(app),
-        Some("cancel_signin") => cancel_signin(app),
+        Some("open_keys") => open_url_in_browser(GROQ_KEYS_URL),
+        Some("save_key") => {
+            let key = v.get("key").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            save_api_key(app, &key);
+        }
+        Some("signin") => {
+            // New page posts save_key with the key; an old cached page may
+            // post a bare signin — accept an optional key either way.
+            let key = v.get("key").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            if !key.trim().is_empty() {
+                save_api_key(app, &key);
+            }
+        }
+        Some("cancel_signin") => {
+            // Validation is a short request; cancel just clears the flag.
+            app.chat.signing_in = false;
+            app.chat.notice = None;
+            push_web(app);
+        }
         Some("disconnect") => disconnect(app),
         Some("nav") => {
             let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("back");
@@ -779,21 +730,14 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
 }
 
 /// Enter: push the user turn, spawn the connector thread for one streaming
-/// response. Refresh happens on the chat thread (5-min margin), never UI.
+/// response.
 fn submit_chat(app: &mut state::App, raw: &str) {
     let text = raw.trim().to_string();
     if text.is_empty() {
         return;
     }
-    let Some(tokens) = app.chat.tokens.clone() else { return };
+    let Some(api_key) = app.chat.tokens.clone() else { return };
     if app.chat.streaming {
-        return;
-    }
-    if !tokens.plan_ready() {
-        // Identity-only sign-in: inference stays off until plan usage is
-        // authorized (tray Connect re-runs OAuth with the full scope set).
-        app.chat.error = Some("ChatGPT plan use isn't enabled — Connect again to authorize it.".into());
-        push_web(app);
         return;
     }
     app.chat.push_history(state::Role::User, text);
@@ -815,49 +759,13 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         .map(|(role, text)| state::Msg { role: *role, text: text.clone() })
         .collect();
     let model = app.chat.model.clone();
-    // The account display name rides every request so the model knows its
-    // user; it comes from the sign-in, never from a manual name box.
-    let user_name = app.chat.tokens.as_ref().and_then(|t| t.name.clone());
     std::thread::spawn(move || unsafe {
         let hwnd = HWND(hwnd as *mut _);
-        // 5-min-margin refresh; OpenAI rotates the refresh token per use, and
-        // this thread is the only refresher while a turn runs.
-        let tokens = match connector::auth::needs_refresh(&tokens) {
-            false => tokens,
-            true => match connector::auth::refresh_tokens(&tokens) {
-                Ok(t) => {
-                    if let Err(e) = connector::auth::save_tokens(&t) {
-                        eprintln!("[notchbud] refreshed credentials could not be saved ({e}); this session continues, but the sign-in may not survive a restart");
-                    }
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_CHAT,
-                        WPARAM(CHAT_CONNECTED),
-                        LPARAM(Box::into_raw(Box::new(t.clone())) as isize),
-                    );
-                    t
-                }
-                Err(e) if e.expired => {
-                    // Terminal: the saved grant is unusable. Clear it so the
-                    // island falls back to the sign-in prompt.
-                    connector::auth::delete_tokens();
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_CHAT,
-                        WPARAM(CHAT_SIGNED_OUT),
-                        LPARAM(Box::into_raw(Box::new(e.msg)) as isize),
-                    );
-                    return;
-                }
-                // transient: the still-valid access token usually works
-                Err(_) => tokens,
-            },
-        };
-        let model = match model {
+        let mut current = match model {
             Some(m) => m,
             None => {
-                // The account catalog decides; no hardcoded fallback.
-                match connector::auth::pick_model(&tokens) {
+                // The key's catalog decides; no hardcoded fallback.
+                match connector::auth::pick_model(&api_key.key) {
                     Ok(m) => {
                         let _ = PostMessageW(
                             Some(hwnd),
@@ -869,13 +777,13 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                     }
                     Err(msg) => {
                         if msg == "expired" {
-                            connector::auth::delete_tokens();
+                            connector::auth::delete_api_key();
                             let _ = PostMessageW(
                                 Some(hwnd),
                                 WM_CHAT,
                                 WPARAM(CHAT_SIGNED_OUT),
                                 LPARAM(Box::into_raw(Box::new(
-                                    "Sign-in expired. Connect again from the tray.".to_owned(),
+                                    "That Groq API key was rejected — enter a new key.".to_owned(),
                                 )) as isize),
                             );
                         } else {
@@ -900,37 +808,90 @@ fn submit_chat(app: &mut state::App, raw: &str) {
             );
         };
         let cancelled = || CHAT_CANCEL.load(Ordering::Relaxed);
-        let result = connector::chat::stream_chat(&tokens, &model, &history, user_name.as_deref(), |ev| match ev {
-            connector::chat::StreamEvent::Delta(d) => {
-                if cancelled() {
-                    false
-                } else {
-                    post_delta(d);
-                    true
+        // One retry: a project-blocked model (403) falls through to the
+        // next catalog model instead of failing the turn.
+        let mut retried = false;
+        loop {
+            let result = connector::chat::stream_chat(&api_key.key, &current, &history, |ev| match ev {
+                connector::chat::StreamEvent::Delta(d) => {
+                    if cancelled() {
+                        false
+                    } else {
+                        post_delta(d);
+                        true
+                    }
                 }
-            }
-            connector::chat::StreamEvent::Done => false,
-            connector::chat::StreamEvent::Error(m) => {
-                let _ = PostMessageW(
-                    Some(hwnd),
-                    WM_CHAT,
-                    WPARAM(CHAT_ERROR),
-                    LPARAM(Box::into_raw(Box::new(m)) as isize),
-                );
-                false
-            }
-        });
-        match result {
-            Ok(()) => {
-                let _ = PostMessageW(Some(hwnd), WM_CHAT, WPARAM(CHAT_DONE), LPARAM(0));
-            }
-            Err(m) => {
-                let _ = PostMessageW(
-                    Some(hwnd),
-                    WM_CHAT,
-                    WPARAM(CHAT_ERROR),
-                    LPARAM(Box::into_raw(Box::new(m)) as isize),
-                );
+                connector::chat::StreamEvent::Done => false,
+                connector::chat::StreamEvent::Error(m) => {
+                    if m == connector::chat::AUTH_REJECTED_MSG {
+                        connector::auth::delete_api_key();
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_CHAT,
+                            WPARAM(CHAT_SIGNED_OUT),
+                            LPARAM(Box::into_raw(Box::new(m)) as isize),
+                        );
+                    } else {
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_CHAT,
+                            WPARAM(CHAT_ERROR),
+                            LPARAM(Box::into_raw(Box::new(m)) as isize),
+                        );
+                    }
+                    false
+                }
+            });
+            match result {
+                Ok(()) => {
+                    let _ = PostMessageW(Some(hwnd), WM_CHAT, WPARAM(CHAT_DONE), LPARAM(0));
+                    break;
+                }
+                Err(m) if m == connector::chat::AUTH_REJECTED_MSG => {
+                    // Terminal auth rejection: drop the credential and the
+                    // cached model, return to key entry via SIGNED_OUT.
+                    connector::auth::delete_api_key();
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_CHAT,
+                        WPARAM(CHAT_SIGNED_OUT),
+                        LPARAM(Box::into_raw(Box::new(m)) as isize),
+                    );
+                    break;
+                }
+                Err(m) if m == connector::chat::MODEL_UNAVAILABLE_MSG && !retried => {
+                    retried = true;
+                    match connector::auth::pick_model_excluding(&api_key.key, &[current.as_str()]) {
+                        Ok(next) if next != current => {
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_CHAT,
+                                WPARAM(CHAT_MODEL),
+                                LPARAM(Box::into_raw(Box::new(next.clone())) as isize),
+                            );
+                            current = next;
+                            continue;
+                        }
+                        _ => {
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_CHAT,
+                                WPARAM(CHAT_ERROR),
+                                LPARAM(Box::into_raw(Box::new(m)) as isize),
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(m) => {
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_CHAT,
+                        WPARAM(CHAT_ERROR),
+                        LPARAM(Box::into_raw(Box::new(m)) as isize),
+                    );
+                    break;
+                }
             }
         }
     });
@@ -958,19 +919,17 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
         }
         CHAT_ERROR => {
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
-            if SIGNIN_CANCEL.swap(false, Ordering::AcqRel) {
-                // user-aborted sign-in: drop the late failure quietly,
-                // back to the sign-in prompt with no error text
-                app.chat.signing_in = false;
+            if !CHAT_CANCEL.load(Ordering::Relaxed) {
                 app.chat.streaming = false;
                 app.chat.stream.clear();
-                app.chat.notice = None;
-            } else if !CHAT_CANCEL.load(Ordering::Relaxed) {
-                app.chat.streaming = false;
-                app.chat.stream.clear();
+                // A blocked model pick must not stick: drop it so the next
+                // turn re-resolves from the catalog instead of retrying it.
+                if s.as_str() == connector::chat::MODEL_UNAVAILABLE_MSG {
+                    app.chat.model = None;
+                }
                 app.chat.error = Some(*s);
-                // A failed sign-in must be retryable: drop the in-progress
-                // flag so the island falls back to the sign-in prompt.
+                // A failed key check must be retryable: drop the in-progress
+                // flag so the island falls back to the key prompt.
                 app.chat.signing_in = false;
                 app.chat.notice = None;
             } else {
@@ -980,27 +939,16 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             push_web(app);
         }
         CHAT_CONNECTED => {
-            let t = unsafe { Box::from_raw(lparam.0 as *mut connector::auth::Tokens) };
-            if SIGNIN_CANCEL.swap(false, Ordering::AcqRel) {
-                // aborted after the browser approved: drop the late grant
-                app.chat.signing_in = false;
-                app.chat.notice = None;
-            } else {
-                app.chat.tokens = Some(*t);
-                app.chat.signing_in = false;
-                app.chat.notice = None;
-                app.chat.error = None;
-            }
-            push_web(app);
-        }
-        CHAT_STATUS => {
-            let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
-            app.chat.notice = Some(*s);
+            let t = unsafe { Box::from_raw(lparam.0 as *mut connector::auth::ApiKey) };
+            app.chat.tokens = Some(*t);
+            app.chat.signing_in = false;
+            app.chat.notice = None;
+            app.chat.error = None;
             push_web(app);
         }
         CHAT_SIGNED_OUT => {
-            // Terminal auth failure (expired/revoked grant): the saved grant
-            // is already deleted. Clear the UI back to the sign-in prompt.
+            // Terminal auth failure (rejected key): the saved key is already
+            // deleted. Clear the UI back to the key prompt.
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
             app.chat.tokens = None;
             app.chat.model = None;
@@ -1152,7 +1100,7 @@ fn main() -> Result<()> {
 
         // --- App state ---
         let mut app = Box::new(state::App::new(hwnd, scale, width, height));
-        app.chat.tokens = connector::auth::load_tokens(); // saved sign-in, if any
+        app.chat.tokens = connector::auth::load_api_key(); // saved key, if any
         app.win_x = x;
         app.win_y = 0;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
@@ -1193,5 +1141,62 @@ fn main() -> Result<()> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn webmsg(json: &str) -> LPARAM {
+        LPARAM(Box::into_raw(Box::new(json.to_owned())) as isize)
+    }
+
+    fn blank_app() -> state::App {
+        state::App::new(HWND(std::ptr::null_mut()), 1.0, 640, 190)
+    }
+
+    #[test]
+    fn nav_intent_opens_settings() {
+        let mut app = blank_app();
+        handle_webmsg(&mut app, webmsg(r#"{"type":"nav","target":"settings"}"#));
+        assert_eq!(app.overlay, state::Overlay::Settings);
+        // Toggling the active icon closes it back.
+        handle_webmsg(&mut app, webmsg(r#"{"type":"nav","target":"settings"}"#));
+        assert_eq!(app.overlay, state::Overlay::None);
+    }
+
+    #[test]
+    fn save_key_with_junk_sets_error_without_validating() {
+        // A format-invalid key is rejected synchronously: no key check, no
+        // network thread, the island stays on the key prompt with a hint.
+        let mut app = blank_app();
+        handle_webmsg(&mut app, webmsg(r#"{"type":"save_key","key":"junk"}"#));
+        assert!(!app.chat.signing_in);
+        assert!(
+            app.chat
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gsk_"),
+            "error was {:?}",
+            app.chat.error
+        );
+    }
+
+    #[test]
+    fn open_keys_points_at_groq_console() {
+        assert_eq!(GROQ_KEYS_URL, "https://console.groq.com/keys");
+    }
+
+    #[test]
+    fn web_reveal_delay_within_budget() {
+        // Hover-to-content budget: the shell spring is measured physics, the
+        // reveal must not pad it — every millisecond here is black island.
+        assert!(
+            web_show_delay_secs() <= 0.85,
+            "reveal takes {}s",
+            web_show_delay_secs()
+        );
     }
 }

@@ -39,11 +39,19 @@
             </div>
         </header>
 
-        <!-- SignIn: not connected yet -->
+        <!-- SignIn: two-step minimal — landing owns the frame, key entry owns it next -->
         <section id="screen-signin" class="screen" hidden>
             <p id="signin-status" class="status" hidden></p>
-            <button id="signin-btn" class="btn btn-secondary btn-lg btn-pill" type="button">Sign in with ChatGPT</button>
-            <button id="signin-cancel" class="btn btn-link btn-link-danger" type="button" hidden>Cancel</button>
+            <div id="signin-landing" class="signin-landing">
+                <button id="signin-btn" class="btn btn-secondary btn-lg btn-pill" type="button">Enter Groq API Key</button>
+                <button id="keys-btn" class="btn btn-link keyhint" type="button">Get a key at console.groq.com</button>
+            </div>
+            <div id="key-entry" class="askbox" hidden>
+                <input id="groq-key" class="askinput" type="password" maxlength="200" placeholder="Paste key…" autocomplete="off" spellcheck="false" />
+                <button id="key-send" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Save key">
+                    <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
+                </button>
+            </div>
         </section>
 
         <!-- Home: signed in, nothing asked yet — greeting owns the top -->
@@ -175,10 +183,10 @@
                 <div class="profile-text">
                     <p id="settings-name" class="profile-name">—</p>
                     <p id="settings-email" class="profile-sub">Not signed in</p>
-                    <p id="settings-plan" class="profile-plan">ChatGPT plan: —</p>
+                    <p id="settings-plan" class="profile-plan">Groq: —</p>
                 </div>
                 <span id="settings-dot" class="presence" aria-hidden="true"></span>
-                <button id="settings-signin" class="btn btn-secondary btn-sm btn-pill" type="button">Sign in with ChatGPT</button>
+                <button id="settings-signin" class="btn btn-secondary btn-sm btn-pill" type="button">Enter Groq API Key</button>
                 <button id="settings-disconnect" class="btn btn-destructive btn-sm btn-pill" type="button">Sign out</button>
             </div>
             <p id="settings-status" class="status" hidden></p>

@@ -1,13 +1,14 @@
 // island_layout.rs — contract tests for the island page layout.
 //
-// The overlay pages (menu / notifications / settings) must sit vertically
-// centered as a group. That centering is done with auto margins, and it is
-// fragile in one specific way: the Back link is `display: none`, and auto
-// margins on a display:none box absorb nothing — so if the bottom margin
-// lands on the hidden Back link instead of the last VISIBLE block, short
-// pages silently un-center (content strands at one edge with a void below).
-// These tests pin the contract in plain source terms so any edit that
-// breaks it fails here instead of on a user's screen.
+// Menu + Notifications pin their heads to one shared top offset, so both
+// titles render at exactly the same (x, y) regardless of body height. The
+// headless settings page still centers as a group via auto margins. That
+// centering is fragile in one specific way: the Back link is
+// `display: none`, and auto margins on a display:none box absorb nothing —
+// so if the bottom margin lands on the hidden Back link instead of the last
+// VISIBLE block, short pages silently un-center (content strands at one edge
+// with a void below). These tests pin the contract in plain source terms so
+// any edit that breaks it fails here instead of on a user's screen.
 
 use std::path::PathBuf;
 
@@ -59,23 +60,26 @@ fn base_screens_center_via_auto_margins() {
     );
 }
 
-/// No rule may zero the top margin of an overlay page's first block: that
-/// was the compact-phase top-anchor override, and it un-centers menu /
-/// notifications / settings outright.
+/// Menu and Notifications heads share one pinned top offset, so the two
+/// titles render at exactly the same (x, y): same DOM order (head first),
+/// same .page-head/.page-title rules, same top offset. Settings is headless
+/// and keeps group centering — it must never gain a head pin.
 #[test]
-fn no_overlay_page_is_top_anchored() {
+fn overlay_heads_share_one_top_offset() {
     let css = css();
     for sel in [
-        ".page>:first-child{margin-top:0",
-        "#screen-menu>:first-child{margin-top:0",
-        "#screen-notifications>:first-child{margin-top:0",
-        "#screen-settings>:first-child{margin-top:0",
+        "#screen-menu.page-head",
+        "#screen-notifications.page-head",
     ] {
         assert!(
-            !css.contains(sel),
-            "top-anchor override present ({sel}) — overlay pages will hug the topbar"
+            rule_has(&css, sel, "margin-top:0;"),
+            "{sel}: head pin missing — titles drift apart when body heights differ"
         );
     }
+    assert!(
+        !rule_has(&css, "#screen-settings.page-head", "margin-top:0"),
+        "settings head pinned — the headless page loses group centering"
+    );
 }
 
 /// The bottom auto margin must sit on the last VISIBLE block of each

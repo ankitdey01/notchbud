@@ -1,5 +1,6 @@
 // tray.rs — tray icon + context menu: Start with Windows (checkbox) /
-// (separator) / Exit, opened at the cursor with RETURNCMD.
+// Enter Groq API Key / Disconnect / (separator) / Exit, opened at the
+// cursor with RETURNCMD.
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
@@ -76,18 +77,17 @@ fn append(hmenu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITE
 }
 
 /// Builds + shows the menu; returns the chosen command id (0 if dismissed).
-/// Connect stays enabled when signed in without plan usage, so the user can
-/// authorize it separately; Disconnect is only meaningful while signed in.
-pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool, plan_ready: bool) -> usize {
+/// Connect stays enabled while signed out so the user can enter a key.
+pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool) -> usize {
     let hmenu = match CreatePopupMenu() {
         Ok(h) => h,
         Err(_) => return 0,
     };
-    append(hmenu, MF_STRING, "Connect ChatGPT", MENU_CONNECT);
+    append(hmenu, MF_STRING, "Enter Groq API Key", MENU_CONNECT);
     append(hmenu, MF_STRING, "Disconnect", MENU_DISCONNECT);
-    if chat_connected && plan_ready {
+    if chat_connected {
         let _ = EnableMenuItem(hmenu, MENU_CONNECT as u32, MF_GRAYED);
-    } else if !chat_connected {
+    } else {
         let _ = EnableMenuItem(hmenu, MENU_DISCONNECT as u32, MF_GRAYED);
     }
     append(hmenu, MF_SEPARATOR, "", 0);

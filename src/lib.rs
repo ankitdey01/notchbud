@@ -1,5 +1,5 @@
 // notchbud library crate: motion math (state) + shell renderer (render) +
-// WebView2 island content (island_web) + the ChatGPT connector (connector)
+// WebView2 island content (island_web) + the Groq connector (connector)
 // + greeting helpers (user). Window shell (main.rs), tray and prefs live
 // in the binary crate.
 pub mod connector;

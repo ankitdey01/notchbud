@@ -63,8 +63,7 @@ fn with_webview(f: impl FnOnce(&ICoreWebView2)) {
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const ISLAND_CSS: &str = include_str!("../ui/styles.css");
 const ISLAND_JS: &str = include_str!("../ui/app.js");
-// Cat logo for the island brand mark (96px PNG data URI, regenerated with
-// `python -c ... web/b694186d-374a-49e0-a172-f7abfd6d9327.png ... ui/logo.b64`).
+// Cat logo for the island brand mark (96px PNG data URI in ui/logo.b64).
 const LOGO_DATAURI: &str = include_str!("../ui/logo.b64");
 
 fn composed_html() -> String {
@@ -139,9 +138,38 @@ pub fn default_write_probe(dir: &Path) -> bool {
     }
 }
 
-/// Ordered environment attempts: the explicit dir first, the default
-/// environment as the fallback that keeps the island alive instead of
-/// black when the explicit dir is held/walled at runtime.
+/// HRESULT_FROM_WIN32(ERROR_BUSY): `CreateCoreWebView2Controller` reports
+/// "the requested resource is in use" when the profile is held by another
+/// live WebView2 (stale notchbud/msedgewebview2 after a kill). The plain
+/// write probe still passes in that state, so only this classification
+/// tells init to retry on a fresh profile instead of leaving a black island.
+pub const HRESULT_BUSY: windows::core::HRESULT =
+    windows::core::HRESULT(0x800700AAu32 as i32);
+
+/// True when a controller/env error is the retryable profile-locked case.
+pub fn is_busy_hresult(hr: windows::core::HRESULT) -> bool {
+    hr == HRESULT_BUSY
+}
+
+/// Fresh per-process profile dir: a brand-new dir cannot be locked by a
+/// stale process, so a BUSY controller retries here. Same parent (still
+/// per-user LOCALAPPDATA), pid-suffixed name so a restart reuses it.
+pub fn busy_fallback_dir(primary: &Path) -> PathBuf {
+    let parent = primary.parent();
+    let base = primary
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("EBWebView");
+    let name = format!("{base}.{}", std::process::id());
+    match parent {
+        Some(p) => p.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Ordered environment attempts: the explicit dir first, a fresh
+/// per-process profile second (the BUSY retry that avoids black when a
+/// stale process holds the primary profile), the default environment last.
 #[derive(Debug, PartialEq, Clone)]
 pub enum EnvDir {
     Explicit(PathBuf),
@@ -150,7 +178,19 @@ pub enum EnvDir {
 
 pub fn env_attempt_order(primary: Option<PathBuf>) -> Vec<EnvDir> {
     match primary {
-        Some(dir) => vec![EnvDir::Explicit(dir), EnvDir::Default],
+        Some(dir) => {
+            let fresh = busy_fallback_dir(&dir);
+            // Degenerate input (dir == its own fallback): keep two attempts.
+            if fresh == dir {
+                vec![EnvDir::Explicit(dir), EnvDir::Default]
+            } else {
+                vec![
+                    EnvDir::Explicit(dir),
+                    EnvDir::Explicit(fresh),
+                    EnvDir::Default,
+                ]
+            }
+        }
         None => vec![EnvDir::Default],
     }
 }
@@ -168,85 +208,78 @@ fn log_webview_event(line: &str) {
     }
 }
 
-/// Create the WebView2 child. Called once, on the UI thread, after the
-/// Win32 window exists. Blocks briefly (pumping messages) until the
-/// controller is ready, then navigates to the embedded island page.
-pub fn init(parent: HWND, scale: f32) {
-    unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); }
-
-    PARENT_HWND.store(parent.0 as isize, Ordering::Relaxed);
-
-    // --- environment ---
-    // Explicit per-user profile dir when usable; otherwise (or when the
-    // explicit dir is held by another live instance at runtime) fall back
-    // to the default environment. A failed env used to abort init silently
-    // and leave a black island; now every attempt is logged (release
-    // builds have no console — see %TEMP%\notchbud-webview.log) and the
-    // default is always tried before giving up.
-    let primary = pick_user_data_dir(std::env::var_os("LOCALAPPDATA").as_deref());
-    let mut env_opt: Option<ICoreWebView2Environment> = None;
-    for attempt in env_attempt_order(primary) {
-        let user_data_wide: Option<Vec<u16>> = match &attempt {
-            EnvDir::Explicit(dir) => Some(
+/// One environment attempt: explicit profile dir or the default
+/// environment. `None` = unusable/failed — the caller moves to the next
+/// attempt instead of leaving a black island. Every outcome is logged to
+/// the file log (release builds have no console).
+fn create_environment(attempt: &EnvDir) -> Option<ICoreWebView2Environment> {
+    let user_data_wide: Option<Vec<u16>> = match attempt {
+        EnvDir::Explicit(dir) => {
+            // The fresh per-process fallback may not exist yet; the primary
+            // was already created by the picker. WebView2 also creates the
+            // dir itself, so a failure here just falls through.
+            let _ = std::fs::create_dir_all(dir);
+            Some(
                 dir.to_string_lossy()
                     .into_owned()
                     .encode_utf16()
                     .chain(std::iter::once(0))
                     .collect(),
+            )
+        }
+        EnvDir::Default => None,
+    };
+    let (etx, erx) = mpsc::channel();
+    let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+        move |result: windows::core::Result<()>, env: Option<ICoreWebView2Environment>| {
+            let _ = etx.send((result, env));
+            Ok(())
+        },
+    ));
+    let outcome = unsafe {
+        // Keep the wide string alive for the whole creation call.
+        let create_result = match user_data_wide.as_ref() {
+            Some(wide) => CreateCoreWebView2EnvironmentWithOptions(
+                PCWSTR::null(),
+                PCWSTR(wide.as_ptr()),
+                None::<&ICoreWebView2EnvironmentOptions>,
+                &env_handler,
             ),
-            EnvDir::Default => None,
+            None => CreateCoreWebView2Environment(&env_handler),
         };
-        let (etx, erx) = mpsc::channel();
-        let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
-            move |result: windows::core::Result<()>, env: Option<ICoreWebView2Environment>| {
-                let _ = etx.send((result, env));
-                Ok(())
-            },
-        ));
-        let outcome = unsafe {
-            // Keep the wide string alive for the whole creation call.
-            let create_result = match user_data_wide.as_ref() {
-                Some(wide) => CreateCoreWebView2EnvironmentWithOptions(
-                    PCWSTR::null(),
-                    PCWSTR(wide.as_ptr()),
-                    None::<&ICoreWebView2EnvironmentOptions>,
-                    &env_handler,
-                ),
-                None => CreateCoreWebView2Environment(&env_handler),
-            };
-            match create_result {
-                Ok(()) => match webview2_com::wait_with_pump(erx) {
-                    Ok((Ok(()), Some(env))) => Some(env),
-                    Ok((Err(e), _)) => {
-                        log_webview_event(&format!("webview env failed ({attempt:?}): {e:#}"));
-                        None
-                    }
-                    _ => {
-                        log_webview_event(&format!("webview env failed ({attempt:?}): no environment"));
-                        None
-                    }
-                },
-                Err(e) => {
-                    log_webview_event(&format!("CreateCoreWebView2Environment ({attempt:?}): {e:#}"));
+        match create_result {
+            Ok(()) => match webview2_com::wait_with_pump(erx) {
+                Ok((Ok(()), Some(env))) => Some(env),
+                Ok((Err(e), _)) => {
+                    log_webview_event(&format!("webview env failed ({attempt:?}): {e:#}"));
                     None
                 }
+                _ => {
+                    log_webview_event(&format!("webview env failed ({attempt:?}): no environment"));
+                    None
+                }
+            },
+            Err(e) => {
+                log_webview_event(&format!("CreateCoreWebView2Environment ({attempt:?}): {e:#}"));
+                None
             }
-        };
-        if let Some(env) = outcome {
-            log_webview_event(&format!("webview env ready ({attempt:?})"));
-            env_opt = Some(env);
-            break;
-        }
-    }
-    let env = match env_opt {
-        Some(env) => env,
-        None => {
-            log_webview_event("webview env unavailable in all attempts; island content disabled");
-            return;
         }
     };
+    if outcome.is_some() {
+        log_webview_event(&format!("webview env ready ({attempt:?})"));
+    }
+    outcome
+}
 
-    // --- controller (child window of the island) ---
+/// One controller attempt on an environment. `None` = failed — the caller
+/// retries the next profile instead of leaving a black island. A BUSY
+/// result (profile held by another live WebView2) is logged distinctly so
+/// the file log tells stale-process apart from real failures.
+fn create_controller(
+    env: &ICoreWebView2Environment,
+    parent: HWND,
+    attempt: &EnvDir,
+) -> Option<ICoreWebView2Controller> {
     let (ctx, crx) = mpsc::channel();
     let ctrl_handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
         move |result: windows::core::Result<()>, ctrl: Option<ICoreWebView2Controller>| {
@@ -254,25 +287,84 @@ pub fn init(parent: HWND, scale: f32) {
             Ok(())
         },
     ));
-    let controller = unsafe {
+    unsafe {
         match env.CreateCoreWebView2Controller(parent, &ctrl_handler) {
             Ok(()) => match webview2_com::wait_with_pump(crx) {
-                Ok((Ok(()), Some(c))) => c,
+                Ok((Ok(()), Some(c))) => Some(c),
                 Ok((Err(e), _)) => {
-                    eprintln!("[notchbud] webview controller failed: {e:#}");
-                    return;
+                    if is_busy_hresult(e.code()) {
+                        log_webview_event(&format!(
+                            "webview controller busy ({attempt:?}): profile held by another live WebView2; retrying next profile"
+                        ));
+                    } else {
+                        log_webview_event(&format!(
+                            "webview controller failed ({attempt:?}): {e:#}"
+                        ));
+                    }
+                    None
                 }
                 _ => {
-                    eprintln!("[notchbud] webview controller failed: none");
-                    return;
+                    log_webview_event(&format!(
+                        "webview controller failed ({attempt:?}): none"
+                    ));
+                    None
                 }
             },
             Err(e) => {
-                eprintln!("[notchbud] CreateCoreWebView2Controller: {e:#}");
-                return;
+                log_webview_event(&format!(
+                    "CreateCoreWebView2Controller ({attempt:?}): {e:#}"
+                ));
+                None
             }
         }
+    }
+}
+
+/// Create the WebView2 child. Called once, on the UI thread, after the
+/// Win32 window exists. Blocks briefly (pumping messages) until the
+/// controller is ready, then navigates to the embedded island page.
+pub fn init(parent: HWND, scale: f32) {
+    // Idempotent: a second call (e.g. DPI re-init racing startup) must not
+    // create a second controller on the same HWND — that fails BUSY too.
+    if READY.load(Ordering::Acquire) {
+        return;
+    }
+    let already = CONTROLLER.with_borrow(|c| c.is_some());
+    if already {
+        return;
+    }
+    unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); }
+
+    PARENT_HWND.store(parent.0 as isize, Ordering::Relaxed);
+
+    // --- environment + controller, with profile retry ---
+    // A failed explicit environment used to abort init silently and leave
+    // a black island; now every attempt is logged (release builds have no
+    // console — see %TEMP%\notchbud-webview.log) and the per-process fresh
+    // profile is always tried before giving up, so a stale lock on the
+    // primary profile degrades to a fresh profile instead of black.
+    let primary = pick_user_data_dir(std::env::var_os("LOCALAPPDATA").as_deref());
+    let mut pair: Option<(ICoreWebView2Environment, ICoreWebView2Controller)> = None;
+    for attempt in env_attempt_order(primary) {
+        let Some(env) = create_environment(&attempt) else {
+            continue;
+        };
+        if let Some(controller) = create_controller(&env, parent, &attempt) {
+            log_webview_event(&format!("webview controller ready ({attempt:?})"));
+            pair = Some((env, controller));
+            break;
+        }
+    }
+    let (env, controller) = match pair {
+        Some(p) => p,
+        None => {
+            log_webview_event("webview unavailable in all attempts; island content disabled");
+            return;
+        }
     };
+    // Keep the environment alive for the whole init (as before: the
+    // controller holds its own refs, this is just lifetime parity).
+    let _env = env;
 
     unsafe {
         let bounds = island_rect(scale);
