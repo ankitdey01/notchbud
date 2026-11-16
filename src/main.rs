@@ -77,9 +77,15 @@ const CHAT_ERROR: usize = 2; // *String
 const CHAT_CONNECTED: usize = 3; // *ApiKey
 const CHAT_MODEL: usize = 5; // *String (resolved model)
 const CHAT_SIGNED_OUT: usize = 6; // *String (terminal auth failure: clear creds)
+// Startup verification results (carry the verify generation so a stale
+// check can't resurrect creds or clobber a disconnect).
+const CHAT_VERIFY_OK: usize = 7; // *(u32, ApiKey)
+const CHAT_VERIFY_OUT: usize = 8; // *(u32, String) (terminal: key revoked)
+const CHAT_VERIFY_ERR: usize = 9; // *(u32, String) (transient: keep any live stream)
 
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
 static CHAT_CANCEL: AtomicBool = AtomicBool::new(false); // island left mid-stream
+static VERIFY_GEN: AtomicU32 = AtomicU32::new(0); // startup key-check generation
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0); // where the hook posts
 static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on quit)
 
@@ -494,12 +500,17 @@ fn handle_tray_menu(app: &mut state::App) {
 
 fn disconnect(app: &mut state::App) {
     connector::auth::delete_api_key();
+    // A pending startup check must not resurrect creds or clobber this
+    // state when it lands — invalidate its generation and drop the
+    // in-progress flag so the island falls back to the key prompt.
+    VERIFY_GEN.fetch_add(1, Ordering::Relaxed);
+    app.chat.signing_in = false;
+    app.chat.notice = None;
     app.chat.tokens = None;
     app.chat.model = None;
     app.chat.streaming = false;
     app.chat.stream.clear();
     app.chat.history.clear();
-    app.chat.notice = None;
     CHAT_CANCEL.store(true, Ordering::Release);
     app.chat.error = Some("Disconnected.".into());
     // Back to the base auth step (signin), never a stale settings page.
@@ -560,6 +571,60 @@ fn save_api_key(app: &mut state::App, raw_key: &str) {
             WPARAM(CHAT_CONNECTED),
             LPARAM(Box::into_raw(Box::new(api_key)) as isize),
         );
+    });
+}
+
+/// Boot check: a saved key may have been revoked since last run.
+/// Re-validate with the existing catalog check on a worker thread. A dead
+/// key drops to the key entry (SIGNED_OUT); a live one just clears the
+/// "checking" flag (CONNECTED); anything else surfaces as-is (ERROR).
+fn verify_saved_key(app: &mut state::App) {
+    let Some(api_key) = app.chat.tokens.clone() else {
+        return; // nothing saved — already on the key entry.
+    };
+    if app.chat.signing_in || app.chat.streaming {
+        return;
+    }
+    app.chat.signing_in = true;
+    app.chat.error = None;
+    app.chat.notice = Some("Checking key…".into());
+    push_web(app);
+    let gen = VERIFY_GEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let hwnd = app.hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let hwnd_raw = HWND(hwnd as *mut _);
+        match connector::auth::validate_api_key(&api_key.key) {
+            Ok(()) => {
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_CHAT,
+                    WPARAM(CHAT_VERIFY_OK),
+                    LPARAM(Box::into_raw(Box::new((gen, api_key))) as isize),
+                );
+            }
+            Err(e) if e.expired => {
+                // No delete here: the file goes only in CHAT_VERIFY_OUT,
+                // after its generation check — a stale result must not
+                // delete a key saved after this check ran.
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_CHAT,
+                    WPARAM(CHAT_VERIFY_OUT),
+                    LPARAM(Box::into_raw(Box::new((
+                        gen,
+                        connector::chat::AUTH_REJECTED_MSG.to_owned(),
+                    ))) as isize),
+                );
+            }
+            Err(e) => {
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_CHAT,
+                    WPARAM(CHAT_VERIFY_ERR),
+                    LPARAM(Box::into_raw(Box::new((gen, e.msg))) as isize),
+                );
+            }
+        }
     });
 }
 
@@ -783,7 +848,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                                 WM_CHAT,
                                 WPARAM(CHAT_SIGNED_OUT),
                                 LPARAM(Box::into_raw(Box::new(
-                                    "That Groq API key was rejected — enter a new key.".to_owned(),
+                                    connector::chat::AUTH_REJECTED_MSG.to_owned(),
                                 )) as isize),
                             );
                         } else {
@@ -948,7 +1013,10 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
         }
         CHAT_SIGNED_OUT => {
             // Terminal auth failure (rejected key): the saved key is already
-            // deleted. Clear the UI back to the key prompt.
+            // deleted. Clear the UI back to the key prompt, and invalidate
+            // any pending startup verification so its delayed VERIFY_OK
+            // can't resurrect these creds via the stale-result check.
+            VERIFY_GEN.fetch_add(1, Ordering::Relaxed);
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
             app.chat.tokens = None;
             app.chat.model = None;
@@ -962,6 +1030,46 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
         CHAT_MODEL => {
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
             app.chat.model = Some(*s);
+        }
+        CHAT_VERIFY_OK => {
+            let b = unsafe { Box::from_raw(lparam.0 as *mut (u32, connector::auth::ApiKey)) };
+            if b.0 != VERIFY_GEN.load(Ordering::Relaxed) {
+                return; // stale check (e.g. after disconnect) — never resurrect creds
+            }
+            app.chat.tokens = Some(b.1);
+            app.chat.signing_in = false;
+            app.chat.notice = None;
+            app.chat.error = None;
+            push_web(app);
+        }
+        CHAT_VERIFY_OUT => {
+            let b = unsafe { Box::from_raw(lparam.0 as *mut (u32, String)) };
+            if b.0 != VERIFY_GEN.load(Ordering::Relaxed) {
+                return; // stale — disconnect already owns the state
+            }
+            // Current: this check ran on the saved key, so the rejection
+            // deletes it here, not in the worker.
+            connector::auth::delete_api_key();
+            app.chat.tokens = None;
+            app.chat.model = None;
+            app.chat.streaming = false;
+            app.chat.stream.clear();
+            app.chat.signing_in = false;
+            app.chat.notice = None;
+            app.chat.error = Some(b.1);
+            push_web(app);
+        }
+        CHAT_VERIFY_ERR => {
+            let b = unsafe { Box::from_raw(lparam.0 as *mut (u32, String)) };
+            if b.0 != VERIFY_GEN.load(Ordering::Relaxed) {
+                return; // stale — leave the newer state alone
+            }
+            // Transient check failure (e.g. offline at boot): retryable, and
+            // never tears down a chat submitted while the check was pending.
+            app.chat.signing_in = false;
+            app.chat.notice = None;
+            app.chat.error = Some(b.1);
+            push_web(app);
         }
         _ => {}
     }
@@ -1127,6 +1235,7 @@ fn main() -> Result<()> {
         if let Some(app) = app_from(hwnd) {
             render::draw_now(app);
             after_state_change(app);
+            verify_saved_key(app);
         }
 
         // --- message pump ---
@@ -1187,6 +1296,56 @@ mod tests {
     #[test]
     fn open_keys_points_at_groq_console() {
         assert_eq!(GROQ_KEYS_URL, "https://console.groq.com/keys");
+    }
+
+    #[test]
+    fn boot_without_saved_key_skips_verification() {
+        // No key on disk: nothing to check, no thread, still signed out.
+        let mut app = blank_app();
+        verify_saved_key(&mut app);
+        assert!(!app.chat.signing_in);
+        assert!(app.chat.notice.is_none());
+        assert_eq!(app.screen(), state::Screen::SignIn);
+    }
+
+    #[test]
+    fn boot_dead_key_returns_to_key_entry() {
+        // The SIGNED_OUT the boot check posts for a rejected key: the
+        // credential and cached model go, the island lands on key entry.
+        let mut app = blank_app();
+        app.chat.tokens =
+            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.model = Some("openai/gpt-oss-20b".into());
+        let msg = Box::into_raw(Box::new(
+            connector::chat::AUTH_REJECTED_MSG.to_owned(),
+        ));
+        handle_chat_msg(&mut app, WPARAM(CHAT_SIGNED_OUT), LPARAM(msg as isize));
+        assert!(app.chat.tokens.is_none());
+        assert!(app.chat.model.is_none());
+        assert_eq!(app.screen(), state::Screen::SignIn);
+    }
+
+    #[test]
+    fn signed_out_invalidates_pending_verification() {
+        // Terminal sign-out bumps the verify generation: a delayed
+        // VERIFY_OK from the boot check must fail the stale-result check
+        // and leave credentials cleared, never resurrect them.
+        let mut app = blank_app();
+        app.chat.tokens =
+            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        let gen = VERIFY_GEN.load(Ordering::Relaxed);
+        let msg = Box::into_raw(Box::new(
+            connector::chat::AUTH_REJECTED_MSG.to_owned(),
+        ));
+        handle_chat_msg(&mut app, WPARAM(CHAT_SIGNED_OUT), LPARAM(msg as isize));
+        assert!(app.chat.tokens.is_none());
+        let stale = Box::into_raw(Box::new((
+            gen,
+            connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap(),
+        )));
+        handle_chat_msg(&mut app, WPARAM(CHAT_VERIFY_OK), LPARAM(stale as isize));
+        assert!(app.chat.tokens.is_none());
+        assert_eq!(app.screen(), state::Screen::SignIn);
     }
 
     #[test]

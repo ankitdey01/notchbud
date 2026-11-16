@@ -210,7 +210,7 @@ pub fn validate_api_key(api_key: &str) -> Result<(), AuthError> {
     match list_models(api_key) {
         Ok(_) => Ok(()),
         Err(e) if e == "expired" => Err(AuthError::new(
-            "That Groq API key was rejected. Check it and try again.",
+            super::chat::AUTH_REJECTED_MSG,
             true,
         )),
         Err(e) => Err(AuthError::new(e, false)),

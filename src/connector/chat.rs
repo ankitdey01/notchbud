@@ -15,7 +15,7 @@ pub const GROQ_CHAT_URL: &str = "https://api.groq.com/openai/v1/chat/completions
 
 /// Terminal auth rejection: the key is dead — the caller must drop the
 /// credential and return to key entry (CHAT_SIGNED_OUT), not CHAT_ERROR.
-pub const AUTH_REJECTED_MSG: &str = "That Groq API key was rejected — enter a new key.";
+pub const AUTH_REJECTED_MSG: &str = "Your Old Groq API key was rejected, enter a new one.";
 /// The selected model is blocked for this project/key: the caller may try
 /// the next catalog model once. Never clears the credential.
 pub const MODEL_UNAVAILABLE_MSG: &str = "This model is not available — trying another helps.";
@@ -275,9 +275,7 @@ mod tests {
             decode_event(&serde_json::from_str::<Value>(
                 r#"{"error":{"message":"Invalid API Key"}}"#
             ).unwrap()),
-            Some(StreamEvent::Error(
-                "That Groq API key was rejected — enter a new key.".into()
-            ))
+            Some(StreamEvent::Error(AUTH_REJECTED_MSG.into()))
         );
         assert_eq!(
             decode_event(

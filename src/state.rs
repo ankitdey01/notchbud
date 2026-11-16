@@ -596,7 +596,7 @@ mod tests {
 
         // failure clears back to the pill
         c.signing_in = false;
-        c.error = Some("That Groq API key was rejected — enter a new key.".into());
+        c.error = Some(crate::connector::chat::AUTH_REJECTED_MSG.into());
         assert!(c.shows_signin_button());
         assert!(c.status_text().contains("rejected"));
     }
@@ -733,6 +733,19 @@ mod tests {
         sign_in(&mut app);
         app.navigate("auth");
         assert_eq!(app.page(), "home");
+    }
+
+    #[test]
+    fn signed_out_menu_home_returns_to_key_entry() {
+        // No Auth tile anymore: a signed-out user on the Menu overlay picks
+        // Home and must land on key entry (the base signin screen), never a
+        // dead home page and with no restart.
+        let mut app = blank_app();
+        app.navigate("menu");
+        assert_eq!(app.page(), "menu");
+        app.navigate("home");
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.page(), "signin");
     }
 
     #[test]

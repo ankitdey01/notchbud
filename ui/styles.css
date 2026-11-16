@@ -282,11 +282,10 @@ body {
     justify-content: center;
 }
 
-/* Optical middle vs the shell: the WebView ends above the shell's bottom
-   curve, so the sign-in stack gets a nudge down to sit truly centered
-   between the island top and bottom edge. */
+/* True island middle: #island carries 6px top / 12px bottom padding, so a
+   6px top pad here puts the centered stack at the geometric middle. */
 #screen-signin {
-    padding-top: 8px;
+    padding-top: 6px;
     align-items: center;
 }
 
@@ -435,7 +434,10 @@ body {
 
 .greet-title {
     font-size: 17px;
-    line-height: 1.15;
+    /* Must clear descenders ("Good Evening" has two g's): the title clips
+       with overflow:hidden for the ellipsis, so a tight factor cuts glyph
+       tails on fonts with taller metrics (Segoe UI in WebView2). */
+    line-height: normal;
     font-weight: 700;
     color: #fff;
     white-space: nowrap;
@@ -541,7 +543,10 @@ body {
 
 /* cancel link is .btn .btn-link .btn-link-danger — no local rules */
 
-/* chat history: bottom-anchored, scrolls natively */
+/* chat history: bottom-anchored, scrolls natively. The anchor is
+   margin-top:auto on the first turn — NOT justify-content:flex-end, which
+   lays overflow out above the box where no scrollbar can ever reach it
+   (early turns become permanently invisible in long chats). */
 .history {
     width: 100%;
     flex: 1;
@@ -549,7 +554,7 @@ body {
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    justify-content: flex-end;
+    justify-content: flex-start;
     gap: 4px;
     font-size: 14px;
     line-height: 1.45;
@@ -565,6 +570,13 @@ body {
 .history::-webkit-scrollbar-thumb {
     background: rgba(255, 255, 255, 0.25);
     border-radius: 2px;
+}
+
+/* Bottom anchor: the free space above a short chat lives here, so the
+   latest turn sits against the prompt. With overflowing content the auto
+   margin resolves to zero and the feed scrolls from the top like normal. */
+.history> :first-child {
+    margin-top: auto;
 }
 
 .turn-user {
@@ -605,47 +617,46 @@ body {
     scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
 }
 
-/* Menu + Notifications heads pin to the same top offset, so both titles
-   render at exactly the same (x, y) no matter how tall each page's body
-   is. Bodies keep their bottom auto margin, so leftover space absorbs
-   below the content, never above the title. Settings stays headless and
-   centered (see tests/island_layout.rs). */
+/* Overlay pages are headless (the highlighted topbar icon already says
+   where you are): heads stay in the DOM but never paint. Each page shows
+   one dotted panel that fills everything between the navbar and the
+   island bottom — top air is the 12px page padding, bottom air the 12px
+   shell padding (the same 12px the prompt input sits in). A long
+   notifications feed scrolls inside its panel (min-height:0 + own
+   overflow), same as chat.
+   The fill MUST sit on the VISIBLE block: the Back link is display:none
+   and a hidden box neither fills nor scrolls, so landing it there
+   silently collapses the whole page (see tests/island_layout.rs). */
 #screen-menu .page-head,
-#screen-notifications .page-head {
-    margin-top: 0;
+#screen-notifications .page-head,
+#screen-settings .page-head {
+    display: none;
 }
 
-/* Overlay pages (menu / notifications / settings) ride the tall shell with
-   compact content: the base .screen auto margins vertically center the
-   headless settings page, so it sits in the optical middle instead of
-   stranded at the top. Menu + Notifications pin their heads (above) and
-   their bodies flow beneath. When a page outgrows the shell (a long
-   notifications feed), the autos resolve to zero and it top-anchors with
-   internal scroll, same as chat.
-   The bottom half MUST sit on the last VISIBLE block: the Back link is
-   display:none and a hidden box absorbs no space, so a margin there
-   silently un-centers the whole page (see tests/island_layout.rs). */
+/* One shared dotted panel: menu grid and notifications (empty + feed)
+   take as much space as possible, edge to edge. All four corners rounded
+   24px to echo the shell's bottom curve. (The settings card lives in
+   .profile-card below with the same treatment.) */
 #screen-menu .menugrid,
 #screen-notifications #notif-empty,
-#screen-notifications #notif-list,
-#screen-settings .profile-card {
-    margin-bottom: auto;
+#screen-notifications #notif-list {
+    flex: 1;
+    min-height: 0;
+    border-radius: 24px;
+    border: 1px dashed rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.03);
 }
 
 /* ---------- overlay page fit (menu / notifications / settings) ----------
    The shell is 140 units tall: ~94px remain below the topbar, so every
    overlay page must fit without scrolling, or its action row gets sheared
-   by the shell's bottom edge. What goes: page sub-lines, the settings
-   head (the highlighted topbar icon already says where you are), and the
-   Back links (tapping the active topbar icon toggles its page closed, Esc
+   by the shell's bottom edge. What goes: page heads (the highlighted
+   topbar icon already says where you are), page sub-lines, and the Back
+   links (tapping the active topbar icon toggles its page closed, Esc
    does the same). Settings keeps one row: the sign in/out pill lives
    inside the profile card instead of on its own row. */
 #screen-menu .page-sub,
 #screen-notifications .page-sub {
-    display: none;
-}
-
-#screen-settings .page-head {
     display: none;
 }
 
@@ -659,10 +670,16 @@ body {
     gap: 6px;
 }
 
-/* Equal gaps above and below the settings card: the page's top padding
-   matches the island's bottom padding (12px), and the auto margins split
-   whatever remains evenly — so topbar-to-card always equals card-to-shell
-   no matter how the card's height changes. */
+/* Equal air above the panel: top padding matches the island's bottom
+   padding (12px), so the dotted border stops the same distance short of
+   the navbar as it does of the shell edge. */
+#screen-menu,
+#screen-notifications {
+    padding-top: 12px;
+}
+
+/* Equal air above the settings panel: top padding matches the island's
+   bottom padding (12px). The panel itself fills the rest. */
 #screen-settings {
     padding-top: 12px;
 }
@@ -753,24 +770,30 @@ body {
     text-align: left;
 }
 
-/* menu launcher — single borderless row: icon alongside name.
-   Start-aligned (never center): a centered row that overflows clips its
-   leading items out of scroll reach in Chromium. Compact sizing so all
-   five tiles fit the ~396-unit content width with no scrolling. */
+/* menu launcher: 2x2 grid inside the dotted panel, tiles centered in
+   the free space. The panel scrolls (never clips) so wrapped rows stay
+   reachable if tiles ever exceed it; safe centering keeps the top row
+   reachable too, same hazard as chat history had. */
 .menugrid {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    justify-content: flex-start;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-content: center;
+    align-content: safe center;
     gap: 2px;
     width: 100%;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
+    padding: 8px 10px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
 }
 
 .menugrid::-webkit-scrollbar {
-    display: none;
+    width: 4px;
+}
+
+.menugrid::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 2px;
 }
 
 /* menu items are .btn .btn-ghost — icon alongside name, no borders */
@@ -837,6 +860,8 @@ body {
     flex-direction: column;
     gap: 6px;
     width: 100%;
+    padding: 8px 10px;
+    overflow-y: auto;
 }
 
 .notif-item {
@@ -851,20 +876,20 @@ body {
     overflow-wrap: anywhere;
 }
 
-/* settings profile */
-/* settings profile: compact so the whole page (topbar + head + card +
-   actions + back) fits the 140-unit shell with minimal internal scroll —
-   a scrolled page pinned against the viewport bottom is what made the
-   bottom edge read as a hard leftover border. */
+/* settings profile: the same dotted panel as menu/notifications, filled
+   edge to edge between navbar and shell bottom, all four corners rounded
+   24px like the rest. The row stays vertically centered inside it. */
 .profile-card {
     position: relative;
     display: flex;
     align-items: center;
     gap: 10px;
     width: 100%;
-    border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(255, 255, 255, 0.05);
+    flex: 1;
+    min-height: 0;
+    border-radius: 24px;
+    border: 1px dashed rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.03);
     padding: 8px 10px;
 }
 

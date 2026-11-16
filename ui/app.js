@@ -402,10 +402,10 @@
     document.body.style.opacity = "0";
   }
 
-  // Open path: called after the pop settles, content fades in like the
-  // frozen choreography (CONTENT_FADE after the shell is at scale 1.0).
+  // Open path: called after the pop settles — content fades in fast
+  // (0.10s: the old 0.18s choreography read as content arriving late).
   function fadeIn() {
-    document.body.style.transition = "opacity .18s ease-out";
+    document.body.style.transition = "opacity .10s ease-out";
     document.body.style.opacity = "1";
   }
 

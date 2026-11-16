@@ -1,13 +1,14 @@
 // island_layout.rs — contract tests for the island page layout.
 //
-// Menu + Notifications pin their heads to one shared top offset, so both
-// titles render at exactly the same (x, y) regardless of body height. The
-// headless settings page still centers as a group via auto margins. That
-// centering is fragile in one specific way: the Back link is
-// `display: none`, and auto margins on a display:none box absorb nothing —
-// so if the bottom margin lands on the hidden Back link instead of the last
-// VISIBLE block, short pages silently un-center (content strands at one edge
-// with a void below). These tests pin the contract in plain source terms so
+// All three overlay pages (menu / notifications / settings) are headless:
+// the highlighted topbar icon already says where you are, so no title ever
+// paints. Each page shows one dotted panel that FILLS everything between
+// the navbar and the island bottom (flex:1 + min-height:0) instead of
+// centering as a compact block. That fill is fragile in one specific way:
+// the Back link is `display: none`, and a display:none box neither fills
+// nor scrolls — so if the fill lands on the hidden Back link instead of
+// the VISIBLE panel, short pages silently collapse (empty dotted box, or
+// no box at all). These tests pin the contract in plain source terms so
 // any edit that breaks it fails here instead of on a user's screen.
 
 use std::path::PathBuf;
@@ -60,44 +61,94 @@ fn base_screens_center_via_auto_margins() {
     );
 }
 
-/// Menu and Notifications heads share one pinned top offset, so the two
-/// titles render at exactly the same (x, y): same DOM order (head first),
-/// same .page-head/.page-title rules, same top offset. Settings is headless
-/// and keeps group centering — it must never gain a head pin.
+/// All three overlay pages are headless: the Menu / Notifications /
+// Settings heads stay in the DOM but must never paint — the active topbar
+// icon already says where you are.
 #[test]
-fn overlay_heads_share_one_top_offset() {
+fn overlay_pages_are_headless() {
     let css = css();
     for sel in [
         "#screen-menu.page-head",
         "#screen-notifications.page-head",
+        "#screen-settings.page-head",
     ] {
         assert!(
-            rule_has(&css, sel, "margin-top:0;"),
-            "{sel}: head pin missing — titles drift apart when body heights differ"
+            rule_has(&css, sel, "display:none;"),
+            "{sel}: head must stay hidden — the overlay icon already says where you are"
         );
     }
-    assert!(
-        !rule_has(&css, "#screen-settings.page-head", "margin-top:0"),
-        "settings head pinned — the headless page loses group centering"
-    );
 }
 
-/// The bottom auto margin must sit on the last VISIBLE block of each
-/// overlay page — never (only) on the hidden Back link. display:none boxes
-/// cannot absorb free space.
+/// Each overlay page's VISIBLE panel must fill the navbar-to-shell space
+/// (flex:1, never collapsing) and wear the shared dotted border — never
+/// (only) the hidden Back link. display:none boxes neither fill nor show
+/// a border.
 #[test]
-fn overlay_pages_center_on_visible_content() {
+fn overlay_pages_fill_with_dotted_panels() {
     let css = css();
-    for (page, last_visible) in [
+    for (page, panel) in [
         ("menu", "#screen-menu.menugrid"),
         ("notifications-empty", "#notif-empty"),
         ("notifications-list", "#screen-notifications#notif-list"),
-        ("settings", "#screen-settings.profile-card"),
+        ("settings", ".profile-card"),
     ] {
         assert!(
-            rule_has(&css, last_visible, "margin-bottom:auto;"),
-            "{page}: bottom centering margin missing on the visible block — \
-             the page will strand at one edge"
+            rule_has(&css, panel, "flex:1;"),
+            "{page}: fill missing on the visible panel — \
+             the dotted box collapses instead of reaching the edges"
+        );
+        assert!(
+            rule_has(&css, panel, "border:1pxdashedrgba(255,255,255,0.14);"),
+            "{page}: dotted border missing on the visible panel"
+        );
+        assert!(
+            rule_has(&css, panel, "border-radius:24px;"),
+            "{page}: panel corners must be rounded 24px all around"
         );
     }
+}
+
+/// Menu tiles ride a 2x2 grid inside the dotted panel, and the panel
+/// scrolls instead of clipping so wrapped rows stay reachable.
+#[test]
+fn menu_tiles_form_two_by_two_grid() {
+    let css = css();
+    assert!(
+        rule_has(&css, ".menugrid", "grid-template-columns:1fr1fr;"),
+        "menugrid is not 2x2 — tiles must sit two per row inside the panel"
+    );
+    assert!(
+        rule_has(&css, ".menugrid", "overflow-y:auto;"),
+        "menugrid clips instead of scrolling — wrapped rows go unreachable"
+    );
+}
+
+/// Chat history must bottom-anchor with margin-top:auto on the first
+/// turn — never justify-content:flex-end, which lays overflowing turns
+/// out above the box where no scrollbar can reach them (early turns go
+/// permanently invisible in long chats while their boxes still overlap
+/// the navbar region).
+#[test]
+fn history_top_stays_reachable() {
+    let css = css();
+    assert!(
+        !rule_has(&css, ".history", "justify-content:flex-end"),
+        "history pinned with flex-end — overflowing turns escape above the box, unreachable"
+    );
+    assert!(
+        rule_has(&css, ".history>:first-child", "margin-top:auto;"),
+        "history bottom anchor missing — short chats strand at the top"
+    );
+}
+
+/// The greeting clips with overflow:hidden (single-line ellipsis), so its
+/// line-height must clear descenders ("Good Evening" has two g's) on every
+/// font — a tight factor cuts glyph tails in WebView2's Segoe UI.
+#[test]
+fn greeting_line_height_clears_descenders() {
+    let css = css();
+    assert!(
+        rule_has(&css, ".greet-title", "line-height:normal;"),
+        "greeting line-height too tight — descenders clip under overflow:hidden"
+    );
 }
