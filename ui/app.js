@@ -17,14 +17,17 @@
   }
 
   const el = (id) => document.getElementById(id);
-  const screens = {
-    signin: el("screen-signin"),
-    home: el("screen-home"),
-    chat: el("screen-chat"),
-    menu: el("screen-menu"),
-    notifications: el("screen-notifications"),
-    settings: el("screen-settings"),
-  };
+  // Screens derive from the DOM (`screen-<page>` sections), not a hand-kept
+  // list — adding a page is HTML + one render entry, never a lookup edit.
+  const screens = {};
+  for (const sec of document.querySelectorAll("section.screen")) {
+    const name = sec.id.replace(/^screen-/, "");
+    if (name && name !== sec.id) screens[name] = sec;
+  }
+  // Overlay pages sit on top of the base flow (home/chat/signin).
+  const OVERLAY_PAGES = new Set(["menu", "chats", "notifications", "settings", "confirm"]);
+  // Page -> visible input. Lookup, not a branch chain.
+  const PAGE_INPUTS = { home: "chat-input-home", chat: "chat-input", signin: "groq-key" };
   const signinStatus = el("signin-status");
   const signinBtn = el("signin-btn");
   const keysBtn = el("keys-btn");
@@ -34,14 +37,23 @@
   const groqKey = el("groq-key");
   const topbar = document.querySelector(".topbar");
   const greeting = el("greeting");
+  const homeGreet = el("home-greet");
   const greetIcon = el("greet-icon");
   const homeStatus = el("home-status");
   const homeInput = el("chat-input-home");
   const chatStatus = el("chat-status");
   const history = el("history");
+  const chatBack = el("chat-back");
   const chatInput = el("chat-input");
   const homeSend = el("home-send");
   const chatSend = el("chat-send");
+
+  // Display-name prompt on Home (shown instead of the chat box until answered).
+  const nameEntry = el("name-entry");
+  const homeName = el("home-name");
+  const homeNameSave = el("home-name-save");
+  // Home chat box (hidden while the name prompt owns Home).
+  const homeAsk = el("home-ask");
 
   // topbar navigation
   const navMenu = el("nav-menu");
@@ -52,6 +64,15 @@
   const notifEmpty = el("notif-empty");
   const notifList = el("notif-list");
 
+  // chats page: linear list of local sessions (title + last message)
+  const chatsEmpty = el("chats-empty");
+  const chatsList = el("chats-list");
+
+  // delete confirmation page (Yes drops the session, No keeps it)
+  const confirmName = el("confirm-name");
+  const confirmYes = el("confirm-yes");
+  const confirmNo = el("confirm-no");
+
   // settings page: profile, login status, sign out
   const settingsAvatar = el("settings-avatar");
   const settingsName = el("settings-name");
@@ -61,8 +82,39 @@
   const settingsStatus = el("settings-status");
   const settingsSignin = el("settings-signin");
   const settingsDisconnect = el("settings-disconnect");
+  // Rename affordance: jumps to the shared Home name step.
+  const settingsNameEdit = el("settings-name-edit");
 
   let lastScreen = "";
+  // Arrow keys arrive as distinct non-Unicode codes (see main.rs
+  // KEY_LEFT/RIGHT/UP/DOWN): Left Arrow is U+0025 '%' (37), so sharing
+  // 37-40 would mistype arrows as %&'( and eat real '%' as caret motion.
+  const KEY_LEFT = 0x110010, KEY_UP = 0x110011, KEY_RIGHT = 0x110012, KEY_DOWN = 0x110013;
+
+  function isArrow(code) {
+    return code === KEY_LEFT || code === KEY_UP || code === KEY_RIGHT || code === KEY_DOWN;
+  }
+
+  // One prompt logic for both screens: Home and Chat own separate inputs
+  // (a node can't live in two screens at once), but every behavior —
+  // typing, Enter/Escape, send enablement — flows through this single
+  // table, so the two prompts can't drift into repeated clones.
+  const PROMPTS = [
+    { input: homeInput, send: homeSend },
+    { input: chatInput, send: chatSend },
+  ];
+  // Send buttons ride disabled (gray) until there is text to send, and
+  // while Rust streams a reply. Blue = ready, gray = nothing to send.
+  let isStreaming = false;
+  // A submit posted but not yet acknowledged by Rust (no render with
+  // streaming/error yet): block a second submit so its draft isn't cleared
+  // and lost to Rust's streaming guard. Cleared on the next render.
+  let awaitingAck = false;
+  function refreshSend() {
+    for (const p of PROMPTS) {
+      if (p.send) p.send.disabled = isStreaming || awaitingAck || !(p.input && p.input.value.trim());
+    }
+  }
   // Local-only step: landing (two buttons) -> key entry (input + up arrow).
   // Rust never sees this; submitKey posts save_key and Rust owns verify.
   let keyEntering = false;
@@ -75,13 +127,16 @@
     else if (!on && groqKey) groqKey.value = "";
   }
 
-  function show(name) {
+  function show(name, overlay) {
     for (const k of Object.keys(screens)) {
       if (screens[k]) screens[k].hidden = (k !== name);
     }
     lastScreen = name;
     // Minimal signin: no navbar on either step; nothing competes with the key.
-    if (topbar) topbar.hidden = (name === "signin");
+    // Chat is chrome-free too (prompt + chats + back only), unless an
+    // overlay page rides on top of it. Confirm is a blank island: the
+    // question + Yes/No own the whole frame, no navbar.
+    if (topbar) topbar.hidden = (name === "signin") || (name === "confirm") || (name === "chat" && overlay === "none");
     if (name !== "signin" && keyEntering) setKeyEntering(false);
   }
 
@@ -121,14 +176,17 @@
   function setGreetIcon(text) {
     if (!greetIcon) return;
     const t = String(text || "");
-    let key = "sun";
-    if (/^sleep already/i.test(t)) key = "moon";
-    else if (/^good evening/i.test(t)) key = "cloud-sun";
-    else if (/^good (morning|afternoon)/i.test(t)) key = "sun";
-    else {
-      const h = new Date().getHours();
-      key = (h >= 22 || h < 5) ? "moon" : (h >= 17 ? "cloud-sun" : "sun");
-    }
+    // First matching pattern wins; empty = fall back to the clock.
+    const key =
+      [
+        [/^sleep already/i, "moon"],
+        [/^good evening/i, "cloud-sun"],
+        [/^good (morning|afternoon)/i, "sun"],
+      ].find(([re]) => re.test(t))?.[1] ??
+      (() => {
+        const h = new Date().getHours();
+        return h >= 22 || h < 5 ? "moon" : h >= 17 ? "cloud-sun" : "sun";
+      })();
     if (greetIcon.dataset.icon !== key) {
       greetIcon.dataset.icon = key;
       greetIcon.innerHTML = GREET_ICONS[key];
@@ -136,14 +194,19 @@
   }
 
   function activeInput() {
-    if (lastScreen === "home") return homeInput;
-    if (lastScreen === "chat") return chatInput;
-    if (lastScreen === "signin") return groqKey;
-    return null;
+    // The window never activates, so focus is page-internal: a focused
+    // owned input always wins (lets the user click between the Home chat
+    // and name boxes). Otherwise the Home name box owns keys while shown.
+    const ae = document.activeElement;
+    if (ae === homeName || ae === homeInput || ae === chatInput
+        || ae === groqKey) return ae;
+    if (lastScreen === "home" && nameEntry && !nameEntry.hidden && homeName) return homeName;
+    const id = PAGE_INPUTS[lastScreen];
+    return id ? el(id) : null;
   }
 
   function isOverlayPage(page) {
-    return page === "menu" || page === "notifications" || page === "settings";
+    return OVERLAY_PAGES.has(page);
   }
 
   function renderNotifications(s) {
@@ -171,9 +234,13 @@
     const connected = !!s.connected;
     const keyReady = !!(s.keyReady ?? s.planReady);
     const signingIn = !!s.signingIn;
+    const name = (s.userName && String(s.userName).trim()) || "";
 
-    if (settingsAvatar) settingsAvatar.textContent = connected ? "G" : "?";
-    if (settingsName) settingsName.textContent = connected ? "Groq API key" : "Not set yet";
+    if (settingsAvatar) {
+      const initial = name ? [...name][0].toUpperCase() : null;
+      settingsAvatar.textContent = initial || (connected ? "G" : "?");
+    }
+    if (settingsName) settingsName.textContent = name || (connected ? "Groq API key" : "Not set yet");
     if (settingsEmail) {
       if (connected) settingsEmail.textContent = "Key sealed on this device";
       else settingsEmail.textContent = "Not signed in";
@@ -190,6 +257,7 @@
     // Transient Rust notice/error (e.g. "Checking key…").
     setStatus(settingsStatus, s.status);
     if (settingsSignin) settingsSignin.style.display = (!connected && !signingIn) ? "" : "none";
+    if (settingsNameEdit) settingsNameEdit.style.display = connected ? "" : "none";
     if (settingsDisconnect) settingsDisconnect.style.display = connected && !signingIn ? "" : "none";
     if (signingIn && settingsStatus) {
       settingsStatus.hidden = false;
@@ -200,75 +268,210 @@
   // Rust -> web: full state render. Inputs are owned by key()/typing:
   // render() never syncs input values so state pushes cannot overwrite
   // text entered while the inputs are unfocused; submitInput() clears
-  // after submission.
+  // after submission. Page bodies are a lookup, not a branch chain:
+  // unknown pages fall back to home visuals rather than a blank island.
+  function renderSignin(s) {
+    // Landing or key entry owns the frame; verification state rides the
+    // same box so nothing swaps mid-flight.
+    const signingIn = !!s.signingIn;
+    const t = (s.status && String(s.status).trim()) ? s.status : "";
+    if (signingIn) {
+      if (!keyEntering) setKeyEntering(true);
+      setStatus(signinStatus, t || "Checking key…");
+    } else if (t) {
+      // Error after verify: stay in entry so the fix is one paste away.
+      if (!keyEntering) setKeyEntering(true);
+      setStatus(signinStatus, t);
+    } else {
+      setStatus(signinStatus, "");
+      // Fresh landing only when no error is showing; keep entry open
+      // across unrelated pushes while the user types.
+      if (keyEntering && document.activeElement !== groqKey && !groqKey.value) setKeyEntering(false);
+    }
+    if (groqKey) groqKey.disabled = signingIn;
+    if (keySend) keySend.style.display = signingIn ? "none" : "";
+  }
+
+  function renderHome(s) {
+    greeting.textContent = s.greeting || "";
+    setGreetIcon(s.greeting);
+    setStatus(homeStatus, s.status);
+    // First-run name step owns Home alone until answered — no navbar, no
+    // greeting, no chat box (mirrors SignIn owning the frame when signed
+    // out). Rust decides via needsName; this side only applies it.
+    const needsName = !!s.needsName;
+    if (topbar) topbar.hidden = needsName;
+    if (homeGreet) homeGreet.hidden = needsName;
+    if (screens.home) screens.home.classList.toggle("name-only", needsName);
+    if (nameEntry) {
+      const wasHidden = nameEntry.hidden;
+      nameEntry.hidden = !needsName;
+      if (needsName && wasHidden && homeName) {
+        // Renaming starts from the saved name, never a blank box — but
+        // never clobber text already being typed.
+        const current = (s.userName && String(s.userName).trim()) || "";
+        if (document.activeElement !== homeName) homeName.value = current;
+        const ae = document.activeElement;
+        if (ae !== homeName && ae !== homeInput) homeName.focus();
+        homeName.setSelectionRange(homeName.value.length, homeName.value.length);
+      }
+      if (!needsName && homeName) homeName.value = "";
+    }
+    if (homeAsk) homeAsk.hidden = needsName;
+  }
+
+  function renderChat(s) {
+    setStatus(chatStatus, s.status);
+    history.innerHTML = "";
+    for (const t of (s.history || [])) {
+      const d = document.createElement("div");
+      d.className = t.role === "user" ? "turn-user" : "turn-assistant";
+      d.textContent = t.text;
+      history.appendChild(d);
+    }
+    if (s.streaming || s.stream) {
+      const txt = s.stream && s.stream.length ? s.stream : "";
+      const d = document.createElement("div");
+      if (!txt && s.streaming) {
+        // No reply yet: shimmer text, no bubble. The bubble appears with
+        // the first arriving text below.
+        d.className = "turn-thinking";
+        d.textContent = "Thinking";
+      } else {
+        d.className = "turn-stream";
+        d.textContent = txt;
+      }
+      history.appendChild(d);
+    }
+    history.scrollTop = history.scrollHeight;
+  }
+
+  // Trash icon (Pikaicons delete-dustbin-01, stroke) for the per-row
+  // delete affordance on the chats list.
+  const TRASH_ICON = '<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m16 6-1.106-2.211a3.236 3.236 0 0 0-5.788 0L8 6M4 6h16M6 6h12v9c0 1.864 0 2.796-.305 3.53a4 4 0 0 1-2.164 2.165C14.796 21 13.864 21 12 21s-2.796 0-3.53-.305a4 4 0 0 1-2.166-2.164C6 17.796 6 16.864 6 15z" fill="none" /></svg>';
+
+  // Chats page: every local session linearly, newest first — title on
+  // top, last message under it, trash on the right. The title block
+  // restores (open_session); the trash pops the confirm page
+  // (ask_delete) — siblings, never nested buttons.
+  function renderChats(s) {
+    const items = Array.isArray(s.sessions) ? s.sessions : [];
+    if (!chatsEmpty || !chatsList) return;
+    if (items.length === 0) {
+      chatsEmpty.hidden = false;
+      chatsList.hidden = true;
+      chatsList.innerHTML = "";
+      return;
+    }
+    chatsEmpty.hidden = true;
+    chatsList.hidden = false;
+    chatsList.innerHTML = "";
+    for (const n of items.slice(0, 50)) {
+      const row = document.createElement("div");
+      row.className = "notif-item chat-row";
+      const open = document.createElement("button");
+      open.className = "chat-open";
+      open.type = "button";
+      const title = document.createElement("span");
+      title.className = "chat-title";
+      title.textContent = (n && n.title) || "New chat";
+      const prev = document.createElement("span");
+      prev.className = "chat-preview";
+      prev.textContent = (n && n.preview) || "";
+      open.appendChild(title);
+      open.appendChild(prev);
+      const id = n && n.id;
+      open.addEventListener("click", () => post({ type: "open_session", id }));
+      const del = document.createElement("button");
+      del.className = "chat-del btn btn-ghost btn-icon-sm btn-circle";
+      del.type = "button";
+      del.setAttribute("aria-label", "Delete chat");
+      del.innerHTML = TRASH_ICON;
+      del.addEventListener("click", () => post({ type: "ask_delete", id }));
+      row.appendChild(open);
+      row.appendChild(del);
+      chatsList.appendChild(row);
+    }
+  }
+
+  // Delete confirmation: blank page naming the chat Yes would drop.
+  function renderConfirm(s) {
+    if (!confirmName) return;
+    const t = (s.deleteTitle && String(s.deleteTitle).trim()) || "";
+    confirmName.hidden = !t;
+    confirmName.textContent = t;
+  }
+
+  // Overlay pages: static launcher / feed / profile / confirm.
+  // `null` = nothing to fill.
+  const RENDERERS = {
+    signin: renderSignin,
+    home: renderHome,
+    chat: renderChat,
+    menu: null,
+    chats: renderChats,
+    notifications: renderNotifications,
+    settings: renderSettings,
+    confirm: renderConfirm,
+  };
+
   function render(s) {
     const page = (s.page && String(s.page)) || (s.screen && String(s.screen)) || "home";
-    show(page);
+    const overlay = (s.overlay && String(s.overlay)) || "none";
+    const known = Object.prototype.hasOwnProperty.call(RENDERERS, page);
+    show(known ? page : "home", overlay);
     setTopbarActive(page);
-    if (page === "signin") {
-      // Landing or key entry owns the frame; verification state rides the
-      // same box so nothing swaps mid-flight.
-      const signingIn = !!s.signingIn;
-      const t = (s.status && String(s.status).trim()) ? s.status : "";
-      if (signingIn) {
-        if (!keyEntering) setKeyEntering(true);
-        setStatus(signinStatus, t || "Checking key…");
-      } else if (t) {
-        // Error after verify: stay in entry so the fix is one paste away.
-        if (!keyEntering) setKeyEntering(true);
-        setStatus(signinStatus, t);
-      } else {
-        setStatus(signinStatus, "");
-        // Fresh landing only when no error is showing; keep entry open
-        // across unrelated pushes while the user types.
-        if (keyEntering && document.activeElement !== groqKey && !groqKey.value) setKeyEntering(false);
-      }
-      if (groqKey) groqKey.disabled = signingIn;
-      if (keySend) keySend.style.display = signingIn ? "none" : "";
-    } else if (page === "home") {
-      greeting.textContent = s.greeting || "";
-      setGreetIcon(s.greeting);
-      setStatus(homeStatus, s.status);
-    } else if (page === "chat") {
-      setStatus(chatStatus, s.status);
-      history.innerHTML = "";
-      for (const t of (s.history || [])) {
-        const d = document.createElement("div");
-        d.className = t.role === "user" ? "turn-user" : "turn-assistant";
-        d.textContent = t.role === "user" ? ("› " + t.text) : t.text;
-        history.appendChild(d);
-      }
-      if (s.streaming || s.stream) {
-        const d = document.createElement("div");
-        d.className = "turn-stream";
-        d.textContent = s.stream && s.stream.length ? s.stream : "…";
-        history.appendChild(d);
-      }
-      history.scrollTop = history.scrollHeight;
-    } else if (page === "menu") {
-      // static launcher — nothing to fill.
-    } else if (page === "notifications") {
-      renderNotifications(s);
-    } else if (page === "settings") {
-      renderSettings(s);
-    } else {
-      // Unknown page from an older/newer host: fall back to home visuals
-      // rather than a blank island.
-      show("home");
-    }
+    (RENDERERS[known ? page : "home"] || (() => {}))(s);
+    isStreaming = !!s.streaming;
+    awaitingAck = false;
+    refreshSend();
   }
 
   // Rust hook -> web: the window never activates, so physical keys arrive
   // here via ExecuteScript. Mirrors a real keypress in the visible input.
-  function key(code) {
-    if (isOverlayPage(lastScreen)) {
-      if (code === 27) { post({ type: "nav", target: "back" }); } // Escape closes the page
-      return;
-    }
-    const input = activeInput();
-    if (!input) return;
-    if (code === 13) { submitInput(); return; }       // Return
-    if (code === 27) { input.value = ""; return; }    // Escape
+  // Shared edit core (Backspace + printable, capped): the Home chat box
+  // uses 400, name inputs use 30.
+  // Hook-driven typing sets .value programmatically, which never scrolls
+  // the field — an overlong prompt hides its newest tail on the right while
+  // old text sits visible on the left. Native typing keeps the caret in
+  // view; do it by hand after every edit.
+  function revealCaret(input) {
+    try {
+      const len = input.value.length;
+      if (!len) { input.scrollLeft = 0; return; }
+      const end = input.selectionEnd == null ? len : input.selectionEnd;
+      if (end >= len) { input.scrollLeft = input.scrollWidth; return; }
+      if (end <= 0) { input.scrollLeft = 0; return; }
+      // Caret mid-text (arrowed back): average char width is only an
+      // estimate in proportional fonts, so move only when the estimate sits
+      // outside the view, with a 2px slop against jitter.
+      const avg = input.scrollWidth / len;
+      const x = end * avg;
+      if (x < input.scrollLeft - 2) input.scrollLeft = Math.max(0, x - avg);
+      else if (x > input.scrollLeft + input.clientWidth + 2) {
+        input.scrollLeft = x - input.clientWidth + avg;
+      }
+    } catch (e) {}
+  }
+
+  function isLowSurrogate(c) { return c >= 0xDC00 && c <= 0xDFFF; }
+  function isHighSurrogate(c) { return c >= 0xD800 && c <= 0xDBFF; }
+
+  // Step one Unicode character left/right in UTF-16 units: an astral char
+  // (emoji) is two units, and landing between them breaks the caret.
+  function stepLeft(value, pos) {
+    if (pos <= 0) return 0;
+    if (pos >= 2 && isLowSurrogate(value.charCodeAt(pos - 1)) && isHighSurrogate(value.charCodeAt(pos - 2))) return pos - 2;
+    return pos - 1;
+  }
+  function stepRight(value, pos) {
+    const len = value.length;
+    if (pos >= len) return len;
+    if (pos + 1 < len && isHighSurrogate(value.charCodeAt(pos)) && isLowSurrogate(value.charCodeAt(pos + 1))) return pos + 2;
+    return pos + 1;
+  }
+
+  function editText(input, code, cap) {
     if (code === 8) {                                 // Backspace
       const a = input.selectionStart == null ? input.value.length : input.selectionStart;
       const b = input.selectionEnd == null ? input.value.length : input.selectionEnd;
@@ -276,30 +479,81 @@
         input.value = input.value.slice(0, a) + input.value.slice(b);
         input.setSelectionRange(a, a);
       } else if (a > 0) {
-        input.value = input.value.slice(0, a - 1) + input.value.slice(a);
-        input.setSelectionRange(a - 1, a - 1);
+        const p = stepLeft(input.value, a);
+        input.value = input.value.slice(0, p) + input.value.slice(a);
+        input.setSelectionRange(p, p);
       }
+      revealCaret(input);
       return;
     }
     if (code >= 32 && code <= 0x10FFFF) {
       const ch = String.fromCodePoint(code);
       if (ch.length && !/\p{Cc}/u.test(ch)) {
-        const cap = 400;
         const a = input.selectionStart == null ? input.value.length : input.selectionStart;
         const b = input.selectionEnd == null ? input.value.length : input.selectionEnd;
         const next = input.value.slice(0, a) + ch + input.value.slice(b);
         if ([...next].length <= cap) {
           input.value = next;
           input.setSelectionRange(a + ch.length, a + ch.length);
+          revealCaret(input);
         }
       }
     }
   }
 
-  // Ctrl+key shortcuts from the Rust hook (window never has OS focus).
-  function shortcut(name) {
+  // Arrow-key caret for hook-driven typing: the window never activates,
+  // so arrows arrive as distinct codes, not native keypresses. Left/Right
+  // step one Unicode character (or collapse a selection); Up/Down jump to
+  // the ends — the prompts, the name box, and the key box are single-line.
+  function moveCaret(input, code) {
+    const len = input.value.length;
+    const a = input.selectionStart == null ? len : input.selectionStart;
+    const b = input.selectionEnd == null ? len : input.selectionEnd;
+    if (code === KEY_LEFT) {
+      const p = a !== b ? Math.min(a, b) : stepLeft(input.value, a);
+      input.setSelectionRange(p, p);
+    } else if (code === KEY_RIGHT) {
+      const p = a !== b ? Math.max(a, b) : stepRight(input.value, a);
+      input.setSelectionRange(p, p);
+    } else if (code === KEY_UP) {   // Up -> start
+      input.setSelectionRange(0, 0);
+    } else {                        // Down -> end
+      input.setSelectionRange(len, len);
+    }
+    revealCaret(input);
+    try { input.focus(); } catch (e) {}
+  }
+
+  function key(code) {
+    if (isOverlayPage(lastScreen)) {
+      // Esc on confirm is a No (keeps the session); elsewhere it closes
+      // the page.
+      if (code === 27) {
+        post(lastScreen === "confirm" ? { type: "cancel_delete" } : { type: "nav", target: "back" });
+      }
+      return;
+    }
     const input = activeInput();
-    if (name === "selectAll") {
+    if (!input) return;
+    // Arrows first: editText would mistype them as printable characters.
+    if (isArrow(code)) { moveCaret(input, code); return; }
+    if (input === homeName) {
+      if (code === 13) { submitHomeName(); return; }  // Return
+      if (code === 27) { input.value = ""; return; }  // Escape
+      editText(input, code, 30);
+      return;
+    }
+    if (code === 13) { submitInput(); return; }       // Return
+    if (code === 27) { input.value = ""; refreshSend(); return; }    // Escape
+    editText(input, code, 400);
+    refreshSend();
+  }
+
+  // Ctrl+key shortcuts from the Rust hook (window never has OS focus).
+  // Lookup, not a branch chain: adding a shortcut is one entry.
+  const SHORTCUTS = {
+    selectAll() {
+      const input = activeInput();
       if (lastScreen === "chat" && document.activeElement !== chatInput
           && window.getSelection().toString() === "") {
         const r = document.createRange();
@@ -310,24 +564,29 @@
         return;
       }
       if (input) { input.focus(); input.select(); }
-      return;
-    }
-    if (name === "copy") {
+    },
+    copy() {
       const sel = window.getSelection().toString();
-      const text = sel || (input && input.value) || "";
-      copyText(text);
-      return;
-    }
-    if (name === "cut" && input) {
+      const input = activeInput();
+      copyText(sel || (input && input.value) || "");
+    },
+    cut() {
+      const input = activeInput();
+      if (!input) return;
       input.focus();
       document.execCommand("cut");
-      return;
-    }
-    if (name === "paste" && input) {
+    },
+    paste() {
+      const input = activeInput();
+      if (!input) return;
       input.focus();
       document.execCommand("paste");
-      return;
-    }
+    },
+  };
+
+  function shortcut(name) {
+    const fn_ = SHORTCUTS[name];
+    if (fn_) fn_();
   }
 
   function copyText(text) {
@@ -348,27 +607,49 @@
   }
 
   function submitInput() {
-    const input =
-      lastScreen === "home" ? homeInput : lastScreen === "chat" ? chatInput : null;
-    if (input) {
+    // The name box saves the name; chat pages submit their page input;
+    // signin submits the key instead.
+    const input = activeInput();
+    if (input === homeName) { submitHomeName(); return; }
+    if (input && lastScreen !== "signin") {
+      if (isStreaming || awaitingAck) return;
       const t = input.value;
+      if (!t.trim()) { refreshSend(); return; }
+      awaitingAck = true;
       input.value = "";
+      refreshSend();
       post({ type: "submit", text: t });
     } else if (lastScreen === "signin") {
       submitKey();
     }
   }
 
-  for (const input of [homeInput, chatInput]) {
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); submitInput(); }
-      if (e.key === "Escape") { input.value = ""; }
-    });
+  // Both prompts wire through the one PROMPTS table above — a shared
+  // input event, Enter/Escape keys, and send click per pair.
+  for (const p of PROMPTS) {
+    if (p.input) {
+      p.input.addEventListener("input", refreshSend);
+      p.input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); submitInput(); }
+        if (e.key === "Escape") { p.input.value = ""; refreshSend(); }
+      });
+    }
+    if (p.send) p.send.addEventListener("click", () => submitInput());
   }
   function submitKey() {
     const k = groqKey ? groqKey.value : "";
     if (!k.trim()) return;
     post({ type: "save_key", key: k });
+  }
+  function submitNameText(v) {
+    const t = (v || "").trim();
+    if (!t) return;
+    post({ type: "save_name", name: t });
+  }
+  function submitHomeName() {
+    if (!homeName) return;
+    submitNameText(homeName.value);
+    homeName.value = "";
   }
   if (groqKey) groqKey.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); submitKey(); }
@@ -377,8 +658,15 @@
   if (signinBtn) signinBtn.addEventListener("click", () => setKeyEntering(true));
   if (keySend) keySend.addEventListener("click", submitKey);
   if (keysBtn) keysBtn.addEventListener("click", () => post({ type: "open_keys" }));
-  if (homeSend) homeSend.addEventListener("click", () => submitInput());
-  if (chatSend) chatSend.addEventListener("click", () => submitInput());
+  if (homeName) homeName.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submitHomeName(); }
+    if (e.key === "Escape") { homeName.value = ""; }
+  });
+  if (homeNameSave) homeNameSave.addEventListener("click", submitHomeName);
+  if (confirmYes) confirmYes.addEventListener("click", () => post({ type: "confirm_delete" }));
+  if (confirmNo) confirmNo.addEventListener("click", () => post({ type: "cancel_delete" }));
+  if (settingsNameEdit) settingsNameEdit.addEventListener("click", () => post({ type: "edit_name" }));
+  if (chatBack) chatBack.addEventListener("click", () => post({ type: "new_chat" }));
 
   // Every [data-nav] button (topbar, menu tiles, back links, brand) posts
   // a nav intent; Rust owns the overlay and pushes the new page back.
@@ -390,6 +678,7 @@
   });
   if (settingsSignin) settingsSignin.addEventListener("click", () => post({ type: "nav", target: "auth" }));
   if (settingsDisconnect) settingsDisconnect.addEventListener("click", () => post({ type: "disconnect" }));
+  refreshSend();
 
   // Leaving the island collapses it (parent has no mouse tracking inside us).
   document.addEventListener("mouseleave", () => post({ type: "mouseleave" }));

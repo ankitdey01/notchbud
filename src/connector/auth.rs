@@ -16,7 +16,7 @@ use windows::Win32::Security::Cryptography::{
 };
 
 pub const GROQ_MODELS_URL: &str = "https://api.groq.com/openai/v1/models";
-pub const USER_AGENT: &str = "notchbud/0.1";
+pub const USER_AGENT: &str = concat!("notchbud/", env!("CARGO_PKG_VERSION"));
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// What a sign-in saves. Never logged; it is a credential.
@@ -206,9 +206,18 @@ pub fn pick_model(api_key: &str) -> Result<String, String> {
 }
 
 /// Save after a successful `list_models`: the key is real before it persists.
+/// A catalog with nothing to chat with fails here, not on first submit.
 pub fn validate_api_key(api_key: &str) -> Result<(), AuthError> {
     match list_models(api_key) {
-        Ok(_) => Ok(()),
+        Ok(list) => {
+            if pick_model_from(list.iter().map(|m| m.slug.as_str())).is_none() {
+                return Err(AuthError::new(
+                    "No models are available for this Groq API key right now.",
+                    false,
+                ));
+            }
+            Ok(())
+        }
         Err(e) if e == "expired" => Err(AuthError::new(
             super::chat::AUTH_REJECTED_MSG,
             true,

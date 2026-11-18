@@ -223,17 +223,32 @@ pub enum Screen {
     Chat,
 }
 
+impl Screen {
+    /// Wire string for `page()` / `page_state()["screen"]`. Single source so
+    /// the two can't drift apart when a screen is added.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Screen::SignIn => "signin",
+            Screen::Home => "home",
+            Screen::Chat => "chat",
+        }
+    }
+}
+
 /// Topbar overlay pages. These sit ON TOP of the base [`Screen`] without
 /// destroying it — opening Settings from Home then going Back returns to
 /// Home, not to a reset island. The user-facing pages are therefore:
-/// home, chat, auth (signin), menu, notifications, settings.
+/// home, chat, auth (signin), menu, chats, notifications, settings,
+/// plus the delete confirmation that pops over the chats list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Overlay {
     #[default]
     None,
     Menu,
+    Chats,
     Notifications,
     Settings,
+    ConfirmDelete,
 }
 
 impl Overlay {
@@ -241,18 +256,25 @@ impl Overlay {
         match self {
             Overlay::None => "none",
             Overlay::Menu => "menu",
+            Overlay::Chats => "chats",
             Overlay::Notifications => "notifications",
             Overlay::Settings => "settings",
+            Overlay::ConfirmDelete => "confirm",
         }
     }
 
+    /// Non-none overlays in wire order. `from_target` looks these up instead
+    /// of re-listing the strings, so the two can't drift apart.
+    pub const ALL: [Overlay; 5] = [
+        Overlay::Menu,
+        Overlay::Chats,
+        Overlay::Notifications,
+        Overlay::Settings,
+        Overlay::ConfirmDelete,
+    ];
+
     pub fn from_target(target: &str) -> Option<Overlay> {
-        match target {
-            "menu" => Some(Overlay::Menu),
-            "notifications" => Some(Overlay::Notifications),
-            "settings" => Some(Overlay::Settings),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|o| o.as_str() == target)
     }
 }
 
@@ -337,10 +359,7 @@ impl Chat {
             .iter()
             .map(|(role, text)| {
                 serde_json::json!({
-                    "role": match role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                    },
+                    "role": role.as_str(),
                     "text": text,
                 })
             })
@@ -369,10 +388,31 @@ pub struct App {
     // island chat backend (history + tokens); content renders in WebView2
     pub chat: Chat,
 
-    /// Topbar overlay page (menu / notifications / settings). `None` means
-    /// the base [`Screen`] owns the frame. Set via the "nav" web intent,
-    /// cleared on Back, on collapse, and on auth transitions.
+    /// Local display name ("What should we call you?"). Plain text on disk,
+    /// empty until the user answers. Survives disconnects (it is device
+    /// profile, not key-bound).
+    pub display_name: String,
+
+    /// Settings pencil reopen of the shared name step. Forces `needsName`
+    /// even with a saved name; cleared on save or on leaving the island.
+    pub rename: bool,
+
+    /// Topbar overlay page (menu / chats / notifications / settings).
+    /// `None` means the base [`Screen`] owns the frame. Set via the "nav"
+    /// web intent, cleared on Back, on collapse, and on auth transitions.
     pub overlay: Overlay,
+
+    /// Local chat sessions (newest first, see sessions.rs). The live
+    /// `chat.history` is the working copy of the session `session_id`.
+    pub sessions: Vec<crate::sessions::Session>,
+    /// Active session id (empty until the first submit creates one).
+    pub session_id: String,
+    /// Groq-titled label for the active session (empty until titled).
+    pub session_title: String,
+    /// Session id awaiting delete confirmation (set by ask_delete, read by
+    /// the confirm page, cleared on Yes/No). Only valid while the overlay
+    /// is ConfirmDelete — the confirm page is unreachable otherwise.
+    pub pending_delete: String,
 
     // geometry snapshot refreshed each frame (NCHITTEST hit surface)
     pub bar_area: [f32; 4],
@@ -403,7 +443,13 @@ impl App {
             expanded: false,
             mouse_inside: false,
             chat: Chat::new(),
+            display_name: String::new(),
+            rename: false,
             overlay: Overlay::None,
+            sessions: Vec::new(),
+            session_id: String::new(),
+            session_title: String::new(),
+            pending_delete: String::new(),
             bar_area: [0.0; 4],
             rgn_area: [0.0; 4],
             win_x: 0,
@@ -412,11 +458,11 @@ impl App {
         }
     }
 
-    /// First name shown in the island UI. An API key carries no account
-    /// name, so this stays empty and the greeting shows the day part
-    /// alone ("Good Evening").
+    /// First name shown in the island UI. Empty until the user answers
+    /// "What should we call you?" — the greeting then shows the day part
+    /// with it ("Good Evening, Alex").
     pub fn display_name(&self) -> &str {
-        ""
+        &self.display_name
     }
 
     /// Greeting owns the top of the island only once signed in and before
@@ -443,14 +489,8 @@ impl App {
     /// signin is the auth page when signed out.
     pub fn page(&self) -> &'static str {
         match self.overlay {
-            Overlay::Menu => "menu",
-            Overlay::Notifications => "notifications",
-            Overlay::Settings => "settings",
-            Overlay::None => match self.screen() {
-                Screen::SignIn => "signin",
-                Screen::Home => "home",
-                Screen::Chat => "chat",
-            },
+            Overlay::None => self.screen().as_str(),
+            overlay => overlay.as_str(),
         }
     }
 
@@ -485,9 +525,8 @@ impl App {
         self.overlay != prev
     }
 
-    /// "Good Evening" for right now. An API key carries no account name,
-    /// so the day part alone shows; the sign-in screen owns the frame
-    /// when signed out.
+    /// "Good Evening, Alex" for right now. Empty name greets with the day
+    /// part alone ("Good Evening").
     pub fn greeting(&self) -> String {
         crate::user::greeting_now(self.display_name())
     }
@@ -496,22 +535,53 @@ impl App {
     /// `screen` stays for backwards compat; `page` is what the router
     /// shows. `overlay` is "none" on the base flow. Settings reads
     /// `connected` / `keyReady` (keyReady mirrors connected: a saved key
-    /// means ready); `userName` / `email` stay null (an API key carries
-    /// neither); notifications reads `notifications` (empty until dynamic
-    /// — the page shows its hardcoded empty state meanwhile).
+    /// means ready); `userName` is the display name (null until set);
+    /// `needsName` owns Home until answered — the page shows the name box
+    /// INSTEAD of the chat box, never both (mirrors SignIn owning the
+    /// frame when signed out); `email` stays null (an API key carries
+    /// none); notifications reads `notifications` (empty until dynamic
+    /// — the page shows its hardcoded empty state meanwhile); chats reads
+    /// `sessions` (linear, newest first: id/title/preview) plus
+    /// `currentId` for the live session.
     pub fn page_state(&self) -> String {
         let mut v = self.chat.ui_state(&self.greeting());
-        v["screen"] = serde_json::json!(match self.screen() {
-            Screen::SignIn => "signin",
-            Screen::Home => "home",
-            Screen::Chat => "chat",
-        });
+        v["screen"] = serde_json::json!(self.screen().as_str());
         v["overlay"] = serde_json::json!(self.overlay.as_str());
         v["page"] = serde_json::json!(self.page());
-        v["userName"] = serde_json::Value::Null;
+        v["userName"] = if self.display_name.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(self.display_name)
+        };
+        v["needsName"] = serde_json::json!(
+            self.chat.connected()
+                && !self.chat.has_chatted()
+                && (self.rename || self.display_name.trim().is_empty())
+        );
         v["email"] = serde_json::Value::Null;
         v["keyReady"] = serde_json::json!(self.chat.connected());
         v["notifications"] = serde_json::json!([] as [serde_json::Value; 0]);
+        let sessions: Vec<serde_json::Value> = self
+            .sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "title": s.display_title(),
+                    "preview": s.preview(),
+                })
+            })
+            .collect();
+        v["sessions"] = serde_json::json!(sessions);
+        v["currentId"] = serde_json::json!(self.session_id);
+        // Confirm page: which stored chat the Yes button would delete.
+        v["deleteTitle"] = serde_json::json!(
+            self.sessions
+                .iter()
+                .find(|s| s.id == self.pending_delete)
+                .map(|s| s.display_title())
+                .unwrap_or_default()
+        );
         v.to_string()
     }
 
@@ -530,10 +600,7 @@ impl App {
 /// island. Collapse only on a cursor truly outside the island bar.
 /// `None` (position unreadable) collapses — fail closed, never stuck open.
 pub fn page_leave_collapses(bar: &[f32; 4], cursor: Option<(f32, f32)>) -> bool {
-    match cursor {
-        None => true,
-        Some((x, y)) => !App::hit(bar, x, y),
-    }
+    cursor.map_or(true, |(x, y)| !App::hit(bar, x, y))
 }
 
 /// Mousemove choreography decision: closed->open transitions only. Moves
@@ -749,6 +816,56 @@ mod tests {
     }
 
     #[test]
+    fn page_state_carries_sessions_linearly() {
+        // The Chats page reads `sessions` (newest first: title + preview)
+        // plus `currentId` for the live session.
+        let mut app = blank_app();
+        sign_in(&mut app);
+        app.session_id = "s1".into();
+        app.session_title = "Trip Ideas".into();
+        app.chat.push_history(Role::User, "plan a trip".into());
+        crate::sessions::upsert(
+            &mut app.sessions,
+            crate::sessions::snapshot(&app.session_id, &app.session_title, &app.chat.history),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["sessions"][0]["id"], "s1");
+        assert_eq!(v["sessions"][0]["title"], "Trip Ideas");
+        assert_eq!(v["sessions"][0]["preview"], "plan a trip");
+        assert_eq!(v["currentId"], "s1");
+        // Untitled sessions fall back to a snippet, never blank.
+        let mut bare = blank_app();
+        sign_in(&mut bare);
+        bare.session_id = "s2".into();
+        bare.chat.push_history(Role::User, "hello there".into());
+        crate::sessions::upsert(
+            &mut bare.sessions,
+            crate::sessions::snapshot(&bare.session_id, &bare.session_title, &bare.chat.history),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&bare.page_state()).unwrap();
+        assert_eq!(v["sessions"][0]["title"], "hello there");
+    }
+
+    #[test]
+    fn chats_overlay_toggles_like_other_pages() {
+        let mut app = blank_app();
+        sign_in(&mut app);
+        assert!(app.navigate("chats"));
+        assert_eq!(app.overlay, Overlay::Chats);
+        assert_eq!(app.page(), "chats");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["overlay"], "chats");
+        assert_eq!(v["page"], "chats");
+        assert_eq!(v["screen"], "home", "base screen survives under the overlay");
+        // Tapping the active Chats tile closes it back.
+        assert!(app.navigate("chats"));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
     fn page_state_carries_settings_fields() {
         let mut app = blank_app();
         sign_in(&mut app);
@@ -758,5 +875,80 @@ mod tests {
         assert!(v["email"].is_null());
         assert_eq!(v["keyReady"], true);
         assert!(v["notifications"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn display_name_flows_into_greeting_and_page_state() {
+        let mut app = blank_app();
+        sign_in(&mut app);
+        app.display_name = "Alex".into();
+        assert_eq!(app.display_name(), "Alex");
+        assert!(app.greeting().contains("Alex"));
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["userName"], "Alex");
+    }
+
+    #[test]
+    fn rename_reopens_name_step_without_trapping_chat() {
+        // The settings pencil forces the shared step even with a saved
+        // name; a live chat still never loses its box to the prompt.
+        let mut app = blank_app();
+        sign_in(&mut app);
+        app.display_name = "Alex".into();
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], false);
+        app.rename = true;
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], true);
+        app.rename = false; // answered (the save_name arm clears it)
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], false);
+        // A live chat still never loses its box to the prompt.
+        app.rename = true;
+        app.chat.push_history(Role::User, "hi".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], false);
+        assert_eq!(v["screen"], "chat");
+        // Signed out: no prompt even when forced (the pencil hides there).
+        let mut app = blank_app();
+        app.rename = true;
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], false);
+    }
+
+    #[test]
+    fn name_prompt_owns_home_until_answered() {
+        // Connected but nameless, nothing asked yet: needsName owns Home —
+        // the page shows the name box INSTEAD of the chat box, never both
+        // (mirrors SignIn owning the frame when signed out).
+        let mut app = blank_app();
+        sign_in(&mut app);
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], true);
+        // Answered: the chat box owns Home again.
+        app.display_name = "Alex".into();
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], false);
+        // A live chat never loses its box to the prompt (no trap).
+        let mut app = blank_app();
+        sign_in(&mut app);
+        app.chat.push_history(Role::User, "hi".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], false);
+        // Signed out: the sign-in screen owns the frame, no name prompt.
+        let app = blank_app();
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["screen"], "signin");
+        assert_eq!(v["needsName"], false);
     }
 }

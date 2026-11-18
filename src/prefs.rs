@@ -102,6 +102,82 @@ pub fn set_start_with_windows(on: bool) -> windows::core::Result<()> {
     }
 }
 
+// --- display name ("What should we call you?") ---
+// Plain text at %APPDATA%\notchbud\display_name.txt — not a credential,
+// so no DPAPI. Empty (no file) means "not asked yet".
+pub const DISPLAY_NAME_MAX: usize = 30;
+
+pub(crate) fn display_name_path() -> Option<std::path::PathBuf> {
+    notchbud::data_dir().map(|dir| dir.join("display_name.txt"))
+}
+
+/// Trimmed, control-char-free, capped at DISPLAY_NAME_MAX chars, with
+/// each word head capitalized ("ankit kumar" -> "Ankit Kumar"). The rest
+/// of each word passes through untouched, so "McDonald" survives intact.
+// Empty means "nothing to store" — callers ignore it.
+pub fn sanitize_display_name(raw: &str) -> String {
+    let clean = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(DISPLAY_NAME_MAX)
+        .collect::<String>();
+    capitalize_words(clean.trim())
+}
+
+/// First letter of every word in caps, everything else untouched.
+/// Words start after whitespace, hyphens, and apostrophes.
+fn capitalize_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut head = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            head = true;
+            out.push(ch);
+        } else if head && ch.is_alphabetic() {
+            // Uppercase the head only (some lowercases expand, e.g. ß->SS).
+            let mut up = ch.to_uppercase();
+            out.push(up.next().unwrap_or(ch));
+            out.extend(up);
+            head = false;
+        } else {
+            if ch == '-' || ch == '\'' || ch == '\u{2019}' {
+                head = true;
+            } else {
+                head = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn load_display_name() -> String {
+    let Some(path) = display_name_path() else {
+        return String::new();
+    };
+    let s = std::fs::read_to_string(&path).unwrap_or_default();
+    sanitize_display_name(&s)
+}
+
+/// Persist the name; returns what is stored (""). Empty input is a no-op
+/// that keeps whatever is on disk.
+pub fn save_display_name(raw: &str) -> String {
+    let clean = sanitize_display_name(raw);
+    if clean.is_empty() {
+        return String::new();
+    }
+    if let Some(path) = display_name_path() {
+        if std::fs::create_dir_all(path.parent().unwrap()).is_ok() {
+            let tmp = path.with_extension("txt.tmp");
+            if std::fs::write(&tmp, clean.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+    clean
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +197,20 @@ mod tests {
             inner.len() > 4 && (inner.as_bytes()[1] == b':' || inner.starts_with(r"\\")),
             "must be absolute: {cmd}"
         );
+    }
+
+    #[test]
+    fn display_name_sanitize_trims_caps_and_strips_controls() {
+        assert_eq!(sanitize_display_name("  Alex  "), "Alex");
+        assert_eq!(sanitize_display_name(""), "");
+        assert_eq!(sanitize_display_name("   "), "");
+        assert_eq!(sanitize_display_name("a\nb\tc"), "Abc");
+        assert_eq!(sanitize_display_name("ankit kumar"), "Ankit Kumar");
+        assert_eq!(sanitize_display_name("o'brien"), "O'Brien");
+        assert_eq!(sanitize_display_name("McDonald"), "McDonald");
+        assert_eq!(sanitize_display_name("anne-marie"), "Anne-Marie");
+        assert_eq!(sanitize_display_name(&"x".repeat(40)).len(), 30);
+        // (Deliberately NOT tested: save/load touch %APPDATA% — never
+        // touch the real profile from `cargo test`.)
     }
 }

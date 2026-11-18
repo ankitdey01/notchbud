@@ -11,7 +11,7 @@
 // Debug builds keep the console so the [notchbud] log lines stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use notchbud::{connector, island_web, render, state};
+use notchbud::{connector, island_web, render, sessions, state};
 
 mod prefs;
 mod tray;
@@ -70,10 +70,17 @@ const KEY_COPY: usize = 0x110000;
 const KEY_SELECT_ALL: usize = 0x110001;
 const KEY_CUT: usize = 0x110002;
 const KEY_PASTE: usize = 0x110003;
+// Arrow keys ride distinct non-Unicode codes so they never collide with
+// printable scalars: Left Arrow is U+0025 '%' (37) in Unicode, so sharing
+// 37-40 would mistype arrows as %&'( and eat real '%' input as caret motion.
+const KEY_LEFT: usize = 0x110010;
+const KEY_UP: usize = 0x110011;
+const KEY_RIGHT: usize = 0x110012;
+const KEY_DOWN: usize = 0x110013;
 // WM_CHAT wparam codes (lp carries a Box pointer where noted)
-const CHAT_DELTA: usize = 0; // *String
-const CHAT_DONE: usize = 1;
-const CHAT_ERROR: usize = 2; // *String
+const CHAT_DELTA: usize = 0; // *Box<(u32, String)> (turn gen, delta)
+const CHAT_DONE: usize = 1; // turn generation as LPARAM
+const CHAT_ERROR: usize = 2; // *Box<(u32, String)> (turn gen, error)
 const CHAT_CONNECTED: usize = 3; // *ApiKey
 const CHAT_MODEL: usize = 5; // *String (resolved model)
 const CHAT_SIGNED_OUT: usize = 6; // *String (terminal auth failure: clear creds)
@@ -82,10 +89,13 @@ const CHAT_SIGNED_OUT: usize = 6; // *String (terminal auth failure: clear creds
 const CHAT_VERIFY_OK: usize = 7; // *(u32, ApiKey)
 const CHAT_VERIFY_OUT: usize = 8; // *(u32, String) (terminal: key revoked)
 const CHAT_VERIFY_ERR: usize = 9; // *(u32, String) (transient: keep any live stream)
+// Groq-titled label for a session (session_id, title); stale ids are ignored.
+const CHAT_TITLE: usize = 10; // *Box<(String, String)>
 
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
 static CHAT_CANCEL: AtomicBool = AtomicBool::new(false); // island left mid-stream
 static VERIFY_GEN: AtomicU32 = AtomicU32::new(0); // startup key-check generation
+static TURN_GEN: AtomicU32 = AtomicU32::new(0); // chat turn generation
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0); // where the hook posts
 static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on quit)
 
@@ -211,7 +221,10 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         let ctrl_down = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
         let alt_down = GetAsyncKeyState(VK_MENU.0 as i32) < 0;
         // Island shortcuts work inside the page and never reach the app
-        // behind it. Other Ctrl/Alt chords still pass through.
+        // behind it. Every other Ctrl-only chord is swallowed too: the
+        // window never activates, so it would otherwise type into the app
+        // behind the island. (Alt chords still pass so Alt+Tab etc. work;
+        // Ctrl+Shift+Esc needs a mouse-leave first.)
         if ctrl_down && !alt_down {
             match kb.vkCode {
                 0x43 => {
@@ -230,15 +243,38 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     post(KEY_PASTE);
                     return LRESULT(1);
                 }
-                _ => {}
+                _ => {
+                    return LRESULT(1);
+                }
             }
         }
         // only plain typing: no Ctrl/Alt chords (shortcuts pass through)
         if !ctrl_down && !alt_down {
             let vk = kb.vkCode as u32;
+            // Arrows yield no text (ToUnicode finds nothing), so without an
+            // explicit code they fall through to the app behind the island
+            // and the caret never moves. They ride distinct non-Unicode
+            // codes (see KEY_LEFT): the page moves the caret for those,
+            // while '%' (37) stays a printable scalar.
             match vk {
+                37 => {
+                    post(KEY_LEFT);
+                    return LRESULT(1);
+                }
+                38 => {
+                    post(KEY_UP);
+                    return LRESULT(1);
+                }
+                39 => {
+                    post(KEY_RIGHT);
+                    return LRESULT(1);
+                }
+                40 => {
+                    post(KEY_DOWN);
+                    return LRESULT(1);
+                }
                 8 | 13 | 27 => {
-                    // VK_BACK VK_RETURN VK_ESCAPE
+                    // VK_BACK VK_RETURN VK_ESCAPE.
                     post(vk as usize);
                     return LRESULT(1);
                 }
@@ -250,8 +286,23 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     let n = ToUnicode(vk, kb.scanCode, Some(&st), &mut buf, 0);
                     // n > 0: produced text; n < 0: dead key — never eaten
                     if n > 0 {
-                        post(buf[0] as usize);
-                        return LRESULT(1);
+                        // Astral chars arrive as a surrogate pair: combine
+                        // to one scalar. A lone surrogate has no scalar
+                        // (JS fromCodePoint throws) — leave it to the app.
+                        let scalar = if n >= 2
+                            && (0xD800..=0xDBFF).contains(&buf[0])
+                            && (0xDC00..=0xDFFF).contains(&buf[1])
+                        {
+                            0x10000
+                                + ((buf[0] as u32 - 0xD800) << 10)
+                                + (buf[1] as u32 - 0xDC00)
+                        } else {
+                            buf[0] as u32
+                        };
+                        if !(0xD800..=0xDFFF).contains(&scalar) {
+                            post(scalar as usize);
+                            return LRESULT(1);
+                        }
                     }
                 }
             }
@@ -383,7 +434,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 handle_chat_msg(app, wparam, lparam);
                 LRESULT(0)
             } else if msg == WM_KEY {
-                handle_chat_key(app, wparam.0);
+                handle_chat_key(wparam.0);
                 LRESULT(0)
             } else if msg == island_web::WM_WEBMSG {
                 handle_webmsg(app, lparam);
@@ -425,20 +476,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// New chat turn (or stream cancel): invalidate every in-flight chat worker.
+/// Workers capture the generation and tag DELTA/DONE/ERROR with it; the
+/// handler drops anything no longer current so a stale worker can neither
+/// modify nor end a newer turn.
+fn bump_turn() -> u32 {
+    TURN_GEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
+
 /// Shared collapse path: hover-out, tray toggle, and the page's own
 /// mouseleave all land here.
 fn collapse(app: &mut state::App) {
     app.mouse_inside = false;
+    app.rename = false; // a rename step never survives leaving the island
     ISLAND_ACTIVE.store(false, Ordering::Release);
     app.expanded = false;
     // Next open starts on the base screen, never a stale overlay page.
     app.close_overlay();
-    // the island left mid-stream: default cancel — the partial
-    // stream is discarded silently
+    // the island left mid-stream: cancel the worker, but keep the partial
+    // reply as an assistant turn (a mouse slip must not eat the answer).
+    // The bump retires the worker: its late DELTA/DONE/ERROR is dropped by
+    // generation, never applied to the next turn.
     if app.chat.streaming {
         CHAT_CANCEL.store(true, Ordering::Release);
+        bump_turn();
         app.chat.streaming = false;
-        app.chat.stream.clear();
+        if !app.chat.stream.is_empty() {
+            let partial = std::mem::take(&mut app.chat.stream);
+            app.chat.push_history(state::Role::Assistant, partial);
+            archive_current(app);
+        }
     }
     // Fade the page instead of hiding it: destroying the live Chromium
     // surface mid-spring hitches DWM in the first frames of the shrink
@@ -498,7 +565,58 @@ fn handle_tray_menu(app: &mut state::App) {
 // chat handling
 // ---------------------------------------------------------------------------
 
+/// Archive the live turns into the local sessions list (newest first,
+/// capped, saved to sessions.json). No-op when there is nothing to keep.
+fn archive_current(app: &mut state::App) {
+    if app.chat.history.is_empty() {
+        return;
+    }
+    if app.session_id.trim().is_empty() {
+        app.session_id = sessions::new_id();
+    }
+    let snap = sessions::snapshot(&app.session_id, &app.session_title, &app.chat.history);
+    sessions::upsert(&mut app.sessions, snap);
+    sessions::save_sessions(&app.sessions);
+}
+
+/// Start a blank session (history cleared, fresh id). The previous turns
+/// must already be archived — this only resets the working copy.
+fn begin_session(app: &mut state::App) {
+    app.chat.history.clear();
+    app.chat.error = None;
+    app.chat.notice = None;
+    app.chat.streaming = false;
+    app.chat.stream.clear();
+    app.session_id = sessions::new_id();
+    app.session_title.clear();
+}
+
+/// Quietly retire a live stream (Back / open_session / collapse-out).
+/// A visible partial reply survives as an assistant turn (same as leaving
+/// the island mid-stream); the caller archives it. Clearing it here would
+/// eat the answer on Back / chat-switch.
+fn cancel_live_stream(app: &mut state::App) {
+    if app.chat.streaming {
+        CHAT_CANCEL.store(true, Ordering::Release);
+        bump_turn();
+        app.chat.streaming = false;
+        if !app.chat.stream.is_empty() {
+            let partial = std::mem::take(&mut app.chat.stream);
+            app.chat.push_history(state::Role::Assistant, partial);
+        }
+    }
+}
+
+/// One web intent string field. Missing/non-string reads as "".
+fn web_str(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn disconnect(app: &mut state::App) {
+    archive_current(app);
     connector::auth::delete_api_key();
     // A pending startup check must not resurrect creds or clobber this
     // state when it lands — invalidate its generation and drop the
@@ -511,7 +629,10 @@ fn disconnect(app: &mut state::App) {
     app.chat.streaming = false;
     app.chat.stream.clear();
     app.chat.history.clear();
+    app.session_id.clear();
+    app.session_title.clear();
     CHAT_CANCEL.store(true, Ordering::Release);
+    bump_turn(); // retire any live worker with the session
     app.chat.error = Some("Disconnected.".into());
     // Back to the base auth step (signin), never a stale settings page.
     app.close_overlay();
@@ -540,6 +661,9 @@ fn save_api_key(app: &mut state::App, raw_key: &str) {
     CHAT_CANCEL.store(false, Ordering::Release);
     push_web(app);
     let hwnd = app.hwnd.0 as isize;
+    // Tag the validation result with the current turn so a chat started
+    // meanwhile (which bumps the generation) isn't killed by its ERROR.
+    let vturn = TURN_GEN.load(Ordering::Relaxed);
     std::thread::spawn(move || unsafe {
         let hwnd_raw = HWND(hwnd as *mut _);
         let fail = |m: String| {
@@ -547,7 +671,7 @@ fn save_api_key(app: &mut state::App, raw_key: &str) {
                 Some(hwnd_raw),
                 WM_CHAT,
                 WPARAM(CHAT_ERROR),
-                LPARAM(Box::into_raw(Box::new(m)) as isize),
+                LPARAM(Box::into_raw(Box::new((vturn, m))) as isize),
             );
         };
         if let Err(e) = connector::auth::validate_api_key(&api_key.key) {
@@ -681,32 +805,33 @@ fn get_clipboard_text() -> Option<String> {
 }
 
 /// WM_KEY from the hook: the page owns editing, so forward printable keys
-/// and shortcuts straight into it. Paste injects via the hook path so it
-/// works without OS focus; everything else is browser-native.
-fn handle_chat_key(app: &mut state::App, code: usize) {
-    if code == KEY_COPY {
-        island_web::forward_shortcut("copy");
-        return;
-    }
-    if code == KEY_SELECT_ALL {
-        island_web::forward_shortcut("selectAll");
-        return;
-    }
-    if code == KEY_CUT {
-        island_web::forward_shortcut("cut");
+/// and shortcuts straight into it. Typing stays live while a stream runs
+/// (type-ahead: send still waits for DONE), so nothing typed is lost.
+fn handle_chat_key(code: usize) {
+    // Hook code -> page shortcut. Lookup, not a branch chain.
+    const KEY_SHORTCUTS: [(usize, &str); 3] = [
+        (KEY_COPY, "copy"),
+        (KEY_SELECT_ALL, "selectAll"),
+        (KEY_CUT, "cut"),
+    ];
+    if let Some((_, name)) = KEY_SHORTCUTS.iter().find(|(c, _)| *c == code) {
+        island_web::forward_shortcut(name);
         return;
     }
     if code == KEY_PASTE {
         paste_into_page();
         return;
     }
-    if app.chat.streaming {
-        return; // silent while a stream runs
-    }
     if code == VK_BACK.0 as usize
         || code == VK_RETURN.0 as usize
         || code == VK_ESCAPE.0 as usize
-        || (32..=0x10FFFF).contains(&code)
+        || code == KEY_LEFT
+        || code == KEY_UP
+        || code == KEY_RIGHT
+        || code == KEY_DOWN
+        // Printable scalars only: lone surrogates have no scalar value
+        // (JS String.fromCodePoint throws on them).
+        || ((32..=0x10FFFF).contains(&code) && !(0xD800..=0xDFFF).contains(&code))
     {
         island_web::forward_key(code)
     }
@@ -740,24 +865,119 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
     match v.get("type").and_then(|t| t.as_str()) {
         Some("open_keys") => open_url_in_browser(GROQ_KEYS_URL),
         Some("save_key") => {
-            let key = v.get("key").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let key = web_str(&v, "key");
             save_api_key(app, &key);
         }
         Some("signin") => {
             // New page posts save_key with the key; an old cached page may
             // post a bare signin — accept an optional key either way.
-            let key = v.get("key").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let key = web_str(&v, "key");
             if !key.trim().is_empty() {
                 save_api_key(app, &key);
             }
         }
         Some("cancel_signin") => {
-            // Validation is a short request; cancel just clears the flag.
+            // Cancel must also swallow the worker's late result: the
+            // CONNECTED/ERROR it already posted is ignored (signing_in
+            // gate / CHAT_CANCEL) instead of signing in anyway.
+            CHAT_CANCEL.store(true, Ordering::Release);
             app.chat.signing_in = false;
             app.chat.notice = None;
             push_web(app);
         }
+        Some("save_name") => {
+            // "What should we call you?" (Home prompt + Settings edit).
+            // Plain-text local profile, not key-bound: disconnects keep it.
+            let raw = web_str(&v, "name");
+            let clean = prefs::save_display_name(&raw);
+            if !clean.is_empty() {
+                app.display_name = clean;
+                app.rename = false;
+            }
+            push_web(app);
+        }
+        Some("edit_name") => {
+            // Settings pencil: reopen the shared name step on Home, even
+            // with a saved name. Signed-out or chatting intents are no-ops
+            // (the pencil hides there); leaving the island cancels it.
+            if app.chat.connected() && !app.chat.has_chatted() {
+                app.rename = true;
+                app.close_overlay();
+            }
+            push_web(app);
+        }
         Some("disconnect") => disconnect(app),
+        Some("new_chat") => {
+            // Back from /chat: archive the turns so the session survives,
+            // then reset the working copy to home. A live stream is
+            // cancelled quietly (same as leaving the island mid-stream).
+            cancel_live_stream(app);
+            archive_current(app);
+            begin_session(app);
+            app.close_overlay();
+            push_web(app);
+        },
+        Some("open_session") => {
+            // Chats page: jump back into a saved session. The live turns
+            // are archived first so nothing is lost. An unknown id is a
+            // no-op: it must not cancel the live stream or archive.
+            let id = web_str(&v, "id");
+            if id.trim().is_empty() {
+                return;
+            }
+            let Some(saved) = app.sessions.iter().find(|s| s.id == id).cloned() else {
+                return;
+            };
+            cancel_live_stream(app);
+            archive_current(app);
+            app.chat.history.clear();
+            for m in &saved.messages {
+                let role = if m.role == "assistant" {
+                    state::Role::Assistant
+                } else {
+                    state::Role::User
+                };
+                app.chat.push_history(role, m.text.clone());
+            }
+            app.session_id = saved.id;
+            app.session_title = saved.title;
+            app.chat.error = None;
+            app.chat.notice = None;
+            app.close_overlay();
+            push_web(app);
+        },
+        Some("ask_delete") => {
+            // Chats row trash: pop the confirm page for a stored session.
+            // Unknown ids are ignored — the confirm page is unreachable then.
+            let id = web_str(&v, "id");
+            if app.sessions.iter().any(|s| s.id == id) {
+                app.pending_delete = id;
+                app.overlay = state::Overlay::ConfirmDelete;
+                push_web(app);
+            }
+        },
+        Some("confirm_delete") => {
+            // Confirm Yes: drop the stored session for good, back to the
+            // list. When the deleted row is the live session, its working
+            // copy dies with it (no re-archive — that would resurrect it).
+            if !app.pending_delete.trim().is_empty() {
+                let doomed = app.pending_delete.clone();
+                sessions::remove(&mut app.sessions, &doomed);
+                sessions::save_sessions(&app.sessions);
+                if app.session_id == doomed {
+                    begin_session(app);
+                }
+                app.pending_delete.clear();
+            }
+            app.overlay = state::Overlay::Chats;
+            push_web(app);
+        },
+        Some("cancel_delete") => {
+            // Confirm No (or Esc): keep the session, back to the list.
+            app.pending_delete.clear();
+            app.overlay = state::Overlay::Chats;
+            push_web(app);
+        },
         Some("nav") => {
             let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("back");
             app.navigate(target);
@@ -768,7 +988,7 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
             push_web(app);
         }
         Some("submit") => {
-            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let text = web_str(&v, "text");
             submit_chat(app, &text);
         }
         Some("mouseleave") => {
@@ -805,12 +1025,29 @@ fn submit_chat(app: &mut state::App, raw: &str) {
     if app.chat.streaming {
         return;
     }
+    // First turn of a blank island starts a session id up front so the
+    // title worker can attach to it.
+    if app.session_id.trim().is_empty() {
+        app.session_id = sessions::new_id();
+    }
+    let session_id = app.session_id.clone();
     app.chat.push_history(state::Role::User, text);
+    // Archive the user turn immediately: Back mid-stream keeps the prompt.
+    archive_current(app);
+    let needs_title = app.session_title.trim().is_empty();
+    let first_user_text = app
+        .chat
+        .history
+        .iter()
+        .find(|(r, _)| *r == state::Role::User)
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default();
     app.chat.streaming = true;
     app.chat.stream.clear();
     app.chat.error = None;
     app.chat.notice = None;
     CHAT_CANCEL.store(false, Ordering::Release);
+    let turn = bump_turn(); // this worker owns the island until the next turn
     // A sent prompt owns the island — drop any overlay (menu/notifications/
     // settings) so the live stream shows on the chat page.
     app.close_overlay();
@@ -824,6 +1061,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         .map(|(role, text)| state::Msg { role: *role, text: text.clone() })
         .collect();
     let model = app.chat.model.clone();
+    let user_name = app.display_name.clone(); // frozen per turn, like history
     std::thread::spawn(move || unsafe {
         let hwnd = HWND(hwnd as *mut _);
         let mut current = match model {
@@ -856,7 +1094,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                                 Some(hwnd),
                                 WM_CHAT,
                                 WPARAM(CHAT_ERROR),
-                                LPARAM(Box::into_raw(Box::new(msg)) as isize),
+                                LPARAM(Box::into_raw(Box::new((turn, msg))) as isize),
                             );
                         }
                         return;
@@ -869,19 +1107,24 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                 Some(hwnd),
                 WM_CHAT,
                 WPARAM(CHAT_DELTA),
-                LPARAM(Box::into_raw(Box::new(d)) as isize),
+                LPARAM(Box::into_raw(Box::new((turn, d))) as isize),
             );
         };
         let cancelled = || CHAT_CANCEL.load(Ordering::Relaxed);
+        // The reply as it arrives: after Done this titles the session
+        // alongside the user's message (see the title call below).
+        let mut reply = String::new();
         // One retry: a project-blocked model (403) falls through to the
         // next catalog model instead of failing the turn.
         let mut retried = false;
         loop {
-            let result = connector::chat::stream_chat(&api_key.key, &current, &history, |ev| match ev {
+            let result = connector::chat::stream_chat(&api_key.key, &current, &user_name, &history, |ev| match ev {
                 connector::chat::StreamEvent::Delta(d) => {
                     if cancelled() {
                         false
                     } else {
+                        let d = connector::chat::strip_citation_markers(&d);
+                        reply.push_str(&d);
                         post_delta(d);
                         true
                     }
@@ -901,7 +1144,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                             Some(hwnd),
                             WM_CHAT,
                             WPARAM(CHAT_ERROR),
-                            LPARAM(Box::into_raw(Box::new(m)) as isize),
+                            LPARAM(Box::into_raw(Box::new((turn, m))) as isize),
                         );
                     }
                     false
@@ -909,7 +1152,35 @@ fn submit_chat(app: &mut state::App, raw: &str) {
             });
             match result {
                 Ok(()) => {
-                    let _ = PostMessageW(Some(hwnd), WM_CHAT, WPARAM(CHAT_DONE), LPARAM(0));
+                    let _ = PostMessageW(Some(hwnd), WM_CHAT, WPARAM(CHAT_DONE), LPARAM(turn as isize));
+                    // Separate title prompt, once per session, after the
+                    // reply lands: a short Groq label from BOTH sides of
+                    // the first exchange for the Chats list. Best-effort —
+                    // a failure just leaves the snippet fallback. A
+                    // cancelled turn never titles: its partial reply would
+                    // label the session from a cut-off answer.
+                    if needs_title && !cancelled() {
+                        // Re-strip the assembled reply: a citation split
+                        // across two deltas only completes here.
+                        let clean = connector::chat::strip_citation_markers(&reply);
+                        if let Some(title) = connector::chat::fetch_title(
+                            &api_key.key,
+                            &current,
+                            &first_user_text,
+                            &clean,
+                        )
+                        {
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_CHAT,
+                                WPARAM(CHAT_TITLE),
+                                LPARAM(
+                                    Box::into_raw(Box::new((session_id.clone(), title)))
+                                        as isize,
+                                ),
+                            );
+                        }
+                    }
                     break;
                 }
                 Err(m) if m == connector::chat::AUTH_REJECTED_MSG => {
@@ -942,7 +1213,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                                 Some(hwnd),
                                 WM_CHAT,
                                 WPARAM(CHAT_ERROR),
-                                LPARAM(Box::into_raw(Box::new(m)) as isize),
+                                LPARAM(Box::into_raw(Box::new((turn, m))) as isize),
                             );
                             break;
                         }
@@ -953,7 +1224,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                         Some(hwnd),
                         WM_CHAT,
                         WPARAM(CHAT_ERROR),
-                        LPARAM(Box::into_raw(Box::new(m)) as isize),
+                        LPARAM(Box::into_raw(Box::new((turn, m))) as isize),
                     );
                     break;
                 }
@@ -966,24 +1237,65 @@ fn submit_chat(app: &mut state::App, raw: &str) {
 fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
     match wparam.0 {
         CHAT_DELTA => {
-            let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
+            let (gen, s) = unsafe { *Box::from_raw(lparam.0 as *mut (u32, String)) };
+            if gen != TURN_GEN.load(Ordering::Relaxed) {
+                return; // stale worker — a newer turn owns the island
+            }
             if app.chat.streaming {
                 app.chat.stream.push_str(&s);
+                // Re-strip the whole buffer: a marker split across two deltas
+                // only completes here, and the slot shows this text live.
+                app.chat.stream = connector::chat::strip_citation_markers(&app.chat.stream);
                 push_web_throttled(app);
             }
         }
         CHAT_DONE => {
+            if lparam.0 as u32 != TURN_GEN.load(Ordering::Relaxed) {
+                return; // stale worker — must not end a newer turn
+            }
             if app.chat.streaming {
                 if !app.chat.stream.is_empty() {
                     let done = std::mem::take(&mut app.chat.stream);
                     app.chat.push_history(state::Role::Assistant, done);
                 }
                 app.chat.streaming = false;
+                archive_current(app);
                 push_web(app);
             }
         }
+        CHAT_TITLE => {
+            let b = unsafe { Box::from_raw(lparam.0 as *mut (String, String)) };
+            let (sid, title) = (&b.0, b.1.trim().to_owned());
+            if title.is_empty() {
+                return;
+            }
+            // Stale title (user started a new session meanwhile): attach it
+            // to the matching archived session instead of the live one.
+            // First title wins: a second request for the same session
+            // (fast follow-up turn before the first lands) must not
+            // overwrite it.
+            if app.session_id == *sid && app.session_title.trim().is_empty() {
+                app.session_title = title.clone();
+            }
+            if let Some(s) = app.sessions.iter_mut().find(|s| &s.id == sid) {
+                if s.title.trim().is_empty() {
+                    s.title = title.clone();
+                }
+            } else if app.session_id == *sid {
+                let snap =
+                    sessions::snapshot(&app.session_id, &app.session_title, &app.chat.history);
+                sessions::upsert(&mut app.sessions, snap);
+            } else {
+                return;
+            }
+            sessions::save_sessions(&app.sessions);
+            push_web(app);
+        }
         CHAT_ERROR => {
-            let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
+            let (gen, s) = unsafe { *Box::from_raw(lparam.0 as *mut (u32, String)) };
+            if gen != TURN_GEN.load(Ordering::Relaxed) {
+                return; // stale worker — must not fail a newer turn
+            }
             if !CHAT_CANCEL.load(Ordering::Relaxed) {
                 app.chat.streaming = false;
                 app.chat.stream.clear();
@@ -992,7 +1304,7 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
                 if s.as_str() == connector::chat::MODEL_UNAVAILABLE_MSG {
                     app.chat.model = None;
                 }
-                app.chat.error = Some(*s);
+                app.chat.error = Some(s);
                 // A failed key check must be retryable: drop the in-progress
                 // flag so the island falls back to the key prompt.
                 app.chat.signing_in = false;
@@ -1005,6 +1317,9 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
         }
         CHAT_CONNECTED => {
             let t = unsafe { Box::from_raw(lparam.0 as *mut connector::auth::ApiKey) };
+            if !app.chat.signing_in {
+                return; // stale (cancelled sign-in, later disconnect) — never resurrect
+            }
             app.chat.tokens = Some(*t);
             app.chat.signing_in = false;
             app.chat.notice = None;
@@ -1018,6 +1333,7 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             // can't resurrect these creds via the stale-result check.
             VERIFY_GEN.fetch_add(1, Ordering::Relaxed);
             let s = unsafe { Box::from_raw(lparam.0 as *mut String) };
+            archive_current(app);
             app.chat.tokens = None;
             app.chat.model = None;
             app.chat.streaming = false;
@@ -1050,6 +1366,7 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             // Current: this check ran on the saved key, so the rejection
             // deletes it here, not in the worker.
             connector::auth::delete_api_key();
+            archive_current(app);
             app.chat.tokens = None;
             app.chat.model = None;
             app.chat.streaming = false;
@@ -1209,6 +1526,8 @@ fn main() -> Result<()> {
         // --- App state ---
         let mut app = Box::new(state::App::new(hwnd, scale, width, height));
         app.chat.tokens = connector::auth::load_api_key(); // saved key, if any
+        app.display_name = prefs::load_display_name(); // saved name, if any
+        app.sessions = sessions::load_sessions(); // past chats, if any
         app.win_x = x;
         app.win_y = 0;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
@@ -1265,6 +1584,54 @@ mod tests {
         state::App::new(HWND(std::ptr::null_mut()), 1.0, 640, 190)
     }
 
+    /// One test at a time may point NOTCHBUD_DATA_DIR elsewhere: env vars
+    /// are process-global and tests run on parallel threads.
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points NOTCHBUD_DATA_DIR at a fresh temp dir for the test's lifetime,
+    /// holding the env lock so parallel tests can't interfere, and removes
+    /// the dir on drop. The real %APPDATA% profile is never touched.
+    struct TempDataDir {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dir: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TempDataDir {
+        fn set() -> Self {
+            // Tolerate a poisoned lock (a panicked test): dirs are unique
+            // per test, and set() always re-points the override.
+            let lock = TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("notchbud-test-{}-{n}", std::process::id());
+            // Prefer the OS temp dir; fall back to the repo target dir when
+            // writes outside the workspace are denied (sandboxed runs).
+            let ws_fallback =
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+            let dir = [std::env::temp_dir(), ws_fallback]
+                .into_iter()
+                .map(|b| b.join(&name))
+                .find_map(|d| std::fs::create_dir_all(&d).ok().map(|()| d))
+                .expect("no writable temp dir for tests");
+            let prev = std::env::var_os("NOTCHBUD_DATA_DIR");
+            std::env::set_var("NOTCHBUD_DATA_DIR", &dir);
+            TempDataDir { _lock: lock, dir, prev }
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("NOTCHBUD_DATA_DIR", v),
+                None => std::env::remove_var("NOTCHBUD_DATA_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[test]
     fn nav_intent_opens_settings() {
         let mut app = blank_app();
@@ -1273,6 +1640,114 @@ mod tests {
         // Toggling the active icon closes it back.
         handle_webmsg(&mut app, webmsg(r#"{"type":"nav","target":"settings"}"#));
         assert_eq!(app.overlay, state::Overlay::None);
+    }
+
+    #[test]
+    fn new_chat_archives_history_back_to_home() {
+        // Back from /chat: the turns archive into the local sessions list
+        // (Back no longer loses the session), then the working copy resets
+        // to home. A live stream is cancelled quietly.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.chat.tokens =
+            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.push_history(state::Role::User, "hi".into());
+        app.chat.streaming = true;
+        app.chat.stream = "half…".into();
+        assert_eq!(app.screen(), state::Screen::Chat);
+        handle_webmsg(&mut app, webmsg(r#"{"type":"new_chat"}"#));
+        assert!(app.chat.history.is_empty());
+        assert!(!app.chat.streaming);
+        assert!(app.chat.stream.is_empty());
+        assert_eq!(app.screen(), state::Screen::Home);
+        assert_eq!(app.sessions.len(), 1, "the turn must survive Back");
+    }
+
+    #[test]
+    fn open_session_restores_archived_turns() {
+        // Chats page: opening a session restores its turns into the working
+        // copy; the live turns archive first so nothing is lost.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.chat.tokens =
+            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.session_id = "live".into();
+        app.chat.push_history(state::Role::User, "live q".into());
+        app.sessions.push(sessions::Session {
+            id: "saved".into(),
+            title: "Saved Title".into(),
+            updated_ms: 1,
+            messages: vec![sessions::StoredTurn {
+                role: "user".into(),
+                text: "saved q".into(),
+            }],
+        });
+        handle_webmsg(&mut app, webmsg(r#"{"type":"open_session","id":"saved"}"#));
+        assert_eq!(app.chat.history.len(), 1);
+        assert_eq!(app.chat.history[0].1, "saved q");
+        assert_eq!(app.session_id, "saved");
+        assert_eq!(app.session_title, "Saved Title");
+        assert_eq!(app.sessions.len(), 2, "live turns archive alongside");
+        assert_eq!(app.screen(), state::Screen::Chat);
+    }
+
+    #[test]
+    fn delete_flow_asks_confirms_and_cancels() {
+        // Trash -> confirm page; Yes drops the session and returns to the
+        // list; No (or Esc) keeps it. Unknown ids never reach confirm.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        for id in ["s1", "s2"] {
+            app.sessions.push(sessions::Session {
+                id: id.into(),
+                title: format!("T{id}"),
+                updated_ms: 0,
+                messages: vec![],
+            });
+        }
+        handle_webmsg(&mut app, webmsg(r#"{"type":"ask_delete","id":"nope"}"#));
+        assert_eq!(app.overlay, state::Overlay::None);
+        assert!(app.pending_delete.is_empty());
+        handle_webmsg(&mut app, webmsg(r#"{"type":"ask_delete","id":"s1"}"#));
+        assert_eq!(app.overlay, state::Overlay::ConfirmDelete);
+        assert_eq!(app.pending_delete, "s1");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).expect("page_state must stay valid JSON");
+        assert_eq!(v["page"], "confirm");
+        assert_eq!(
+            v["deleteTitle"], "Ts1",
+            "confirm page must name the chat Yes would drop, got {v:?}"
+        );
+        handle_webmsg(&mut app, webmsg(r#"{"type":"cancel_delete"}"#));
+        assert_eq!(app.overlay, state::Overlay::Chats);
+        assert!(app.pending_delete.is_empty());
+        assert_eq!(app.sessions.len(), 2, "No must keep the session");
+        handle_webmsg(&mut app, webmsg(r#"{"type":"ask_delete","id":"s1"}"#));
+        handle_webmsg(&mut app, webmsg(r#"{"type":"confirm_delete"}"#));
+        assert_eq!(app.overlay, state::Overlay::Chats);
+        assert!(app.pending_delete.is_empty());
+        assert_eq!(
+            app.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["s2"],
+            "Yes must drop exactly the confirmed session"
+        );
+    }
+
+    #[test]
+    fn chat_title_attaches_to_live_and_archived_session() {
+        // The title arm saves the sessions file: isolate it in a temp dir.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.session_id = "s1".into();
+        app.chat
+            .push_history(state::Role::User, "plan a trip".into());
+        let msg = Box::into_raw(Box::new(("s1".to_owned(), "Trip Ideas".to_owned())));
+        // push_web is best-effort (no WebView on the test host: island_web
+        // guards on READY so it no-ops).
+        handle_chat_msg(&mut app, WPARAM(CHAT_TITLE), LPARAM(msg as isize));
+        assert_eq!(app.session_title, "Trip Ideas");
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].title, "Trip Ideas");
     }
 
     #[test]
@@ -1296,6 +1771,44 @@ mod tests {
     #[test]
     fn open_keys_points_at_groq_console() {
         assert_eq!(GROQ_KEYS_URL, "https://console.groq.com/keys");
+    }
+
+    #[test]
+    fn save_name_stores_trimmed_name_and_ignores_blank() {
+        // save_name persists the display-name file: isolate it in a temp dir.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        handle_webmsg(&mut app, webmsg(r#"{"type":"save_name","name":"  Alex  "}"#));
+        assert_eq!(app.display_name, "Alex");
+        assert!(app.greeting().contains("Alex"));
+        // Blank never clears an existing name.
+        handle_webmsg(&mut app, webmsg(r#"{"type":"save_name","name":"   "}"#));
+        assert_eq!(app.display_name, "Alex");
+        // Overlong input caps at the stored max.
+        let long = "x".repeat(40);
+        handle_webmsg(
+            &mut app,
+            webmsg(&format!(r#"{{"type":"save_name","name":"{long}"}}"#)),
+        );
+        assert_eq!(app.display_name.len(), crate::prefs::DISPLAY_NAME_MAX);
+        // edit_name (settings pencil) reopens the shared step: overlay
+        // drops, the prompt owns Home until save (or leave).
+        app.chat.tokens =
+            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.display_name = "Alex".into();
+        app.overlay = state::Overlay::Settings;
+        handle_webmsg(&mut app, webmsg(r#"{"type":"edit_name"}"#));
+        assert!(app.rename);
+        assert_eq!(app.overlay, state::Overlay::None);
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["needsName"], true);
+        handle_webmsg(&mut app, webmsg(r#"{"type":"save_name","name":"Bob"}"#));
+        assert!(!app.rename);
+        assert_eq!(app.display_name, "Bob");
+        // Signed out: a stale edit intent is a no-op.
+        let mut signed_out = blank_app();
+        handle_webmsg(&mut signed_out, webmsg(r#"{"type":"edit_name"}"#));
+        assert!(!signed_out.rename);
     }
 
     #[test]
@@ -1346,6 +1859,54 @@ mod tests {
         handle_chat_msg(&mut app, WPARAM(CHAT_VERIFY_OK), LPARAM(stale as isize));
         assert!(app.chat.tokens.is_none());
         assert_eq!(app.screen(), state::Screen::SignIn);
+    }
+
+    #[test]
+    fn stale_turn_messages_are_dropped() {
+        // A cancelled worker's late DELTA/DONE/ERROR must not touch the
+        // newer turn. The temp-dir guard also holds the env lock, so no
+        // parallel test can bump TURN_GEN mid-assert.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.chat.tokens =
+            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.streaming = true;
+        app.chat.stream = "new".into();
+        let cur = bump_turn();
+        let stale = cur.wrapping_sub(1);
+        handle_chat_msg(&mut app, WPARAM(CHAT_DONE), LPARAM(stale as isize));
+        assert!(app.chat.streaming, "stale DONE must not end the turn");
+        assert_eq!(app.chat.stream, "new");
+        let msg = Box::into_raw(Box::new((stale, "boom".to_owned())));
+        handle_chat_msg(&mut app, WPARAM(CHAT_ERROR), LPARAM(msg as isize));
+        assert!(app.chat.streaming, "stale ERROR must not fail the turn");
+        assert!(app.chat.error.is_none());
+        let msg = Box::into_raw(Box::new((stale, "old".to_owned())));
+        handle_chat_msg(&mut app, WPARAM(CHAT_DELTA), LPARAM(msg as isize));
+        assert_eq!(app.chat.stream, "new", "stale DELTA must not append");
+        handle_chat_msg(&mut app, WPARAM(CHAT_DONE), LPARAM(cur as isize));
+        assert!(!app.chat.streaming, "current DONE completes the turn");
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    #[test]
+    fn cancelled_signin_ignores_late_connected() {
+        // Cancel is real: a worker CONNECTED posted before the cancel lands
+        // while signing_in=false is dropped, never resurrecting creds.
+        let mut app = blank_app();
+        let msg = Box::into_raw(Box::new(
+            connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap(),
+        ));
+        handle_chat_msg(&mut app, WPARAM(CHAT_CONNECTED), LPARAM(msg as isize));
+        assert!(app.chat.tokens.is_none());
+        // A live sign-in still connects.
+        app.chat.signing_in = true;
+        let msg = Box::into_raw(Box::new(
+            connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap(),
+        ));
+        handle_chat_msg(&mut app, WPARAM(CHAT_CONNECTED), LPARAM(msg as isize));
+        assert!(app.chat.tokens.is_some());
+        assert!(!app.chat.signing_in);
     }
 
     #[test]

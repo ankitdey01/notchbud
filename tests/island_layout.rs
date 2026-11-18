@@ -1,6 +1,7 @@
 // island_layout.rs — contract tests for the island page layout.
 //
-// All three overlay pages (menu / notifications / settings) are headless:
+// All four overlay pages (menu / chats / notifications / settings) are
+// headless:
 // the highlighted topbar icon already says where you are, so no title ever
 // paints. Each page shows one dotted panel that FILLS everything between
 // the navbar and the island bottom (flex:1 + min-height:0) instead of
@@ -61,14 +62,15 @@ fn base_screens_center_via_auto_margins() {
     );
 }
 
-/// All three overlay pages are headless: the Menu / Notifications /
-// Settings heads stay in the DOM but must never paint — the active topbar
+/// All four overlay pages are headless: the Menu / Chats / Notifications /
+ // Settings heads stay in the DOM but must never paint — the active topbar
 // icon already says where you are.
 #[test]
 fn overlay_pages_are_headless() {
     let css = css();
     for sel in [
         "#screen-menu.page-head",
+        "#screen-chats.page-head",
         "#screen-notifications.page-head",
         "#screen-settings.page-head",
     ] {
@@ -88,6 +90,8 @@ fn overlay_pages_fill_with_dotted_panels() {
     let css = css();
     for (page, panel) in [
         ("menu", "#screen-menu.menugrid"),
+        ("chats-empty", "#chats-empty"),
+        ("chats-list", "#screen-chats#chats-list"),
         ("notifications-empty", "#notif-empty"),
         ("notifications-list", "#screen-notifications#notif-list"),
         ("settings", ".profile-card"),
@@ -123,6 +127,22 @@ fn menu_tiles_form_two_by_two_grid() {
     );
 }
 
+/// Button bounce must never rise above full size: the release leg (base
+/// .btn transition) is a plain ease-out, so letting go glides 0.93 -> 1
+/// with no overshoot kick. The springy dip lives only on :active.
+#[test]
+fn button_release_has_no_overshoot() {
+    let css = css();
+    assert!(
+        rule_has(&css, ".btn", "transform180msease-out;"),
+        "button release must ease out exactly to full size"
+    );
+    assert!(
+        !rule_has(&css, ".btn{", "cubic-bezier"),
+        "base button transition must not overshoot above full size"
+    );
+}
+
 /// Chat history must bottom-anchor with margin-top:auto on the first
 /// turn — never justify-content:flex-end, which lays overflowing turns
 /// out above the box where no scrollbar can reach them (early turns go
@@ -150,5 +170,81 @@ fn greeting_line_height_clears_descenders() {
     assert!(
         rule_has(&css, ".greet-title", "line-height:normal;"),
         "greeting line-height too tight — descenders clip under overflow:hidden"
+    );
+}
+
+/// The confirm-page chat name is single-line ellipsis gray text, so its
+/// line-height needs the same descender headroom as the greeting — a
+/// WebView2/Segoe `normal` box clips tails like the g in
+/// "Brief Greeting Interaction" under overflow:hidden.
+#[test]
+fn confirm_name_line_height_clears_descenders() {
+    let css = css();
+    assert!(
+        rule_has(&css, ".confirm-name", "line-height:1.4;"),
+        "confirm name line-height too tight — title tails clip under overflow:hidden"
+    );
+}
+
+/// First-run name prompt: the question "What should we call you?" is a
+/// big white line ABOVE the input — the input itself shows an example
+/// name, never the question.
+#[test]
+fn home_name_prompt_has_question_above_input() {
+    let html = ui_file("index.html");
+    let entry = html
+        .find("id=\"name-entry\"")
+        .and_then(|s| {
+            html[s..]
+                .find("id=\"home-ask\"")
+                .map(|e| html[s..s + e].to_string())
+        })
+        .expect("name-entry must sit before the home chat box");
+    let q = entry
+        .find("What should we call you?")
+        .expect("name question line missing from name-entry");
+    let input = entry
+        .find("id=\"home-name\"")
+        .expect("name input missing from name-entry");
+    assert!(
+        q < input,
+        "question must sit above the input, not inside it"
+    );
+    assert!(
+        entry.contains("placeholder=\"Galaxy Destroyer\""),
+        "name input must show an example name, not the question"
+    );
+    let css = css();
+    assert!(
+        rule_has(&css, ".name-q", "font-size:17px;"),
+        "name question must be big (17px like greeting/page titles)"
+    );
+    assert!(
+        rule_has(&css, ".name-q", "color:#fff;"),
+        "name question must be white"
+    );
+    assert!(
+        rule_has(&css, "#name-entry", "max-width:340px;"),
+        "name box must not span the island — capped like the signin key entry"
+    );
+}
+
+/// Chat owns every pixel for history: the back row floats over the feed
+/// instead of consuming a top strip — in a 140-unit island a 28px in-flow
+/// row is a whole lost line of history.
+#[test]
+fn chat_back_row_floats_off_the_layout() {
+    let css = css();
+    assert!(
+        rule_has(&css, "#screen-chat", "position:relative;"),
+        "chat section must anchor the floating back row"
+    );
+    assert!(
+        rule_has(&css, ".chatnav", "position:absolute;"),
+        "chat back row must float — an in-flow row is a black strip off the history"
+    );
+    assert!(
+        rule_has(&css, "#screen-chat.history", "padding-top:30px;"),
+        "history must start clear of the floating back button"
     );
 }

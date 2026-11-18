@@ -28,7 +28,7 @@
                     <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
                         <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.159 17.724a60 60 0 0 1-3.733-.297 1.587 1.587 0 0 1-1.33-2.08c.161-.485.324-.963.367-1.478l.355-4.26a7.207 7.207 0 0 1 14.365 0l.355 4.262c.043.515.206.993.367 1.479a1.587 1.587 0 0 1-1.33 2.077 60 60 0 0 1-3.732.297m-5.684 0q2.841.135 5.684 0m-5.684 0v.434a2.842 2.842 0 1 0 5.684 0v-.434" fill="none" />
                     </svg>
-                    <span class="dot" aria-hidden="true"></span>
+<!-- no unread dot: the notifications feed is hardcoded empty -->
                 </button>
                 <button id="nav-settings" class="iconbtn btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Settings" data-nav="settings" aria-pressed="false">
                     <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
@@ -56,7 +56,7 @@
 
         <!-- Home: signed in, nothing asked yet — greeting owns the top -->
         <section id="screen-home" class="screen" hidden>
-            <div class="greet">
+            <div id="home-greet" class="greet">
                 <span id="greet-icon" class="greet-tile" aria-hidden="true">
                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24">
                         <g clip-path="url(#greet-sun)">
@@ -74,7 +74,16 @@
                     <p id="home-status" class="greet-sub" hidden></p>
                 </div>
             </div>
-            <div class="askbox">
+            <div id="name-entry" hidden>
+                <label class="name-q" for="home-name">What should we call you?</label>
+                <div class="askbox">
+                    <input id="home-name" class="askinput" type="text" maxlength="30" placeholder="Galaxy Destroyer" autocomplete="off" spellcheck="false" />
+                    <button id="home-name-save" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Save name">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
+                    </button>
+                </div>
+            </div>
+            <div id="home-ask" class="askbox">
                 <span class="asklead" aria-hidden="true">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
                         <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.577 5.764c.46-.893.69-1.34.999-1.485a1 1 0 0 1 .848 0c.31.145.539.592.999 1.485l1.191 2.315c.08.154.12.232.171.3a1 1 0 0 0 .157.165c.065.055.14.098.291.186l2.386 1.387c.782.454 1.173.681 1.305.977a1 1 0 0 1 0 .812c-.132.296-.523.523-1.305.977l-2.386 1.387c-.15.088-.226.131-.291.186q-.088.073-.157.165c-.051.068-.091.146-.17.3l-1.192 2.315c-.46.893-.69 1.34-.999 1.485a1 1 0 0 1-.848 0c-.31-.145-.539-.592-.999-1.485l-1.191-2.315c-.08-.154-.12-.232-.171-.3a1 1 0 0 0-.157-.165 2 2 0 0 0-.291-.186l-2.386-1.387c-.782-.454-1.173-.681-1.305-.977a1 1 0 0 1 0-.812c.132-.296.523-.523 1.305-.977L6.767 8.73c.15-.088.226-.131.291-.186a1 1 0 0 0 .157-.165 2 2 0 0 0 .17-.3z" fill="none" />
@@ -83,16 +92,19 @@
                     </svg>
                 </span>
                 <input id="chat-input-home" class="askinput" type="text" maxlength="400" placeholder="Ask anything…" autocomplete="off" spellcheck="false" />
-                <button id="home-send" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Send">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24">
-                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.934 12 3.09 5.732c-.481-1.635 1.05-3.147 2.665-2.628a54 54 0 0 1 12.64 5.963C19.525 9.793 21 10.442 21 12s-1.474 2.207-2.605 2.933a54 54 0 0 1-12.64 5.963c-1.614.519-3.146-.993-2.665-2.628zm0 0h4.9" fill="none" />
-                    </svg>
+                <button id="home-send" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Send" disabled>
+                    <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
                 </button>
             </div>
         </section>
 
         <!-- Chat: history / live stream + pinned prompt -->
         <section id="screen-chat" class="screen" hidden>
+            <div class="chatnav">
+                <button id="chat-back" class="btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Back to home">
+                    <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.83 6a30.2 30.2 0 0 0-5.62 5.406A.95.95 0 0 0 4 12m5.83 6a30.2 30.2 0 0 1-5.62-5.406A.95.95 0 0 1 4 12m0 0h16" fill="none" /></svg>
+                </button>
+            </div>
             <p id="chat-status" class="status" hidden></p>
             <div id="history" class="history"></div>
             <div class="askbox">
@@ -104,10 +116,8 @@
                     </svg>
                 </span>
                 <input id="chat-input" class="askinput" type="text" maxlength="400" placeholder="Ask anything…" autocomplete="off" spellcheck="false" />
-                <button id="chat-send" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Send">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24">
-                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.934 12 3.09 5.732c-.481-1.635 1.05-3.147 2.665-2.628a54 54 0 0 1 12.64 5.963C19.525 9.793 21 10.442 21 12s-1.474 2.207-2.605 2.933a54 54 0 0 1-12.64 5.963c-1.614.519-3.146-.993-2.665-2.628zm0 0h4.9" fill="none" />
-                    </svg>
+                <button id="chat-send" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Send" disabled>
+                    <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
                 </button>
             </div>
         </section>
@@ -124,10 +134,10 @@
                         <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12.759c0-1.017 0-1.526.119-2.002a4 4 0 0 1 .513-1.19c.265-.414.634-.763 1.374-1.461l2.6-2.456c1.546-1.46 2.32-2.19 3.201-2.466a4 4 0 0 1 2.386 0c.882.275 1.655 1.006 3.201 2.466l2.6 2.456c.74.698 1.11 1.047 1.374 1.46a4 4 0 0 1 .513 1.191c.119.476.119.985.119 2.002v3.574c0 1.085 0 1.628-.12 2.073a3.5 3.5 0 0 1-2.474 2.475c-.445.119-.988.119-2.073.119-.31 0-.465 0-.592-.034a1 1 0 0 1-.707-.707C15 20.132 15 19.977 15 19.667V17c0-.465 0-.697-.03-.891a2.5 2.5 0 0 0-2.079-2.078C12.697 14 12.464 14 12 14s-.697 0-.891.03a2.5 2.5 0 0 0-2.079 2.08C9 16.303 9 16.535 9 17v2.667c0 .31 0 .465-.034.592a1 1 0 0 1-.707.707C8.132 21 7.977 21 7.667 21c-1.085 0-1.628 0-2.073-.12a3.5 3.5 0 0 1-2.475-2.474C3 17.96 3 17.418 3 16.333z" fill="none" /></svg>
                     <span>Home</span>
                 </button>
-                <button class="tile btn btn-ghost" type="button" data-nav="chat" aria-label="Go to Chat">
+                <button class="tile btn btn-ghost" type="button" data-nav="chats" aria-label="Go to Chats">
                     <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
                         <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h8m-8 4h4m9-2a9 9 0 0 1-10.272 8.91c-1.203-.17-1.805-.255-1.964-.267-.257-.02-.165-.016-.423-.014-.159 0-.34.014-.702.04l-2.153.153c-.857.062-1.286.092-1.607-.06a1.35 1.35 0 0 1-.641-.641c-.152-.32-.122-.75-.06-1.607l.153-2.153c.026-.362.04-.543.04-.702.002-.258.006-.166-.014-.423-.012-.159-.098-.76-.268-1.964A9 9 0 1 1 21 12Z" fill="none" /></svg>
-                    <span>Chat</span>
+                    <span>Chats</span>
                 </button>
                 <button class="tile btn btn-ghost" type="button" data-nav="notifications" aria-label="Go to Notifications">
                     <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
@@ -143,6 +153,46 @@
             </div>
             <button class="backlink btn btn-link" type="button" data-nav="back"><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24">
                     <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.83 6a30.2 30.2 0 0 0-5.62 5.406A.95.95 0 0 0 4 12m5.83 6a30.2 30.2 0 0 1-5.62-5.406A.95.95 0 0 1 4 12m0 0h16" fill="none" /></svg><span>Back</span></button>
+        </section>
+
+        <!-- Chats: linear list of local sessions (newest first) — title + last message -->
+        <section id="screen-chats" class="screen page" hidden>
+            <div class="page-head">
+                <h1 class="page-title">Chats</h1>
+                <p class="page-sub">Past conversations on this device</p>
+            </div>
+            <div id="chats-empty" class="empty">
+                <span class="empty-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" fill="none" viewBox="0 0 24 24">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" d="M8 10h8m-8 4h4m9-2a9 9 0 0 1-10.272 8.91c-1.203-.17-1.805-.255-1.964-.267-.257-.02-.165-.016-.423-.014-.159 0-.34.014-.702.04l-2.153.153c-.857.062-1.286.092-1.607-.06a1.35 1.35 0 0 1-.641-.641c-.152-.32-.122-.75-.06-1.607l.153-2.153c.026-.362.04-.543.04-.702.002-.258.006-.166-.014-.423-.012-.159-.098-.76-.268-1.964A9 9 0 1 1 21 12Z" fill="none" /></svg>
+                </span>
+                <div class="empty-text">
+                    <p class="empty-title">No saved chats yet</p>
+                    <p class="empty-sub">Ask anything &mdash; it will land here.</p>
+                </div>
+            </div>
+            <div id="chats-list" class="notif-list" hidden></div>
+            <button class="backlink btn btn-link" type="button" data-nav="back"><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24">
+                    <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.83 6a30.2 30.2 0 0 0-5.62 5.406A.95.95 0 0 0 4 12m5.83 6a30.2 30.2 0 0 1-5.62-5.406A.95.95 0 0 1 4 12m0 0h16" fill="none" /></svg><span>Back</span></button>
+        </section>
+
+        <!-- Delete confirmation: blank page over the chats list — big
+            question, the chat's title, Yes (red) / No (blue) below it. -->
+        <section id="screen-confirm" class="screen page" hidden>
+            <div class="confirm-wrap">
+                <p class="confirm-q">Are you sure you want to delete this chat?</p>
+                <p id="confirm-name" class="confirm-name"></p>
+                <div class="confirm-actions">
+                    <button id="confirm-yes" class="btn btn-destructive btn-md btn-pill" type="button">
+                        <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m8.5 12.513 2.341 2.338A15 15 0 0 1 15.4 9.915l.101-.069M21.15 12a9.15 9.15 0 1 1-18.3 0 9.15 9.15 0 0 1 18.3 0Z" fill="none" /></svg>
+                        <span>Yes</span>
+                    </button>
+                    <button id="confirm-no" class="btn btn-primary btn-md btn-pill" type="button">
+                        <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m9 15 3-3m0 0 3-3m-3 3L9 9m3 3 3 3m-3 6.15a9.15 9.15 0 1 1 0-18.3 9.15 9.15 0 0 1 0 18.3Z" fill="none" /></svg>
+                        <span>No</span>
+                    </button>
+                </div>
+            </div>
         </section>
 
         <!-- Notifications: hardcoded empty state until a dynamic feed lands -->
@@ -175,7 +225,12 @@
             <div class="profile-card">
                 <span id="settings-avatar" class="avatar" aria-hidden="true">?</span>
                 <div class="profile-text">
-                    <p id="settings-name" class="profile-name">—</p>
+                    <div class="profile-namerow">
+                        <p id="settings-name" class="profile-name">—</p>
+                        <button id="settings-name-edit" class="btn btn-ghost btn-circle" type="button" aria-label="Edit name">
+                            <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.066 18.315c.01-.377.014-.565.06-.742q.06-.237.19-.445c.096-.155.228-.288.494-.555l13.053-13.11a1.57 1.57 0 0 1 1.964-.212 6.3 6.3 0 0 1 1.932 1.965c.404.65.273 1.473-.258 2.006L7.528 20.252c-.275.277-.413.415-.574.514a1.6 1.6 0 0 1-.46.19c-.183.045-.378.044-.767.044L3 20.995z" fill="none" /></svg>
+                        </button>
+                    </div>
                     <p id="settings-email" class="profile-sub">Not signed in</p>
                     <p id="settings-plan" class="profile-plan">Groq: —</p>
                 </div>

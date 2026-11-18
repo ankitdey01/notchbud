@@ -17,3 +17,9 @@ Use Pikaicons for every icon in this project, and save these rules to AGENTS.md 
 - Use the component library from Coss for all UI needs (buttons, inputs, cards, modals, etc.)
 - Do not write custom component code when Coss has an equivalent
 - Check Coss documentation first before creating any new UI element
+
+## Island UI rules (learned the hard way)
+
+- The island is tiny: outer Win32 window 640x190 units (`WINDOW_UNITS_W/H` in `src/state.rs`), WebView2 content viewport ~420x140 (`ISLAND_W/H`). Always verify UI at real content size (Playwright viewport ~420x140 at 100% scaling), never a tall desktop viewport — anchoring/centering bugs only show at true height.
+- Single-line ellipsis text (`overflow: hidden` + `nowrap`) must keep `line-height: 1.4` or roomier — WebView2's Segoe UI clips descender tails (g, y, p) in tighter boxes. Pinned by `greeting_line_height_clears_descenders` / `confirm_name_line_height_clears_descenders`.
+- Chat bubbles hug their text: `width: fit-content` + a `max-width` cap, user right (`align-self: flex-end`), assistant left (`flex-start`) — never `stretch`, or a short "Ok" fills the whole row.

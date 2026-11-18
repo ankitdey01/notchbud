@@ -202,6 +202,10 @@ fn log_webview_event(line: &str) {
     eprintln!("[notchbud] {line}");
     let mut path = std::env::temp_dir();
     path.push("notchbud-webview.log");
+    // Cap the file: release builds append every launch with no rotation.
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 512 * 1024 {
+        let _ = std::fs::remove_file(&path);
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
         let _ = writeln!(f, "[notchbud] {line}");

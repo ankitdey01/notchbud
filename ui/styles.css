@@ -57,7 +57,9 @@
     cursor: pointer;
     user-select: none;
     -webkit-user-select: none;
-    transition: box-shadow 150ms ease-out;
+    /* Release leg: smooth ease-out back to exactly 1 — never overshoots
+       above full size. (The springy dip lives on :active below.) */
+    transition: box-shadow 150ms ease-out, transform 180ms ease-out;
 }
 
 .btn svg {
@@ -75,6 +77,10 @@
 
 .btn:active {
     filter: brightness(0.92);
+    transform: scale(0.93);
+    /* Press leg only: dips with a slight overshoot below 0.93, so the
+       whole bounce stays at/below the original position. */
+    transition: box-shadow 150ms ease-out, transform 120ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 .btn:focus-visible {
@@ -327,13 +333,44 @@ body {
     min-height: 0;
 }
 
-/* Chat owns its own layout (history flexes, ask box pins to the bottom). */
+/* Prompt sits a touch lower: pulls 4px into the shell's bottom air. */
+#screen-home .askbox {
+    margin-bottom: -4px;
+}
+
+/* Chat owns its own layout (back row on top, history flexes, ask box
+   pins to the bottom). No topbar here: prompt, chats, back only. */
 #screen-chat> :first-child {
     margin-top: 0;
 }
 
+/* Back row floats over the feed: an in-flow row here is a black strip
+   off a ~3-line history. The feed starts below it (padding-top) and the
+   button carries its own backdrop so text never shows through. */
+#screen-chat {
+    position: relative;
+}
+
+.chatnav {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 2;
+    display: flex;
+    justify-content: flex-start;
+}
+
+#chat-back {
+    background: rgba(28, 28, 30, 0.85);
+}
+
+#screen-chat .history {
+    padding-top: 30px;
+}
+
 #screen-chat> :last-child {
-    margin-bottom: 0;
+    /* Same bottom sit as Home's prompt: pulls 4px into the shell's air. */
+    margin-bottom: -4px;
 }
 
 .screen[hidden] {
@@ -453,6 +490,30 @@ body {
 
 /* ---------- ask box ---------- */
 
+/* First-run name step owns Home alone (mirrors signin): no navbar, no
+   greeting, no chat box — the question + input center like key entry. */
+#screen-home.name-only {
+    justify-content: center;
+    padding-top: 0;
+}
+
+#name-entry {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    max-width: 340px;
+    align-self: center;
+}
+
+/* First-run name prompt: big white question above the input. */
+.name-q {
+    font-size: 17px;
+    font-weight: 700;
+    color: #fff;
+    text-align: center;
+}
+
 .askbox {
     display: flex;
     align-items: center;
@@ -502,15 +563,19 @@ body {
     white-space: nowrap;
 }
 
-/* send buttons are .btn .btn-primary .btn-icon-sm .btn-circle;
-   only the paper-plane sends need the optical nudge — the up arrow stays centered */
+/* send buttons are .btn .btn-primary .btn-icon-sm .btn-circle (blue when
+   ready); empty or streaming rides disabled in flat gray. All four sends
+   are up arrows now, so no optical nudge — the arrow stays centered. */
 .send {
     flex: none;
 }
 
-#home-send svg,
-#chat-send svg {
-    margin-left: 2px;
+.send:disabled {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: transparent;
+    color: #8e8e93;
+    box-shadow: none;
+    opacity: 1;
 }
 
 .askinput:disabled {
@@ -555,10 +620,10 @@ body {
     display: flex;
     flex-direction: column;
     justify-content: flex-start;
-    gap: 4px;
+    gap: 10px;
     font-size: 14px;
     line-height: 1.45;
-    padding: 0 2px;
+    padding: 0 12px;
     scrollbar-width: thin;
     scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
 }
@@ -580,17 +645,43 @@ body {
 }
 
 .turn-user {
-    opacity: 0.95;
+    align-self: flex-end;
+    width: fit-content;
+    max-width: 85%;
+    background: var(--cb-primary);
+    color: #fff;
+    border-radius: 999px;
+    padding: 8px 14px;
+    font-size: 13.5px;
+    line-height: 1.4;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
 
 .turn-assistant {
+    align-self: flex-start;
+    width: fit-content;
+    max-width: 100%;
+    background: #1c1c1e;
+    color: #f2f2f7;
+    border-radius: 16px;
+    padding: 8px 14px;
+    font-size: 13.5px;
+    line-height: 1.4;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
 
 .turn-stream {
+    align-self: flex-start;
+    width: fit-content;
+    max-width: 100%;
+    background: #1c1c1e;
+    color: #f2f2f7;
+    border-radius: 16px;
+    padding: 8px 14px;
+    font-size: 13.5px;
+    line-height: 1.4;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
@@ -598,6 +689,31 @@ body {
 .turn-stream::after {
     content: "▏";
     animation: caret 1s steps(1) infinite;
+}
+
+/* Pre-reply state: shimmer text sweeping left to right, no bubble. The
+   bubble appears with the first arriving text (see renderChat). */
+.turn-thinking {
+    align-self: flex-start;
+    font-size: 13.5px;
+    font-weight: 600;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.25) 0%, #fff 50%, rgba(255, 255, 255, 0.25) 100%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.35));
+    animation: thinking-shimmer 1.4s linear infinite;
+}
+
+@keyframes thinking-shimmer {
+    from {
+        background-position: 200% 0;
+    }
+
+    to {
+        background-position: -200% 0;
+    }
 }
 
 @keyframes caret {
@@ -628,6 +744,7 @@ body {
    and a hidden box neither fills nor scrolls, so landing it there
    silently collapses the whole page (see tests/island_layout.rs). */
 #screen-menu .page-head,
+#screen-chats .page-head,
 #screen-notifications .page-head,
 #screen-settings .page-head {
     display: none;
@@ -639,7 +756,9 @@ body {
    .profile-card below with the same treatment.) */
 #screen-menu .menugrid,
 #screen-notifications #notif-empty,
-#screen-notifications #notif-list {
+#screen-notifications #notif-list,
+#screen-chats #chats-empty,
+#screen-chats #chats-list {
     flex: 1;
     min-height: 0;
     border-radius: 24px;
@@ -656,11 +775,13 @@ body {
    does the same). Settings keeps one row: the sign in/out pill lives
    inside the profile card instead of on its own row. */
 #screen-menu .page-sub,
+#screen-chats .page-sub,
 #screen-notifications .page-sub {
     display: none;
 }
 
 #screen-menu .backlink,
+#screen-chats .backlink,
 #screen-notifications .backlink,
 #screen-settings .backlink {
     display: none;
@@ -672,14 +793,10 @@ body {
 
 /* Equal air above the panel: top padding matches the island's bottom
    padding (12px), so the dotted border stops the same distance short of
-   the navbar as it does of the shell edge. */
+   the navbar as it does of the shell edge. The panel itself fills the rest. */
 #screen-menu,
-#screen-notifications {
-    padding-top: 12px;
-}
-
-/* Equal air above the settings panel: top padding matches the island's
-   bottom padding (12px). The panel itself fills the rest. */
+#screen-chats,
+#screen-notifications,
 #screen-settings {
     padding-top: 12px;
 }
@@ -709,9 +826,10 @@ body {
     flex: none;
 }
 
-/* Notifications empty state: one compact row (icon + stacked texts) so
-   the page ends well above the shell's bottom curve. */
-#notif-empty {
+/* Notifications + chats empty states: one compact row (icon + stacked
+   texts) so the page ends well above the shell's bottom curve. */
+#notif-empty,
+#chats-empty {
     flex-direction: row;
     align-items: center;
     text-align: left;
@@ -719,15 +837,119 @@ body {
     gap: 10px;
 }
 
-#notif-empty .empty-icon {
+#notif-empty .empty-icon,
+#chats-empty .empty-icon {
     flex: none;
     width: 32px;
     height: 32px;
 }
 
-#notif-empty .empty-icon svg {
+#notif-empty .empty-icon svg,
+#chats-empty .empty-icon svg {
     width: 18px;
     height: 18px;
+}
+
+/* Session rows: title + last message on the left, trash on the right. */
+.chat-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+}
+
+.chat-open {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1px;
+    border: none;
+    background: transparent;
+    padding: 0;
+    color: inherit;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.chat-row:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* Trash: white at rest, red on hover. */
+.chat-del {
+    flex: none;
+    color: #ececf1;
+}
+
+.chat-del:hover {
+    color: #ff5a52;
+    background: rgba(255, 90, 82, 0.12);
+}
+
+.chat-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chat-preview {
+    font-size: 12px;
+    font-weight: 400;
+    color: #9ca3af;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Delete confirmation: blank page — big question centered, the chat's
+   title under it, Yes (red) / No (blue) side by side below. */
+#screen-confirm .confirm-wrap {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    text-align: center;
+    padding: 12px;
+}
+
+.confirm-q {
+    font-size: 17px;
+    font-weight: 700;
+    color: #fff;
+    line-height: 1.3;
+    max-width: 340px;
+}
+
+.confirm-name {
+    font-size: 13px;
+    font-weight: 400;
+    color: #9ca3af;
+    /* Single-line ellipsis like the greeting: the line box must clear
+       descenders ("Brief Greeting Interaction" clips its g tail under
+       overflow:hidden on WebView2's Segoe UI without this headroom). */
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+}
+
+.confirm-actions {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    margin-top: 4px;
 }
 
 .empty-text {
@@ -921,6 +1143,26 @@ body {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+/* Rename affordance: name + small pencil ride one row, truncating as one. */
+.profile-namerow {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+}
+
+#settings-name-edit {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    color: #9ca3af;
+}
+
+#settings-name-edit svg {
+    width: 12px;
+    height: 12px;
 }
 
 .profile-sub {

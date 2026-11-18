@@ -23,6 +23,90 @@ pub const MODEL_UNAVAILABLE_MSG: &str = "This model is not available — trying 
 /// Everything chat sends is text; keep instructions plain.
 const INSTRUCTIONS: &str = "You are notchbud, the tiny assistant inside a notch island on the desktop. Answer in one or two short plain-text sentences — no markdown, no lists.";
 
+/// Separate title prompt: fired once per session, after the first reply
+/// lands, so the Chats page can label it. Sees both sides — the user's
+/// opening message and the assistant's reply — so the label reflects what
+/// the chat is actually about. Short on purpose: 3-5 words, title only.
+pub const TITLE_PROMPT: &str = "Create a short chat title of not more than 3 to 5 words for the conversation below. Reply with the title only, plain text, no quotes, no trailing punctuation.";
+
+fn title_agent() -> Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(20))
+        .user_agent(USER_AGENT)
+        .build()
+}
+
+/// Messages for the title call: both sides of the first exchange. Empty
+/// when there is nothing to title (the caller falls back to a snippet).
+/// A missing/blank reply titles from the user's message alone.
+fn title_messages(first_user_text: &str, assistant_reply: &str) -> Vec<Value> {
+    let user = first_user_text.trim();
+    if user.is_empty() {
+        return Vec::new();
+    }
+    let mut messages = vec![
+        json!({"role": "system", "content": TITLE_PROMPT}),
+        json!({"role": "user", "content": user}),
+    ];
+    let reply = assistant_reply.trim();
+    if !reply.is_empty() {
+        messages.push(json!({"role": "assistant", "content": reply}));
+    }
+    messages
+}
+
+/// One-shot non-streaming title for a session. `None` on any failure —
+/// the caller falls back to a local snippet so the list still labels.
+pub fn fetch_title(
+    api_key: &str,
+    model: &str,
+    first_user_text: &str,
+    assistant_reply: &str,
+) -> Option<String> {
+    let messages = title_messages(first_user_text, assistant_reply);
+    if messages.is_empty() {
+        return None;
+    }
+    let body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+    });
+    let resp = title_agent()
+        .post(GROQ_CHAT_URL)
+        .set("authorization", &format!("Bearer {}", api_key.trim()))
+        .set("accept", "application/json")
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(_) => return None,
+    };
+    if resp.status() != 200 {
+        return None;
+    }
+    let v: Value = resp.into_string().ok().and_then(|s| serde_json::from_str(&s).ok())?;
+    let raw = v["choices"][0]["message"]["content"].as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // First line only, strip wrapping quotes, clamp to 8 words / 60 chars.
+    let line = raw.lines().next().unwrap_or("").trim();
+    let line = line.trim_matches(|c| c == '"' || c == '\'' || c == '`').trim();
+    if line.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = line.split_whitespace().take(8).collect();
+    let mut out = words.join(" ");
+    out = out.trim_matches(|c: char| c == '.' || c == '!' || c == '?' || c == '"' || c == '\'').trim().to_owned();
+    if out.chars().count() > 60 {
+        out = out.chars().take(60).collect();
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Role {
     User,
@@ -34,6 +118,14 @@ impl Role {
         match self {
             Role::User => 0,
             Role::Assistant => 1,
+        }
+    }
+    /// Wire string for history JSON and the chat body ("user"/"assistant").
+    /// Single source so `ui_state` and `chat_body` can't drift apart.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
         }
     }
     pub fn from_code(c: u8) -> Option<Role> {
@@ -65,22 +157,53 @@ fn chat_agent() -> Agent {
         .build()
 }
 
+/// Models with Groq's hosted web search (built-in `browser_search` tool,
+/// https://console.groq.com/docs/tool-use/built-in-tools/browser-search).
+/// The whole agentic loop runs server-side: the model searches when the
+/// question needs current/external facts, then the final answer streams
+/// back like a plain turn. Anything else chats exactly as before.
+fn supports_browser_search(model: &str) -> bool {
+    matches!(
+        model.trim(),
+        "openai/gpt-oss-20b" | "openai/gpt-oss-120b"
+    )
+}
+
 /// The Groq chat body: system instructions + short history, streamed.
-/// Nothing stored server-side; the whole context rides every request.
-pub fn chat_body(model: &str, history: &[Msg]) -> Value {
+/// The saved display name rides the system prompt when set, so the model
+/// knows who it is talking to. Nothing stored server-side; the whole
+/// context rides every request.
+pub fn chat_body(model: &str, user_name: &str, history: &[Msg]) -> Value {
+    let user_name = user_name.trim();
+    let mut instructions = INSTRUCTIONS.to_owned();
+    if supports_browser_search(model) {
+        instructions.push_str(" You have the browser_search tool; use it when the answer needs current or external facts.");
+    }
+    instructions.push_str(&format!(
+        " The current local date and time is {}.",
+        crate::user::local_now_text()
+    ));
+    if !user_name.is_empty() {
+        instructions.push_str(&format!(" The user's name is {user_name}."));
+    }
     let mut messages = Vec::with_capacity(history.len() + 1);
-    messages.push(json!({"role": "system", "content": INSTRUCTIONS}));
+    messages.push(json!({"role": "system", "content": instructions}));
     for m in history {
         messages.push(json!({
-            "role": match m.role { Role::User => "user", Role::Assistant => "assistant" },
+            "role": m.role.as_str(),
             "content": m.text,
         }));
     }
-    json!({
+    let mut body = json!({
         "model": model,
         "messages": messages,
         "stream": true,
-    })
+    });
+    if supports_browser_search(model) {
+        body["tools"] = json!([{"type": "browser_search"}]);
+        body["tool_choice"] = json!("auto");
+    }
+    body
 }
 
 /// One `data:` line of the OpenAI-compatible SSE stream.
@@ -101,30 +224,74 @@ fn decode_event(v: &Value) -> Option<StreamEvent> {
             return Some(StreamEvent::Delta(content.to_owned()));
         }
     }
-    match choice["finish_reason"].as_str() {
-        // A finish reason alone never completes the turn: only `data:
-        // [DONE]` does. Treating "stop"/"length" as Done masks a cut-off
-        // stream (EOF without [DONE]) as success.
-        Some("stop") | Some("length") => None,
-        _ => None,
+    // A finish reason alone never completes the turn: only `data:
+    // [DONE]` does. Treating "stop"/"length" as Done masks a cut-off
+    // stream (EOF without [DONE]) as success.
+    None
+}
+
+/// Groq's hosted web search answers carry Exa-style citations (`【2†L26-L30】`).
+/// The island slot is one or two plain-text sentences with no footnote UI,
+/// so they render as junk glyphs — drop citation spans on ingest and keep
+/// the sentence intact. Only spans whose contents hold the citation dagger
+/// (`†`) go; ordinary bracketed text such as 【設定】 survives. An
+/// unterminated `【` (marker split across stream chunks) is kept until its
+/// `】` arrives, then the whole span goes if it cites.
+pub fn strip_citation_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('【') {
+        match rest[start..].find('】') {
+            Some(end) => {
+                let close = start + end + '】'.len_utf8();
+                // Citation spans carry † (e.g. 【2†L26-L30】); anything
+                // else is ordinary bracketed text and stays.
+                if rest[start..close].contains('†') {
+                    out.push_str(&rest[..start]);
+                    rest = &rest[close..];
+                } else {
+                    out.push_str(&rest[..close]);
+                    rest = &rest[close..];
+                }
+            }
+            None => {
+                // Unterminated tail (marker split across stream chunks):
+                // keep it whole; it drops on a later pass once `】`
+                // arrives and only if it cites.
+                out.push_str(rest);
+                rest = "";
+            }
+        }
     }
+    out.push_str(rest);
+    out
 }
 
 /// Friendly lines for the slot: quota / invalid key / offline.
 fn user_error(raw: &str) -> String {
     let low = raw.to_ascii_lowercase();
-    if low.contains("invalid_api_key") || low.contains("invalid api key") || low.contains("incorrect api key") || low.contains("unauthorized") || low.contains("invalid_token") {
+    let has_any = |needles: &[&str]| needles.iter().any(|n| low.contains(n));
+    if has_any(&[
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "unauthorized",
+        "invalid_token",
+    ]) {
         AUTH_REJECTED_MSG.into()
-    } else if low.contains("usage not included")
-        || low.contains("usage_limit")
-        || low.contains("rate limit")
-        || low.contains("rate_limit")
-        || low.contains("quota")
-        || low.contains("limit reached")
-        || low.contains("tokens per")
-    {
+    } else if has_any(&[
+        "usage not included",
+        "usage_limit",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "limit reached",
+        "tokens per",
+    ]) {
         "Groq limit reached for now. Try again later.".into()
-    } else if low.contains("model") && (low.contains("not") || low.contains("decommissioned") || low.contains("not found")) {
+    } else if low.contains("model")
+        && has_any(&["not", "decommissioned", "not found"])
+    {
         MODEL_UNAVAILABLE_MSG.into()
     } else {
         // Truncate long provider text; ellipsis marks the cut.
@@ -143,6 +310,7 @@ fn user_error(raw: &str) -> String {
 pub fn stream_chat(
     api_key: &str,
     model: &str,
+    user_name: &str,
     history: &[Msg],
     on: impl FnMut(StreamEvent) -> bool,
 ) -> Result<(), String> {
@@ -152,7 +320,7 @@ pub fn stream_chat(
         .set("authorization", &format!("Bearer {}", api_key.trim()))
         .set("accept", "text/event-stream")
         .set("content-type", "application/json");
-    let resp = match req.send_string(&chat_body(model, history).to_string()) {
+    let resp = match req.send_string(&chat_body(model, user_name, history).to_string()) {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
         Err(_) => return Err("offline — can't reach Groq".to_owned()),
@@ -250,6 +418,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn title_messages_pairs_user_and_reply() {
+        let m = title_messages("plan a trip", "Sure — Kyoto in spring.");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1]["role"], "user");
+        assert_eq!(m[1]["content"], "plan a trip");
+        assert_eq!(m[2]["role"], "assistant");
+        assert!(m[2]["content"].as_str().unwrap().contains("Kyoto"));
+    }
+
+    #[test]
+    fn title_messages_user_only_without_reply() {
+        // A Done with no deltas still titles from the user's message.
+        let m = title_messages("plan a trip", "   ");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[1]["role"], "user");
+    }
+
+    #[test]
+    fn title_messages_empty_without_user_text() {
+        assert!(title_messages("  ", "some reply").is_empty());
+    }
+
+    #[test]
     fn sse_events_decode() {
         assert_eq!(
             decode_event(
@@ -290,6 +481,7 @@ mod tests {
     fn chat_body_shape() {
         let body = chat_body(
             "openai/gpt-oss-20b",
+            "Alex",
             &[
                 Msg {
                     role: Role::User,
@@ -304,11 +496,79 @@ mod tests {
         assert_eq!(body["model"], "openai/gpt-oss-20b");
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "system");
-        assert!(body["messages"][0]["content"].as_str().unwrap().contains("notchbud"));
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.contains("notchbud"));
+        assert!(
+            sys.contains("Alex"),
+            "the model must know who it is talking to, got: {sys}"
+        );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "hi");
         assert_eq!(body["messages"][2]["role"], "assistant");
         assert_eq!(body["messages"][2]["content"], "hey");
+    }
+
+    #[test]
+    fn chat_body_without_name_sends_base_instructions() {
+        let body = chat_body(
+            "llama-3.3-70b-versatile",
+            "",
+            &[Msg {
+                role: Role::User,
+                text: "hi".into(),
+            }],
+        );
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !sys.contains("name"),
+            "nameless users send the base instructions, nothing else, got: {sys}"
+        );
+        assert!(
+            body.get("tools").is_none(),
+            "unsupported models chat exactly as before, no tools attached"
+        );
+    }
+
+    #[test]
+    fn chat_body_attaches_browser_search_for_supported_models() {
+        for model in ["openai/gpt-oss-20b", "openai/gpt-oss-120b"] {
+            let body = chat_body(
+                model,
+                "",
+                &[Msg {
+                    role: Role::User,
+                    text: "who won yesterday?".into(),
+                }],
+            );
+            assert_eq!(body["tools"], json!([{"type": "browser_search"}]));
+            assert_eq!(body["tool_choice"], "auto");
+            let sys = body["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                sys.contains("browser_search"),
+                "the model must know search is available, got: {sys}"
+            );
+            assert!(
+                sys.contains("local date and time is") && sys.contains("local time"),
+                "every turn carries the local clock, got: {sys}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_citation_markers_drops_exa_footnotes() {
+        assert_eq!(
+            strip_citation_markers("Paris is the capital of France.【2†L26-L30】"),
+            "Paris is the capital of France."
+        );
+        assert_eq!(
+            strip_citation_markers("A【1†L1-L2】 mid【3†L4】 sentence."),
+            "A mid sentence."
+        );
+        assert_eq!(strip_citation_markers("No markers here."), "No markers here.");
+        // Ordinary bracketed text is not a citation and survives.
+        assert_eq!(strip_citation_markers("設定【設定】done"), "設定【設定】done");
+        // Unterminated marker (split stream chunk) survives until closed.
+        assert_eq!(strip_citation_markers("Hi 【2†L2"), "Hi 【2†L2");
     }
 
     #[test]
