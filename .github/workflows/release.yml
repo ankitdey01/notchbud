@@ -18,9 +18,9 @@ jobs:
           $tagVer = "${{ github.ref_name }}".TrimStart("v")
           if ($tagVer -ne $cargoVer) { Write-Error "Tag v$tagVer does not match Cargo.toml $cargoVer"; exit 1 }
 
-      - run: cargo test --locked
+      - run: cargo test
 
-      - run: cargo build --release --locked
+      - run: cargo build --release
 
       - name: Sync installer version + build setup
         shell: pwsh
