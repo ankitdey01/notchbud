@@ -1,0 +1,38 @@
+name: Release
+on:
+  push:
+    tags: ["v*.*.*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Tag must match Cargo.toml
+        shell: pwsh
+        run: |
+          $cargoVer = (Get-Content Cargo.toml | Select-String '^version\s*=\s*"([^"]+)"' | ForEach-Object { $_.Matches.Groups[1].Value } | Select-Object -First 1)
+          $tagVer = "${{ github.ref_name }}".TrimStart("v")
+          if ($tagVer -ne $cargoVer) { Write-Error "Tag v$tagVer does not match Cargo.toml $cargoVer"; exit 1 }
+
+      - run: cargo test --locked
+
+      - run: cargo build --release --locked
+
+      - name: Sync installer version + build setup
+        shell: pwsh
+        run: |
+          $cargoVer = (Get-Content Cargo.toml | Select-String '^version\s*=\s*"([^"]+)"' | ForEach-Object { $_.Matches.Groups[1].Value } | Select-Object -First 1)
+          (Get-Content installer/notchbud.iss) -replace '#define MyAppVersion ".*"', "#define MyAppVersion `"$cargoVer`"" | Set-Content installer/notchbud.iss
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/notchbud.iss
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            target/release/notchbud.exe
+            installer/Output/*.exe
