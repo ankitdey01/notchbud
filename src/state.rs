@@ -286,7 +286,7 @@ pub struct Chat {
     /// Assistant text currently arriving.
     pub stream: String,
     /// Finished turns, oldest first.
-    pub history: Vec<(Role, String)>,
+    pub history: Vec<(Role, String, Option<String>)>,
     pub streaming: bool,
     /// Browser sign-in in progress (tray Connect clicked).
     pub signing_in: bool,
@@ -316,10 +316,18 @@ impl Chat {
     }
 
     pub fn push_history(&mut self, role: Role, text: String) {
+        self.push_history_image(role, text, String::new())
+    }
+
+    /// Push a user turn with its screenshot thumbnail: renders above the
+    /// bubble (see renderChat). The full-size image is never stored —
+    /// history keeps the cheap thumb only.
+    pub fn push_history_image(&mut self, role: Role, text: String, thumb: String) {
         if self.history.len() >= HISTORY_MAX {
             self.history.remove(0);
         }
-        self.history.push((role, text));
+        let thumb = (!thumb.trim().is_empty()).then(|| thumb);
+        self.history.push((role, text, thumb));
     }
 
     /// True once a conversation owns the island: finished turns, a live
@@ -357,10 +365,11 @@ impl Chat {
         let history: Vec<serde_json::Value> = self
             .history
             .iter()
-            .map(|(role, text)| {
+            .map(|(role, text, image)| {
                 serde_json::json!({
                     "role": role.as_str(),
                     "text": text,
+                    "image": image,
                 })
             })
             .collect();
@@ -413,6 +422,13 @@ pub struct App {
     /// the confirm page, cleared on Yes/No). Only valid while the overlay
     /// is ConfirmDelete — the confirm page is unreachable otherwise.
     pub pending_delete: String,
+    /// Camera screenshot awaiting send (full PNG data URL). Set by the
+    /// take_shot intent, attached to the next submit, then cleared. Never
+    /// archived (see the shortcut note in shot.rs).
+    pub pending_image: String,
+    /// Display thumb for the pending shot: previews in the pill, then
+    /// rides the history turn (history keeps the cheap thumb only).
+    pub pending_thumb: String,
 
     // geometry snapshot refreshed each frame (NCHITTEST hit surface)
     pub bar_area: [f32; 4],
@@ -450,6 +466,8 @@ impl App {
             session_id: String::new(),
             session_title: String::new(),
             pending_delete: String::new(),
+            pending_image: String::new(),
+            pending_thumb: String::new(),
             bar_area: [0.0; 4],
             rgn_area: [0.0; 4],
             win_x: 0,
@@ -574,6 +592,12 @@ impl App {
             .collect();
         v["sessions"] = serde_json::json!(sessions);
         v["currentId"] = serde_json::json!(self.session_id);
+        // Camera preview: the thumb data URL when a shot is attached, else null.
+        v["pendingImage"] = if self.pending_thumb.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(self.pending_thumb)
+        };
         // Confirm page: which stored chat the Yes button would delete.
         v["deleteTitle"] = serde_json::json!(
             self.sessions
@@ -682,6 +706,19 @@ mod tests {
         app.chat.tokens = Some(crate::connector::auth::ApiKey {
             key: "gsk_test1234567890abcdef".into(),
         });
+    }
+
+    #[test]
+    fn shot_thumb_rides_its_history_turn() {
+        // The thumbnail a screenshot turn leaves behind renders above its
+        // bubble; plain turns carry null so the page renders text only.
+        let mut app = blank_app();
+        app.chat.push_history(Role::User, "plain".into());
+        app.chat
+            .push_history_image(Role::User, "look".into(), "data:image/png;base64,AAA".into());
+        let v = app.chat.ui_state("Hi");
+        assert!(v["history"][0]["image"].is_null());
+        assert_eq!(v["history"][1]["image"], "data:image/png;base64,AAA");
     }
 
     #[test]

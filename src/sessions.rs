@@ -150,15 +150,16 @@ pub fn remove(sessions: &mut Vec<Session>, id: &str) -> bool {
     sessions.len() != before
 }
 
-/// Build a Session snapshot from the live chat turns.
-pub fn snapshot(id: &str, title: &str, history: &[(Role, String)]) -> Session {
+/// Build a Session snapshot from the live chat turns (text only — a
+/// turn's thumbnail never lands on disk).
+pub fn snapshot(id: &str, title: &str, history: &[(Role, String, Option<String>)]) -> Session {
     Session {
         id: id.to_owned(),
         title: title.to_owned(),
         updated_ms: now_ms(),
         messages: history
             .iter()
-            .map(|(role, text)| StoredTurn {
+            .map(|(role, text, _)| StoredTurn {
                 role: role.as_str().to_owned(),
                 text: text.clone(),
             })

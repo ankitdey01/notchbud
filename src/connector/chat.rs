@@ -172,8 +172,15 @@ fn supports_browser_search(model: &str) -> bool {
 /// The Groq chat body: system instructions + short history, streamed.
 /// The saved display name rides the system prompt when set, so the model
 /// knows who it is talking to. Nothing stored server-side; the whole
-/// context rides every request.
-pub fn chat_body(model: &str, user_name: &str, history: &[Msg]) -> Value {
+/// context rides every request. `image` (a PNG data URL from the camera
+/// button) attaches to the latest user turn as an image_url part and is
+/// strictly one-shot — history itself stays text-only.
+pub fn chat_body(
+    model: &str,
+    user_name: &str,
+    history: &[Msg],
+    image: Option<&str>,
+) -> Value {
     let user_name = user_name.trim();
     let mut instructions = INSTRUCTIONS.to_owned();
     if supports_browser_search(model) {
@@ -186,9 +193,29 @@ pub fn chat_body(model: &str, user_name: &str, history: &[Msg]) -> Value {
     if !user_name.is_empty() {
         instructions.push_str(&format!(" The user's name is {user_name}."));
     }
+    // The camera shot rides the latest user turn only: text plus an
+    // image_url part. Older turns stay plain text.
+    let shot: Option<(usize, &str)> = image.filter(|s| !s.trim().is_empty()).and_then(|url| {
+        history
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .map(|i| (i, url))
+    });
     let mut messages = Vec::with_capacity(history.len() + 1);
     messages.push(json!({"role": "system", "content": instructions}));
-    for m in history {
+    for (i, m) in history.iter().enumerate() {
+        if let Some((at, url)) = shot {
+            if i == at {
+                messages.push(json!({
+                    "role": m.role.as_str(),
+                    "content": [
+                        {"type": "text", "text": m.text},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                }));
+                continue;
+            }
+        }
         messages.push(json!({
             "role": m.role.as_str(),
             "content": m.text,
@@ -267,7 +294,7 @@ pub fn strip_citation_markers(text: &str) -> String {
     out
 }
 
-/// Friendly lines for the slot: quota / invalid key / offline.
+/// Friendly lines for the slot: quota / invalid key / unreachable.
 fn user_error(raw: &str) -> String {
     let low = raw.to_ascii_lowercase();
     let has_any = |needles: &[&str]| needles.iter().any(|n| low.contains(n));
@@ -312,6 +339,7 @@ pub fn stream_chat(
     model: &str,
     user_name: &str,
     history: &[Msg],
+    image: Option<&str>,
     on: impl FnMut(StreamEvent) -> bool,
 ) -> Result<(), String> {
     let agent = chat_agent();
@@ -320,10 +348,10 @@ pub fn stream_chat(
         .set("authorization", &format!("Bearer {}", api_key.trim()))
         .set("accept", "text/event-stream")
         .set("content-type", "application/json");
-    let resp = match req.send_string(&chat_body(model, user_name, history).to_string()) {
+    let resp = match req.send_string(&chat_body(model, user_name, history, image).to_string()) {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(_) => return Err("offline — can't reach Groq".to_owned()),
+        Err(_) => return Err("Couldn't reach Groq. Try again.".to_owned()),
     };
     if resp.status() == 401 {
         return Err(AUTH_REJECTED_MSG.to_owned());
@@ -492,6 +520,7 @@ mod tests {
                     text: "hey".into(),
                 },
             ],
+            None,
         );
         assert_eq!(body["model"], "openai/gpt-oss-20b");
         assert_eq!(body["stream"], true);
@@ -517,6 +546,7 @@ mod tests {
                 role: Role::User,
                 text: "hi".into(),
             }],
+            None,
         );
         let sys = body["messages"][0]["content"].as_str().unwrap();
         assert!(
@@ -539,6 +569,7 @@ mod tests {
                     role: Role::User,
                     text: "who won yesterday?".into(),
                 }],
+                None,
             );
             assert_eq!(body["tools"], json!([{"type": "browser_search"}]));
             assert_eq!(body["tool_choice"], "auto");
@@ -552,6 +583,41 @@ mod tests {
                 "every turn carries the local clock, got: {sys}"
             );
         }
+    }
+
+    #[test]
+    fn chat_body_attaches_shot_to_latest_user_turn() {
+        let url = "data:image/png;base64,AAA";
+        let body = chat_body(
+            "qwen/qwen3.8-27b",
+            "",
+            &[
+                Msg { role: Role::User, text: "old q".into() },
+                Msg { role: Role::Assistant, text: "old a".into() },
+                Msg { role: Role::User, text: "what is this?".into() },
+            ],
+            Some(url),
+        );
+        // Older turns stay plain text.
+        assert_eq!(body["messages"][1]["content"], "old q");
+        assert_eq!(body["messages"][2]["content"], "old a");
+        // Latest user turn carries text + image parts.
+        let content = &body["messages"][3]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], url);
+    }
+
+    #[test]
+    fn chat_body_without_shot_stays_text_only() {
+        let body = chat_body(
+            "openai/gpt-oss-20b",
+            "",
+            &[Msg { role: Role::User, text: "hi".into() }],
+            Some("   "),
+        );
+        assert_eq!(body["messages"][1]["content"], "hi");
     }
 
     #[test]

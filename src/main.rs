@@ -11,7 +11,7 @@
 // Debug builds keep the console so the [notchbud] log lines stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use notchbud::{connector, island_web, render, sessions, state};
+use notchbud::{connector, island_web, render, sessions, shot, state};
 
 mod prefs;
 mod tray;
@@ -91,6 +91,8 @@ const CHAT_VERIFY_OUT: usize = 8; // *(u32, String) (terminal: key revoked)
 const CHAT_VERIFY_ERR: usize = 9; // *(u32, String) (transient: keep any live stream)
 // Groq-titled label for a session (session_id, title); stale ids are ignored.
 const CHAT_TITLE: usize = 10; // *Box<(String, String)>
+// Screenshot captured for the prompt (data URL); attaches as pendingImage.
+const CHAT_SHOT: usize = 11; // *Box<String>
 
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
 static CHAT_CANCEL: AtomicBool = AtomicBool::new(false); // island left mid-stream
@@ -579,6 +581,13 @@ fn archive_current(app: &mut state::App) {
     sessions::save_sessions(&app.sessions);
 }
 
+/// Drop the camera attachment (full image + thumb) after send, remove,
+/// or session switch. One place so the pair can't half-clear.
+fn clear_shot(app: &mut state::App) {
+    app.pending_image.clear();
+    app.pending_thumb.clear();
+}
+
 /// Start a blank session (history cleared, fresh id). The previous turns
 /// must already be archived — this only resets the working copy.
 fn begin_session(app: &mut state::App) {
@@ -589,6 +598,7 @@ fn begin_session(app: &mut state::App) {
     app.chat.stream.clear();
     app.session_id = sessions::new_id();
     app.session_title.clear();
+    clear_shot(app);
 }
 
 /// Quietly retire a live stream (Back / open_session / collapse-out).
@@ -631,6 +641,7 @@ fn disconnect(app: &mut state::App) {
     app.chat.history.clear();
     app.session_id.clear();
     app.session_title.clear();
+    clear_shot(app);
     CHAT_CANCEL.store(true, Ordering::Release);
     bump_turn(); // retire any live worker with the session
     app.chat.error = Some("Disconnected.".into());
@@ -701,7 +712,9 @@ fn save_api_key(app: &mut state::App, raw_key: &str) {
 /// Boot check: a saved key may have been revoked since last run.
 /// Re-validate with the existing catalog check on a worker thread. A dead
 /// key drops to the key entry (SIGNED_OUT); a live one just clears the
-/// "checking" flag (CONNECTED); anything else surfaces as-is (ERROR).
+/// "checking" flag (CONNECTED); anything else stays silent (ERROR clears
+/// the flag with no user-visible status — Home never shows boot noise, and
+/// a transient network blip must not claim anything until a real attempt).
 fn verify_saved_key(app: &mut state::App) {
     let Some(api_key) = app.chat.tokens.clone() else {
         return; // nothing saved — already on the key entry.
@@ -711,7 +724,7 @@ fn verify_saved_key(app: &mut state::App) {
     }
     app.chat.signing_in = true;
     app.chat.error = None;
-    app.chat.notice = Some("Checking key…".into());
+    app.chat.notice = None;
     push_web(app);
     let gen = VERIFY_GEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     let hwnd = app.hwnd.0 as isize;
@@ -943,7 +956,31 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
             app.session_title = saved.title;
             app.chat.error = None;
             app.chat.notice = None;
+            clear_shot(app);
             app.close_overlay();
+            push_web(app);
+        },
+        Some("take_shot") => {
+            // Camera button: capture the screen on a worker thread (GDI +
+            // WIC take ~100ms — never stall the window pump). The result
+            // lands via CHAT_SHOT and previews in the prompt.
+            let hwnd = app.hwnd.0 as isize;
+            std::thread::spawn(move || unsafe {
+                let hwnd_raw = HWND(hwnd as *mut _);
+                // Empty pair = failure (the CHAT_SHOT arm reports it
+                // without touching any live stream).
+                let urls = shot::capture_shot().unwrap_or_default();
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_CHAT,
+                    WPARAM(CHAT_SHOT),
+                    LPARAM(Box::into_raw(Box::new(urls)) as isize),
+                );
+            });
+        },
+        Some("clear_shot") => {
+            // Preview remove: drop the attachment, hide the preview.
+            clear_shot(app);
             push_web(app);
         },
         Some("ask_delete") => {
@@ -1031,7 +1068,23 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         app.session_id = sessions::new_id();
     }
     let session_id = app.session_id.clone();
-    app.chat.push_history(state::Role::User, text);
+    // The camera shot (if any) rides this turn only, then clears: the full
+    // image goes to the model, the thumb stays on the history turn above
+    // the bubble. Archive still stores text only.
+    let shot = if app.pending_image.trim().is_empty() {
+        None
+    } else {
+        Some((
+            std::mem::take(&mut app.pending_image),
+            std::mem::take(&mut app.pending_thumb),
+        ))
+    };
+    if let Some((_, thumb)) = &shot {
+        app.chat
+            .push_history_image(state::Role::User, text, thumb.clone());
+    } else {
+        app.chat.push_history(state::Role::User, text);
+    }
     // Archive the user turn immediately: Back mid-stream keeps the prompt.
     archive_current(app);
     let needs_title = app.session_title.trim().is_empty();
@@ -1039,8 +1092,8 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         .chat
         .history
         .iter()
-        .find(|(r, _)| *r == state::Role::User)
-        .map(|(_, t)| t.clone())
+        .find(|(r, _, _)| *r == state::Role::User)
+        .map(|(_, t, _)| t.clone())
         .unwrap_or_default();
     app.chat.streaming = true;
     app.chat.stream.clear();
@@ -1058,7 +1111,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         .chat
         .history
         .iter()
-        .map(|(role, text)| state::Msg { role: *role, text: text.clone() })
+        .map(|(role, text, _)| state::Msg { role: *role, text: text.clone() })
         .collect();
     let model = app.chat.model.clone();
     let user_name = app.display_name.clone(); // frozen per turn, like history
@@ -1102,6 +1155,14 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                 }
             }
         };
+        // Screenshot turns always run on the Qwen vision model — the text
+        // models can't see image_url parts. Used for this turn only, never
+        // persisted (no CHAT_MODEL post): the next text turn resolves its
+        // model as usual.
+        if shot.is_some() {
+            current = connector::auth::SCREENSHOT_MODEL.to_owned();
+        }
+        let shot_ref = shot.as_ref().map(|(full, _)| full.as_str());
         let post_delta = |d: String| {
             let _ = PostMessageW(
                 Some(hwnd),
@@ -1118,7 +1179,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         // next catalog model instead of failing the turn.
         let mut retried = false;
         loop {
-            let result = connector::chat::stream_chat(&api_key.key, &current, &user_name, &history, |ev| match ev {
+            let result = connector::chat::stream_chat(&api_key.key, &current, &user_name, &history, shot_ref, |ev| match ev {
                 connector::chat::StreamEvent::Delta(d) => {
                     if cancelled() {
                         false
@@ -1263,6 +1324,19 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
                 push_web(app);
             }
         }
+        CHAT_SHOT => {
+            // Camera capture landed: preview it in the prompt. A capture
+            // that arrives mid-stream still previews — it attaches to the
+            // NEXT submit, never the live turn. Empty pair = capture failed.
+            let (url, thumb) = unsafe { *Box::from_raw(lparam.0 as *mut (String, String)) };
+            if url.trim().is_empty() {
+                app.chat.error = Some("Couldn't capture the screen.".into());
+            } else {
+                app.pending_image = url;
+                app.pending_thumb = thumb;
+            }
+            push_web(app);
+        }
         CHAT_TITLE => {
             let b = unsafe { Box::from_raw(lparam.0 as *mut (String, String)) };
             let (sid, title) = (&b.0, b.1.trim().to_owned());
@@ -1381,11 +1455,13 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             if b.0 != VERIFY_GEN.load(Ordering::Relaxed) {
                 return; // stale — leave the newer state alone
             }
-            // Transient check failure (e.g. offline at boot): retryable, and
-            // never tears down a chat submitted while the check was pending.
+            // Transient check failure at boot (e.g. network blip): stay
+            // silent so Home never shows boot noise, and never tears down
+            // a chat submitted while the check was pending. The next real
+            // attempt (chat/save_key) surfaces its own error if still failing.
             app.chat.signing_in = false;
             app.chat.notice = None;
-            app.chat.error = Some(b.1);
+            app.chat.error = None;
             push_web(app);
         }
         _ => {}
@@ -1734,6 +1810,35 @@ mod tests {
     }
 
     #[test]
+    fn shot_preview_shows_and_clears() {
+        // CHAT_SHOT (worker result) previews the data URL; clear_shot
+        // drops it. Both push the page state the preview reads.
+        let mut app = blank_app();
+        let msg = Box::into_raw(Box::new((
+            "data:image/png;base64,AAA".to_owned(),
+            "data:image/png;base64,BBB".to_owned(),
+        )));
+        handle_chat_msg(&mut app, WPARAM(CHAT_SHOT), LPARAM(msg as isize));
+        assert_eq!(app.pending_image, "data:image/png;base64,AAA");
+        assert_eq!(app.pending_thumb, "data:image/png;base64,BBB");
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).expect("page_state must stay valid JSON");
+        assert_eq!(v["pendingImage"], "data:image/png;base64,BBB");
+        handle_webmsg(&mut app, webmsg(r#"{"type":"clear_shot"}"#));
+        assert!(app.pending_image.is_empty());
+        assert!(app.pending_thumb.is_empty());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).expect("page_state must stay valid JSON");
+        assert!(v["pendingImage"].is_null());
+        // A fresh session never carries a stale attachment.
+        app.pending_image = "data:image/png;base64,AAA".into();
+        app.pending_thumb = "data:image/png;base64,BBB".into();
+        begin_session(&mut app);
+        assert!(app.pending_image.is_empty());
+        assert!(app.pending_thumb.is_empty());
+    }
+
+    #[test]
     fn chat_title_attaches_to_live_and_archived_session() {
         // The title arm saves the sessions file: isolate it in a temp dir.
         let _data = TempDataDir::set();
@@ -1819,6 +1924,25 @@ mod tests {
         assert!(!app.chat.signing_in);
         assert!(app.chat.notice.is_none());
         assert_eq!(app.screen(), state::Screen::SignIn);
+    }
+
+    #[test]
+    fn boot_transient_verify_error_stays_silent_on_home() {
+        // A boot-check network blip must not paint Home: no notice, no
+        // error, creds kept, still on Home. The next real attempt reports
+        // its own failure if still failing.
+        let mut app = blank_app();
+        app.chat.tokens =
+            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.signing_in = true;
+        let gen = VERIFY_GEN.load(Ordering::Relaxed);
+        let msg = Box::into_raw(Box::new((gen, "Couldn't reach Groq. Try again.".to_owned())));
+        handle_chat_msg(&mut app, WPARAM(CHAT_VERIFY_ERR), LPARAM(msg as isize));
+        assert!(!app.chat.signing_in);
+        assert!(app.chat.notice.is_none());
+        assert!(app.chat.error.is_none());
+        assert!(app.chat.tokens.is_some());
+        assert_eq!(app.screen(), state::Screen::Home);
     }
 
     #[test]

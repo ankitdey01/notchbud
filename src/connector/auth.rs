@@ -102,7 +102,7 @@ pub fn list_models(api_key: &str) -> Result<Vec<ModelInfo>, String> {
     {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(_) => return Err("offline — can't reach Groq".to_owned()),
+        Err(_) => return Err("Couldn't reach Groq. Try again.".to_owned()),
     };
     if resp.status() == 401 || resp.status() == 403 {
         return Err("expired".to_owned());
@@ -111,8 +111,13 @@ pub fn list_models(api_key: &str) -> Result<Vec<ModelInfo>, String> {
         return Err(format!("Groq models unavailable (HTTP {}).", resp.status()));
     }
     let data = body_json(resp);
-    // Groq (OpenAI-compatible) shape is a `data` array of {id,...}.
-    let items: &[Value] = data["data"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    // Groq (OpenAI-compatible) shape is a `data` array of {id,...}. A 200
+    // without it is a bad response, not an empty catalog: falling through
+    // to Ok([]) would misreport it as "no models for this key" — a false
+    // positive, since chat works fine once the catalog actually loads.
+    let Value::Array(items) = &data["data"] else {
+        return Err("Groq models unavailable (bad response).".to_owned());
+    };
     let mut out = Vec::new();
     for item in items {
         let slug = item["id"].as_str().unwrap_or("");
@@ -145,6 +150,12 @@ pub fn list_models(api_key: &str) -> Result<Vec<ModelInfo>, String> {
 /// are enterprise-only since Aug 2026 and must NOT be preferred.
 pub const PREFERRED_CHAT_MODELS: [&str; 2] =
     ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
+
+/// Screenshot turns always run on this model: Groq's multimodal Qwen
+/// (https://console.groq.com/docs/vision) takes image_url parts, which
+/// the text-only preferred chat models reject. Fixed slug, not a catalog
+/// pick — there is exactly one model for the job.
+pub const SCREENSHOT_MODEL: &str = "qwen/qwen3.8-27b";
 
 /// True when the slug can back a chat-completions turn. Excludes speech,
 /// safety and TTS entries that share the same catalog but cannot chat

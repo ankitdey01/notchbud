@@ -39,7 +39,6 @@
   const greeting = el("greeting");
   const homeGreet = el("home-greet");
   const greetIcon = el("greet-icon");
-  const homeStatus = el("home-status");
   const homeInput = el("chat-input-home");
   const chatStatus = el("chat-status");
   const history = el("history");
@@ -47,6 +46,17 @@
   const chatInput = el("chat-input");
   const homeSend = el("home-send");
   const chatSend = el("chat-send");
+  // Camera buttons + attached-shot previews (one set per prompt).
+  const homeCam = el("home-cam");
+  const chatCam = el("chat-cam");
+  const homeShot = el("home-shot");
+  const chatShot = el("chat-shot");
+  const homeShotImg = el("home-shot-img");
+  const chatShotImg = el("chat-shot-img");
+  const homeShotSkel = el("home-shot-skel");
+  const chatShotSkel = el("chat-shot-skel");
+  const homeShotX = el("home-shot-x");
+  const chatShotX = el("chat-shot-x");
 
   // Display-name prompt on Home (shown instead of the chat box until answered).
   const nameEntry = el("name-entry");
@@ -100,8 +110,8 @@
   // typing, Enter/Escape, send enablement — flows through this single
   // table, so the two prompts can't drift into repeated clones.
   const PROMPTS = [
-    { input: homeInput, send: homeSend },
-    { input: chatInput, send: chatSend },
+    { input: homeInput, send: homeSend, cam: homeCam, shot: homeShot, img: homeShotImg, skel: homeShotSkel, shotX: homeShotX },
+    { input: chatInput, send: chatSend, cam: chatCam, shot: chatShot, img: chatShotImg, skel: chatShotSkel, shotX: chatShotX },
   ];
   // Send buttons ride disabled (gray) until there is text to send, and
   // while Rust streams a reply. Blue = ready, gray = nothing to send.
@@ -295,7 +305,6 @@
   function renderHome(s) {
     greeting.textContent = s.greeting || "";
     setGreetIcon(s.greeting);
-    setStatus(homeStatus, s.status);
     // First-run name step owns Home alone until answered — no navbar, no
     // greeting, no chat box (mirrors SignIn owning the frame when signed
     // out). Rust decides via needsName; this side only applies it.
@@ -324,6 +333,15 @@
     setStatus(chatStatus, s.status);
     history.innerHTML = "";
     for (const t of (s.history || [])) {
+      // A sent screenshot sits right above its bubble.
+      const img = (t.image && String(t.image).trim()) || "";
+      if (img) {
+        const shot = document.createElement("img");
+        shot.className = "turn-shot";
+        shot.src = img;
+        shot.alt = "Sent screenshot";
+        history.appendChild(shot);
+      }
       const d = document.createElement("div");
       d.className = t.role === "user" ? "turn-user" : "turn-assistant";
       d.textContent = t.text;
@@ -394,6 +412,25 @@
     }
   }
 
+  // Camera preview: one pending screenshot shared by both prompts —
+  // the thumbnail shows in whichever askbox is visible. Between click
+  // and arrival the skeleton shimmers in the thumbnail's exact spot; the
+  // next push always hides it (image or not), so it can never stick.
+  function renderShot(s) {
+    const url = (s.pendingImage && String(s.pendingImage).trim()) || "";
+    for (const p of PROMPTS) {
+      p.shot.hidden = !url;
+      p.skel.hidden = true;
+      if (url) {
+        p.img.hidden = false;
+        if (p.img.getAttribute("src") !== url) p.img.src = url;
+      } else {
+        p.img.removeAttribute("src");
+        p.img.hidden = true;
+      }
+    }
+  }
+
   // Delete confirmation: blank page naming the chat Yes would drop.
   function renderConfirm(s) {
     if (!confirmName) return;
@@ -424,6 +461,7 @@
     (RENDERERS[known ? page : "home"] || (() => {}))(s);
     isStreaming = !!s.streaming;
     awaitingAck = false;
+    renderShot(s);
     refreshSend();
   }
 
@@ -635,6 +673,15 @@
       });
     }
     if (p.send) p.send.addEventListener("click", () => submitInput());
+    if (p.cam) p.cam.addEventListener("click", () => {
+      // Show the skeleton now; renderShot swaps in the image (or hides
+      // everything) on the very next push.
+      p.shot.hidden = false;
+      p.skel.hidden = false;
+      p.img.hidden = true;
+      post({ type: "take_shot" });
+    });
+    if (p.shotX) p.shotX.addEventListener("click", () => post({ type: "clear_shot" }));
   }
   function submitKey() {
     const k = groqKey ? groqKey.value : "";

@@ -39,6 +39,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_DirectComposition",
 ] }
+base64 = "0.23.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = "z"

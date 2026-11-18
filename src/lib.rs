@@ -6,6 +6,7 @@ pub mod connector;
 pub mod island_web;
 pub mod render;
 pub mod sessions;
+pub mod shot;
 pub mod state;
 pub mod user;
 

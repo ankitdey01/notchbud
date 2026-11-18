@@ -422,8 +422,8 @@ fn prompt_arrows_move_caret_and_wiring_is_shared() {
     let js = js();
     let f: String = js.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        f.contains("constPROMPTS=[{input:homeInput,send:homeSend},{input:chatInput,send:chatSend},]"),
-        "both prompts must pair through one PROMPTS table"
+        f.contains("constPROMPTS=[{input:homeInput,send:homeSend,cam:homeCam,shot:homeShot,img:homeShotImg,skel:homeShotSkel,shotX:homeShotX},{input:chatInput,send:chatSend,cam:chatCam,shot:chatShot,img:chatShotImg,skel:chatShotSkel,shotX:chatShotX},]"),
+        "both prompts must pair through one PROMPTS table (input + send + camera + preview)"
     );
     assert!(
         f.contains("functionmoveCaret(input,code)") && f.contains("KEY_LEFT") && f.contains("isArrow(code)"),
@@ -436,6 +436,82 @@ fn prompt_arrows_move_caret_and_wiring_is_shared() {
     assert!(
         !js.contains("homeSend.addEventListener") && !js.contains("chatSend.addEventListener"),
         "send buttons must wire through the shared loop, not per-prompt clones"
+    );
+}
+
+/// Camera button beside each send: Pikaicons camera captures the screen,
+/// the thumbnail previews in the typing pill, and it sends with the text.
+/// Clear removes it; submits always carry text (image-only sends stay out).
+#[test]
+fn camera_captures_previews_and_sends_with_text() {
+    let h = html();
+    for id in ["id=\"home-cam\"", "id=\"chat-cam\""] {
+        let btn = h
+            .find(id)
+            .and_then(|s| h[s..].find("</button>").map(|e| h[s..s + e].to_string()))
+            .unwrap_or_else(|| panic!("{id} button not found"));
+        assert!(
+            btn.contains("M2 11c0-2.8"),
+            "{id} must use the Pikaicons camera, not a hand-drawn SVG"
+        );
+    }
+    for id in [
+        "id=\"home-shot\"",
+        "id=\"chat-shot\"",
+        "id=\"home-shot-img\"",
+        "id=\"chat-shot-img\"",
+        "id=\"home-shot-skel\"",
+        "id=\"chat-shot-skel\"",
+        "id=\"home-shot-x\"",
+        "id=\"chat-shot-x\"",
+    ] {
+        assert!(h.contains(id), "prompt preview needs {id} in both askboxes");
+    }
+    let js = js();
+    let f: String = js.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        js.contains("type: \"take_shot\"") && js.contains("type: \"clear_shot\""),
+        "camera and remove must post take_shot / clear_shot"
+    );
+    assert!(
+        f.contains("functionrenderShot(s)") && f.contains("s.pendingImage"),
+        "page must render the pendingImage preview into the pill"
+    );
+    let css = ui_file("styles.css");
+    let c: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        c.contains(".shot-wrap{") && c.contains(".shot-img{") && c.contains(".shot-skel{"),
+        "preview needs its pill thumbnail + skeleton styles"
+    );
+    assert!(
+        c.contains(".shot-skel{") && c.contains("thinking-shimmer"),
+        "the skeleton must reuse the shimmer sweep, not invent a new animation"
+    );
+}
+
+/// A sent screenshot renders as a thumbnail directly above its bubble —
+/// plain turns render text only, same as before.
+#[test]
+fn chat_shot_renders_thumbnail_above_its_bubble() {
+    let js = js();
+    let span = js
+        .find("function renderChat")
+        .and_then(|s| {
+            js[s..]
+                .find("\n  function ")
+                .map(|e| js[s..s + e].to_string())
+        })
+        .expect("renderChat not found");
+    let f: String = span.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        f.contains("turn-shot") && f.contains("t.image"),
+        "turns carrying an image must render the thumbnail above the bubble"
+    );
+    let css = ui_file("styles.css");
+    let c: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        c.contains(".turn-shot{") && c.contains("align-self:flex-end"),
+        "the thumbnail must hug the right edge over its bubble"
     );
 }
 

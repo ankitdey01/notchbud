@@ -482,12 +482,6 @@ body {
     text-overflow: ellipsis;
 }
 
-.greet-sub {
-    font-size: 12px;
-    font-weight: 400;
-    color: #9ca3af;
-}
-
 /* ---------- ask box ---------- */
 
 /* First-run name step owns Home alone (mirrors signin): no navbar, no
@@ -576,6 +570,53 @@ body {
     color: #8e8e93;
     box-shadow: none;
     opacity: 1;
+}
+
+/* Camera preview rides inside the prompt pill: thumbnail + tiny remove.
+   Hidden until a shot is attached (see renderShot). */
+.shot-wrap {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.shot-img {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    object-fit: cover;
+    display: block;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+/* Capture in flight: shimmer block in the thumbnail's exact spot until
+   the image arrives (same sweep as the Thinking text). */
+.shot-skel {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    display: block;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.18) 50%, rgba(255, 255, 255, 0.06) 100%);
+    background-size: 200% 100%;
+    animation: thinking-shimmer 1.2s linear infinite;
+}
+
+.shot-x {
+    width: 20px;
+    height: 20px;
+    flex: none;
+    color: #9ca3af;
+}
+
+.shot-x:hover {
+    color: #ff5a52;
+}
+
+.shot-x svg {
+    width: 10px;
+    height: 10px;
 }
 
 .askinput:disabled {
@@ -689,6 +730,21 @@ body {
 .turn-stream::after {
     content: "▏";
     animation: caret 1s steps(1) infinite;
+}
+
+/* Sent screenshot: thumbnail hugging the right edge directly above its
+   bubble (history gap tightened between the two). */
+.turn-shot {
+    align-self: flex-end;
+    max-width: 140px;
+    border-radius: 12px;
+    display: block;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    object-fit: cover;
+}
+
+.turn-shot + .turn-user {
+    margin-top: -6px;
 }
 
 /* Pre-reply state: shimmer text sweeping left to right, no bubble. The

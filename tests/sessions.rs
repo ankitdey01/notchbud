@@ -82,7 +82,10 @@ fn save_load_round_trips() {
     let made = sessions::snapshot(
         "s1",
         "Trip",
-        &[(Role::User, "hi".into()), (Role::Assistant, "hey".into())],
+        &[
+            (Role::User, "hi".into(), None),
+            (Role::Assistant, "hey".into(), None),
+        ],
     );
     sessions::save_sessions(&[made]);
     let back = sessions::load_sessions();
@@ -112,7 +115,7 @@ fn corrupt_file_quarantines_and_recovers() {
 
 #[test]
 fn snapshot_keeps_id_title_and_role_strings() {
-    let s = sessions::snapshot("id-1", "T", &[(Role::User, "q".into())]);
+    let s = sessions::snapshot("id-1", "T", &[(Role::User, "q".into(), None)]);
     assert_eq!(s.id, "id-1");
     assert_eq!(s.title, "T");
     assert_eq!(s.messages.len(), 1);
