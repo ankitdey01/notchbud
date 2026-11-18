@@ -91,7 +91,13 @@ pub fn capture_shot() -> Option<(String, String)> {
         imageops::{resize, FilterType},
         DynamicImage, ImageBuffer, ImageEncoder as _, Rgba,
     };
-    let (px, w, h) = capture_bgra()?;
+    let (mut px, w, h) = capture_bgra()?;
+    // GDI 32-bit BI_RGB is B,G,R,unused(0): swizzle to R,G,B,opaque for
+    // the image crate (Rgba expects R,G,B,A; unused byte is 0, not 255).
+    for px in px.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 255;
+    }
     let rgba = ImageBuffer::<Rgba<u8>, _>::from_raw(w, h, px)?;
     // Downscale once at most; the thumb derives from the result, never
     // from full resolution a second time.

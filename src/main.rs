@@ -1117,51 +1117,53 @@ fn submit_chat(app: &mut state::App, raw: &str) {
     let user_name = app.display_name.clone(); // frozen per turn, like history
     std::thread::spawn(move || unsafe {
         let hwnd = HWND(hwnd as *mut _);
-        let mut current = match model {
-            Some(m) => m,
-            None => {
-                // The key's catalog decides; no hardcoded fallback.
-                match connector::auth::pick_model(&api_key.key) {
-                    Ok(m) => {
-                        let _ = PostMessageW(
-                            Some(hwnd),
-                            WM_CHAT,
-                            WPARAM(CHAT_MODEL),
-                            LPARAM(Box::into_raw(Box::new(m.clone())) as isize),
-                        );
-                        m
-                    }
-                    Err(msg) => {
-                        if msg == "expired" {
-                            connector::auth::delete_api_key();
+        // Screenshot turns always run on the Qwen vision model — the text
+        // models can't see image_url parts. Used for this turn only, never
+        // persisted (no CHAT_MODEL post): the next text turn resolves its
+        // model as usual. Resolved before the catalog so a catalog error
+        // can't block a screenshot turn that needs no catalog pick.
+        let mut current = if shot.is_some() {
+            connector::auth::SCREENSHOT_MODEL.to_owned()
+        } else {
+            match model {
+                Some(m) => m,
+                None => {
+                    // The key's catalog decides; no hardcoded fallback.
+                    match connector::auth::pick_model(&api_key.key) {
+                        Ok(m) => {
                             let _ = PostMessageW(
                                 Some(hwnd),
                                 WM_CHAT,
-                                WPARAM(CHAT_SIGNED_OUT),
-                                LPARAM(Box::into_raw(Box::new(
-                                    connector::chat::AUTH_REJECTED_MSG.to_owned(),
-                                )) as isize),
+                                WPARAM(CHAT_MODEL),
+                                LPARAM(Box::into_raw(Box::new(m.clone())) as isize),
                             );
-                        } else {
-                            let _ = PostMessageW(
-                                Some(hwnd),
-                                WM_CHAT,
-                                WPARAM(CHAT_ERROR),
-                                LPARAM(Box::into_raw(Box::new((turn, msg))) as isize),
-                            );
+                            m
                         }
-                        return;
+                        Err(msg) => {
+                            if msg == "expired" {
+                                connector::auth::delete_api_key();
+                                let _ = PostMessageW(
+                                    Some(hwnd),
+                                    WM_CHAT,
+                                    WPARAM(CHAT_SIGNED_OUT),
+                                    LPARAM(Box::into_raw(Box::new(
+                                        connector::chat::AUTH_REJECTED_MSG.to_owned(),
+                                    )) as isize),
+                                );
+                            } else {
+                                let _ = PostMessageW(
+                                    Some(hwnd),
+                                    WM_CHAT,
+                                    WPARAM(CHAT_ERROR),
+                                    LPARAM(Box::into_raw(Box::new((turn, msg))) as isize),
+                                );
+                            }
+                            return;
+                        }
                     }
                 }
             }
         };
-        // Screenshot turns always run on the Qwen vision model — the text
-        // models can't see image_url parts. Used for this turn only, never
-        // persisted (no CHAT_MODEL post): the next text turn resolves its
-        // model as usual.
-        if shot.is_some() {
-            current = connector::auth::SCREENSHOT_MODEL.to_owned();
-        }
         let shot_ref = shot.as_ref().map(|(full, _)| full.as_str());
         let post_delta = |d: String| {
             let _ = PostMessageW(
@@ -1257,6 +1259,18 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                     break;
                 }
                 Err(m) if m == connector::chat::MODEL_UNAVAILABLE_MSG && !retried => {
+                    // Image turns stay on the vision model: retrying with a
+                    // catalog text model would resend image_url to a model
+                    // that rejects it. Fail the turn instead.
+                    if shot.is_some() {
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_CHAT,
+                            WPARAM(CHAT_ERROR),
+                            LPARAM(Box::into_raw(Box::new((turn, m))) as isize),
+                        );
+                        break;
+                    }
                     retried = true;
                     match connector::auth::pick_model_excluding(&api_key.key, &[current.as_str()]) {
                         Ok(next) if next != current => {
