@@ -1,18 +1,6 @@
 name: Windows release
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "build.rs"
-      - "src/**"
-      - "ui/**"
-      - "assets/**"
-      - "installer/**"
-      - "tests/**"
-      - ".github/workflows/windows-release.yml"
   workflow_dispatch:
 
 permissions:
@@ -54,6 +42,9 @@ jobs:
           if (!(Test-Path $installer)) { throw "Installer was not produced: $installer" }
           $hash = (Get-FileHash $installer -Algorithm SHA256).Hash
           "$hash  Notchbud-Setup-0.1.2.exe" | Set-Content "installer\Output\SHA256SUMS.txt"
+
+      - name: Verify built installer and release binary with tests
+        run: cargo test --locked
 
       - name: Publish public preview
         uses: softprops/action-gh-release@v2
