@@ -1,9 +1,6 @@
 /target
-installer/Output/
 .agents
 dev_run.log
 run*.log
-*.png
 build_warn.txt
-crop*.ps1
-web
+AGENTS.md
