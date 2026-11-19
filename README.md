@@ -23,17 +23,25 @@ notchbud adds a small island to the top of your Windows screen. Hover it, type a
 
 It uses your own Groq API key. There is no notchbud server in between.
 
-### Island
+<div align="center">
 
 <img src="assets/island_preview.webp" alt="notchbud island" width="600" />
+<br />
+<u>The island at rest. It sits slim at the top until you hover it.</u>
 
-### Answering
+<br /><br />
 
 <img src="assets/island_preview_chat.webp" alt="notchbud answering" width="600" />
+<br />
+<u>Hover to expand, type your question, and watch the answer stream in live.</u>
 
-### History
+<br /><br />
 
 <img src="assets/island_preview_chats.webp" alt="notchbud history" width="600" />
+<br />
+<u>Your recent exchange stays in the island for reference.</u>
+
+</div>
 
 ## Features
 
