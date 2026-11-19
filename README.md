@@ -1,6 +1,10 @@
 <div align="center">
 
-<img src="assets/notchbud-logo.png" alt="notchbud logo" width="128" style="border-radius:32px" />
+<img src="assets/island_header.png" alt="notchbud island header" width="100%" />
+
+</div>
+
+<div align="center">
 
 # notchbud
 
@@ -11,7 +15,9 @@
 [![Stars](https://img.shields.io/github/stars/ankitdey01/notchbud?style=for-the-badge)](https://github.com/ankitdey01/notchbud/stargazers)
 [![Windows](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/ankitdey01/notchbud/releases)
 
-[Download](#download) · [How to use](#how-to-use) · [Privacy](#privacy)
+[Download](#download) · [How to use](#how-to-use) · [Privacy](#privacy) · [FAQ](#faq)
+
+<img src="assets/notchbud-logo.png" alt="notchbud logo" width="128" style="border-radius:32px" />
 
 </div>
 
@@ -23,25 +29,27 @@ notchbud adds a small island to the top of your Windows screen. Hover it, type a
 
 It uses your own Groq API key. There is no notchbud server in between.
 
-<div align="center">
+<table align="center">
+<tr><td align="center"><b>Island</b></td></tr>
+<tr><td><img src="assets/island_preview.webp" alt="notchbud island" width="600" /></td></tr>
+<tr><td align="center"><u>The island at rest. It sits slim at the top until you hover it.</u></td></tr>
+</table>
 
-<img src="assets/island_preview.webp" alt="notchbud island" width="600" />
 <br />
-<u>The island at rest. It sits slim at the top until you hover it.</u>
 
-<br /><br />
+<table align="center">
+<tr><td align="center"><b>Answering</b></td></tr>
+<tr><td><img src="assets/island_preview_chat.webp" alt="notchbud answering" width="600" /></td></tr>
+<tr><td align="center"><u>Hover to expand, type your question, and watch the answer stream in live.</u></td></tr>
+</table>
 
-<img src="assets/island_preview_chat.webp" alt="notchbud answering" width="600" />
 <br />
-<u>Hover to expand, type your question, and watch the answer stream in live.</u>
 
-<br /><br />
-
-<img src="assets/island_preview_chats.webp" alt="notchbud history" width="600" />
-<br />
-<u>Your recent exchange stays in the island for reference.</u>
-
-</div>
+<table align="center">
+<tr><td align="center"><b>History</b></td></tr>
+<tr><td><img src="assets/island_preview_chats.webp" alt="notchbud history" width="600" /></td></tr>
+<tr><td align="center"><u>Your recent exchange stays in the island for reference.</u></td></tr>
+</table>
 
 ## Features
 
@@ -85,6 +93,43 @@ Issues and PRs are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, 
 ## License
 
 No LICENSE file is included yet, so all rights are reserved for now. Open an issue if you want to reuse this code.
+
+## FAQ
+
+<details>
+<summary><b>Is it really free?</b></summary>
+
+Yes. The app costs nothing and has no paid plan. Answers are billed to your own Groq key, so Groq's own pricing applies to your usage.
+
+</details>
+
+<details>
+<summary><b>Do I need admin rights?</b></summary>
+
+No. The installer is per user and never asks for elevation.
+
+</details>
+
+<details>
+<summary><b>Where is my API key stored?</b></summary>
+
+In a protected file on your own PC, under `%APPDATA%\notchbud`. It is only ever sent to Groq, never anywhere else.
+
+</details>
+
+<details>
+<summary><b>Does it work offline?</b></summary>
+
+No. Answers stream from Groq, so you need an internet connection.
+
+</details>
+
+<details>
+<summary><b>How do I sign out or wipe my data?</b></summary>
+
+Pick Disconnect in the tray menu to sign out. If you uninstall, the uninstaller asks whether to delete your sign-in data too.
+
+</details>
 
 ---
 
