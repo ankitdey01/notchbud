@@ -1281,3 +1281,14 @@ body {
     color: #fff;
     text-decoration: none;
 }
+/* ---------- auto-update (free for all): one settings icon ---------- */
+#update-btn.has-update {
+    background: rgba(0, 122, 255, 0.22);
+    color: #fff;
+    animation: update-pulse 1.6s ease-in-out infinite;
+}
+#update-btn.is-busy svg {
+    animation: update-spin 0.9s linear infinite;
+}
+@keyframes update-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.55); } 50% { box-shadow: 0 0 0 6px rgba(0, 122, 255, 0); } }
+@keyframes update-spin { to { transform: rotate(360deg); } }

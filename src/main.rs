@@ -11,7 +11,7 @@
 // Debug builds keep the console so the [notchbud] log lines stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use notchbud::{connector, island_web, render, sessions, shot, state};
+use notchbud::{connector, island_web, render, sessions, shot, state, updater};
 
 mod prefs;
 mod tray;
@@ -94,10 +94,17 @@ const CHAT_TITLE: usize = 10; // *Box<(String, String)>
 // Screenshot captured for the prompt (data URL); attaches as pendingImage.
 const CHAT_SHOT: usize = 11; // *Box<String>
 
+// updater wiring: worker thread(s) post into this pump via PostMessage.
+const WM_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12;
+const UPDATE_AVAILABLE: usize = 0; // *Box<updater::UpdateInfo>
+const UPDATE_STATUS: usize = 1; // *Box<String>
+const UPDATE_DONE: usize = 2; // *Box<String> (installer path, launch+quit)
+
 static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island expanded
 static CHAT_CANCEL: AtomicBool = AtomicBool::new(false); // island left mid-stream
 static VERIFY_GEN: AtomicU32 = AtomicU32::new(0); // startup key-check generation
 static TURN_GEN: AtomicU32 = AtomicU32::new(0); // chat turn generation
+static UPDATE_GEN: AtomicU32 = AtomicU32::new(0); // manual update-check generation
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0); // where the hook posts
 static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on quit)
 
@@ -435,6 +442,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if msg == WM_CHAT {
                 handle_chat_msg(app, wparam, lparam);
                 LRESULT(0)
+            } else if msg == WM_UPDATE {
+                handle_update_msg(app, wparam, lparam);
+                LRESULT(0)
             } else if msg == WM_KEY {
                 handle_chat_key(wparam.0);
                 LRESULT(0)
@@ -765,6 +775,37 @@ fn verify_saved_key(app: &mut state::App) {
     });
 }
 
+// --- auto-update (free for all): GitHub Releases, Setup exe only ---
+// Startup (5s delay, non-blocking) + every 1hr. Silent on offline or
+// rate-limit: the island just doesn't glow.
+fn spawn_update_loop(hwnd: HWND) {
+    let raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        loop {
+            let current = env!("CARGO_PKG_VERSION");
+            match updater::check_for_update(current) {
+                Ok(Some(info)) => {
+                    eprintln!("[notchbud] update: background check found v{}", info.version);
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(raw as *mut _)),
+                            WM_UPDATE,
+                            WPARAM(UPDATE_AVAILABLE),
+                            LPARAM(Box::into_raw(Box::new((0u32, info))) as isize),
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("[notchbud] update: background check failed ({e})"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(
+                updater::CHECK_INTERVAL_SECS,
+            ));
+        }
+    });
+}
+
 /// Open an external URL in the system browser. The island WebView must never
 /// navigate itself (one external click would replace the island page and
 /// deaden every intent until restart), so links go out through here.
@@ -782,6 +823,165 @@ fn open_url_in_browser(url: &str) {
             None,
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
+    }
+}
+
+// Manual "Check for updates" from the island: shows Checking… then either
+// glows (AVAILABLE) or reports honestly. One worker at a time: rapid
+// clicks while one runs are ignored, so threads can never pile up.
+fn request_manual_check(app: &mut state::App) {
+    if app.update_inflight {
+        return;
+    }
+    app.update_inflight = true;
+    let gen = UPDATE_GEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    app.update_gen = gen;
+    app.update_status = Some("Checking…".into());
+    push_web(app);
+    let raw = app.hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let hwnd_raw = HWND(raw as *mut _);
+        eprintln!("[notchbud] update: checking GitHub releases…");
+        match updater::check_for_update(env!("CARGO_PKG_VERSION")) {
+            Ok(Some(info)) => {
+                eprintln!("[notchbud] update: found v{}", info.version);
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_UPDATE,
+                    WPARAM(UPDATE_AVAILABLE),
+                    LPARAM(Box::into_raw(Box::new((gen, info))) as isize),
+                );
+            }
+            Ok(None) => {
+                eprintln!("[notchbud] update: already on the latest release");
+                // Silent success: an empty status frees the button without
+                // painting anything on the island.
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_UPDATE,
+                    WPARAM(UPDATE_STATUS),
+                    LPARAM(Box::into_raw(Box::new((gen, "".to_owned()))) as isize),
+                );
+            }
+            Err(e) => {
+                eprintln!("[notchbud] update: check failed ({e})");
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_UPDATE,
+                    WPARAM(UPDATE_STATUS),
+                    LPARAM(Box::into_raw(Box::new((gen, "Update check failed.".to_owned()))) as isize),
+                );
+            }
+        }
+    });
+}
+
+// One-click Setup download: streams the Inno installer to %TEMP% then the
+// UI thread launches it and quits (file lock: the app must be dead first).
+fn spawn_apply_update(app: &mut state::App) {
+    let (Some(version), Some(url)) = (app.update_version.clone(), app.update_url.clone()) else {
+        return;
+    };
+    if app.update_inflight {
+        return;
+    }
+    app.update_inflight = true;
+    app.update_status = Some(format!("Downloading v{version}…"));
+    push_web(app);
+    let gen = app.update_gen;
+    let raw = app.hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let hwnd_raw = HWND(raw as *mut _);
+        let mut dest = std::env::temp_dir();
+        dest.push(format!("Notchbud-Setup-{version}.exe"));
+        match updater::download_setup(&url, &dest) {
+            Ok(()) => {
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_UPDATE,
+                    WPARAM(UPDATE_DONE),
+                    LPARAM(Box::into_raw(Box::new(dest.to_string_lossy().into_owned())) as isize),
+                );
+            }
+            Err(e) => {
+                let _ = PostMessageW(
+                    Some(hwnd_raw),
+                    WM_UPDATE,
+                    WPARAM(UPDATE_STATUS),
+                    LPARAM(Box::into_raw(Box::new((gen, format!("Update failed: {e}")))) as isize),
+                );
+            }
+        }
+    });
+}
+
+/// Launch the downloaded Setup exe. True only when the OS accepted the
+/// launch (HINSTANCE > 32) — the caller quits only then, so a failed
+/// launch keeps the app running with a retryable error instead of
+/// vanishing (which reads as a crash).
+fn launch_installer(path: &str) -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    unsafe {
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let mut file: Vec<u16> = path.encode_utf16().collect();
+        file.push(0);
+        ShellExecuteW(
+            None,
+            windows::core::PCWSTR(op.as_ptr()),
+            windows::core::PCWSTR(file.as_ptr()),
+            None,
+            None,
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+        .0 as isize
+            > 32
+    }
+}
+
+fn handle_update_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
+    match wparam.0 {
+        UPDATE_AVAILABLE => {
+            let (gen, info) =
+                unsafe { *Box::from_raw(lparam.0 as *mut (u32, updater::UpdateInfo)) };
+            eprintln!("[notchbud] update: announced v{}", info.version);
+            if gen != 0 && gen != app.update_gen {
+                return; // stale manual result — a newer check owns the island
+            }
+            // Only the matching manual check completes the flight;
+            // background discovery never touches it. The worker only
+            // reports newer releases, so this always glows.
+            if gen != 0 {
+                app.update_inflight = false;
+                app.update_status = None;
+            }
+            app.update_version = Some(info.version);
+            app.update_url = Some(info.url);
+            push_web(app);
+        }
+        UPDATE_STATUS => {
+            let (gen, s) = unsafe { *Box::from_raw(lparam.0 as *mut (u32, String)) };
+            if gen != app.update_gen {
+                return; // stale — a newer check owns the island
+            }
+            app.update_inflight = false;
+            app.update_status = Some(s);
+            push_web(app);
+        }
+        UPDATE_DONE => {
+            let path = unsafe { *Box::from_raw(lparam.0 as *mut String) };
+            if launch_installer(&path) {
+                app.update_status = Some("Restarting to update…".into());
+                push_web(app);
+                unsafe { PostQuitMessage(0) };
+            } else {
+                eprintln!("[notchbud] update: installer launch failed");
+                app.update_inflight = false;
+                app.update_status =
+                    Some("Couldn't start the installer — try again.".into());
+                push_web(app);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1027,6 +1227,14 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
         Some("submit") => {
             let text = web_str(&v, "text");
             submit_chat(app, &text);
+        }
+        Some("check_update") => {
+            eprintln!("[notchbud] update: manual check requested");
+            request_manual_check(app);
+        }
+        Some("apply_update") => {
+            eprintln!("[notchbud] update: apply requested");
+            spawn_apply_update(app);
         }
         Some("mouseleave") => {
             if !app.expanded {
@@ -1646,6 +1854,7 @@ fn main() -> Result<()> {
             after_state_change(app);
             verify_saved_key(app);
         }
+        spawn_update_loop(hwnd);
 
         // --- message pump ---
         let mut msg = MSG::default();
@@ -1928,6 +2137,122 @@ mod tests {
         let mut signed_out = blank_app();
         handle_webmsg(&mut signed_out, webmsg(r#"{"type":"edit_name"}"#));
         assert!(!signed_out.rename);
+    }
+
+    #[test]
+    fn update_available_newer_glows_and_stale_does_not() {
+        // A release newer than this build glows the island button.
+        let newer = format!("{}.1", env!("CARGO_PKG_VERSION"));
+        // Matching manual result: glows and frees the button.
+        let mut app = blank_app();
+        app.update_gen = 7;
+        app.update_inflight = true;
+        let info = Box::into_raw(Box::new((
+            7u32,
+            updater::UpdateInfo {
+                version: newer.clone(),
+                url: "https://x/setup.exe".into(),            },
+        )));
+        handle_update_msg(&mut app, WPARAM(UPDATE_AVAILABLE), LPARAM(info as isize));
+        assert!(!app.update_inflight, "a reply must free the button");
+        assert_eq!(app.update_version.as_deref(), Some(newer.as_str()));
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).expect("page_state must stay valid JSON");
+        assert_eq!(v["update"]["available"], true);
+        // Stale manual result: ignored entirely, flight untouched.
+        let mut stale = blank_app();
+        stale.update_gen = 7;
+        stale.update_inflight = true;
+        let info = Box::into_raw(Box::new((
+            6u32,
+            updater::UpdateInfo {
+                version: "9.9.9".into(),
+                url: "https://x/old.exe".into(),            },
+        )));
+        handle_update_msg(&mut stale, WPARAM(UPDATE_AVAILABLE), LPARAM(info as isize));
+        assert!(stale.update_version.is_none());
+        assert!(stale.update_inflight);
+        // Background discovery during a download: availability lands, but
+        // the Downloading state and the flight flag survive.
+        let mut dl = blank_app();
+        dl.update_inflight = true;
+        dl.update_status = Some("Downloading v9.9.9…".into());
+        let info = Box::into_raw(Box::new((
+            0u32,
+            updater::UpdateInfo {
+                version: newer.clone(),
+                url: "https://x/setup.exe".into(),            },
+        )));
+        handle_update_msg(&mut dl, WPARAM(UPDATE_AVAILABLE), LPARAM(info as isize));
+        assert_eq!(dl.update_version.as_deref(), Some(newer.as_str()));
+        assert!(dl.update_inflight);
+        assert_eq!(dl.update_status.as_deref(), Some("Downloading v9.9.9…"));
+    }
+
+    #[test]
+    fn update_status_with_nothing_new_stays_silent() {
+        // Up-to-date check: empty status frees the button and paints
+        // nothing on the island.
+        let mut app = blank_app();
+        app.update_gen = 5;
+        app.update_inflight = true;
+        let s = Box::into_raw(Box::new((5u32, "".to_owned())));
+        handle_update_msg(&mut app, WPARAM(UPDATE_STATUS), LPARAM(s as isize));
+        assert!(!app.update_inflight);
+        assert_eq!(app.update_status.as_deref(), Some(""));
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).expect("page_state must stay valid JSON");
+        assert_eq!(v["update"]["status"], "");
+        // Stale status: ignored, flight untouched.
+        let mut stale = blank_app();
+        stale.update_gen = 5;
+        stale.update_inflight = true;
+        let s = Box::into_raw(Box::new((
+            4u32,
+            "You are on the latest version.".to_owned(),
+        )));
+        handle_update_msg(&mut stale, WPARAM(UPDATE_STATUS), LPARAM(s as isize));
+        assert!(stale.update_status.is_none());
+        assert!(stale.update_inflight);
+    }
+
+    #[test]
+    fn failed_installer_launch_keeps_app_alive_with_retry() {
+        // ShellExecuteW on a missing path fails (SE_ERR_FNF): no launch,
+        // no side effects — safe to assert directly.
+        assert!(!launch_installer(
+            "C:\\notchbud-test\\no-such-dir\\setup.exe"
+        ));
+        let mut app = blank_app();
+        app.update_inflight = true;
+        let p = Box::into_raw(Box::new(
+            "C:\\notchbud-test\\no-such-dir\\setup.exe".to_owned(),
+        ));
+        handle_update_msg(&mut app, WPARAM(UPDATE_DONE), LPARAM(p as isize));
+        assert!(!app.update_inflight, "failure must free the button");
+        assert_eq!(
+            app.update_status.as_deref(),
+            Some("Couldn't start the installer — try again.")
+        );
+    }
+
+    #[test]
+    fn apply_update_without_known_release_is_noop() {
+        // No version known: returns before spawning any worker — no thread,
+        // no status change. (With a version set it would hit the network,
+        // so that path stays out of unit tests.)
+        let mut app = blank_app();
+        handle_webmsg(&mut app, webmsg(r#"{"type":"apply_update"}"#));
+        assert!(app.update_status.is_none());
+    }
+
+    #[test]
+    fn extra_checks_are_ignored_while_busy() {
+        // A worker already running: extra clicks spawn nothing.
+        let mut app = blank_app();
+        app.update_inflight = true;
+        handle_webmsg(&mut app, webmsg(r#"{"type":"check_update"}"#));
+        assert!(app.update_status.is_none());
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod render;
 pub mod sessions;
 pub mod shot;
 pub mod state;
+pub mod updater;
 pub mod user;
 
 /// Local profile dir: %APPDATA%\notchbud by default. Tests point

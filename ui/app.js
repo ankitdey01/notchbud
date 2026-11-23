@@ -94,6 +94,11 @@
   const settingsDisconnect = el("settings-disconnect");
   // Rename affordance: jumps to the shared Home name step.
   const settingsNameEdit = el("settings-name-edit");
+  // auto-update (free for all): one settings icon, refresh normally,
+  // cloud-download + glow when a Release is newer.
+  const updateBtn = el("update-btn");
+  const updateIconCheck = el("update-icon-check");
+  const updateIconInstall = el("update-icon-install");
 
   let lastScreen = "";
   // Arrow keys arrive as distinct non-Unicode codes (see main.rs
@@ -272,6 +277,29 @@
     if (signingIn && settingsStatus) {
       settingsStatus.hidden = false;
       if (!settingsStatus.textContent) settingsStatus.textContent = "Checking key…";
+    }
+    // Update icon: refresh normally, cloud-download + glow when a newer
+    // Release exists. Click checks or installs. Native title = tooltip.
+    const u = (s && s.update) || {};
+    const has = !!u.available;
+    const ustatus = (u.status && String(u.status)) || "";
+    const busy = /checking|downloading|restarting/i.test(ustatus);
+    if (updateIconCheck) updateIconCheck.hidden = has;
+    if (updateIconInstall) updateIconInstall.hidden = !has;
+    if (updateBtn) {
+      updateBtn.classList.toggle("has-update", has && !busy);
+      updateBtn.classList.toggle("is-busy", busy);
+      const label = has && u.version ? "Install version " + u.version : "Check for updates";
+      updateBtn.title = label;
+      updateBtn.setAttribute("aria-label", label);
+      updateBtn.onclick = () => { if (!busy) post({ type: has ? "apply_update" : "check_update" }); };
+    }
+    // Update results ride the Settings status line so they stay visible
+    // even when idle; the transient Checking… never paints (the spinning
+    // icon is the feedback). The tooltip stays action-focused.
+    if (settingsStatus) {
+      if (/^checking/i.test(ustatus)) setStatus(settingsStatus, "");
+      else if (ustatus) setStatus(settingsStatus, ustatus);
     }
   }
 

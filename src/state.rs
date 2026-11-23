@@ -429,6 +429,15 @@ pub struct App {
     /// Display thumb for the pending shot: previews in the pill, then
     /// rides the history turn (history keeps the cheap thumb only).
     pub pending_thumb: String,
+    pub update_inflight: bool,
+    /// Owner generation of the active manual check (0 = none). Worker
+    /// results carry their generation; stale ones are dropped so a late
+    /// reply can never clobber a newer check, and background discovery
+    /// (gen 0) never disturbs an active check or download.
+    pub update_gen: u32,
+    pub update_version: Option<String>,
+    pub update_url: Option<String>,
+    pub update_status: Option<String>,
 
     // geometry snapshot refreshed each frame (NCHITTEST hit surface)
     pub bar_area: [f32; 4],
@@ -468,6 +477,11 @@ impl App {
             pending_delete: String::new(),
             pending_image: String::new(),
             pending_thumb: String::new(),
+            update_inflight: false,
+            update_gen: 0,
+            update_version: None,
+            update_url: None,
+            update_status: None,
             bar_area: [0.0; 4],
             rgn_area: [0.0; 4],
             win_x: 0,
@@ -606,6 +620,7 @@ impl App {
                 .map(|s| s.display_title())
                 .unwrap_or_default()
         );
+        v["update"] = serde_json::json!({"available": self.update_version.is_some(),"version": self.update_version,"status": self.update_status});
         v.to_string()
     }
 
@@ -784,6 +799,29 @@ mod tests {
             serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["screen"], "chat");
         assert_eq!(v["page"], "chat");
+    }
+
+    #[test]
+    fn update_state_flows_into_page_state() {
+        // Up to date: the island shows no glow, no version, no status.
+        let mut app = blank_app();
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["update"]["available"], false);
+        assert!(v["update"]["version"].is_null());
+        assert!(v["update"]["status"].is_null());
+        // New release known: the button glows with the version.
+        app.update_version = Some("0.9.9".into());
+        app.update_url = Some("https://x/setup.exe".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["update"]["available"], true);
+        assert_eq!(v["update"]["version"], "0.9.9");
+        // Transient worker line (Checking…/Downloading…/error) rides along.
+        app.update_status = Some("Downloading v0.9.9…".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&app.page_state()).unwrap();
+        assert_eq!(v["update"]["status"], "Downloading v0.9.9…");
     }
 
     #[test]
