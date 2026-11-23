@@ -294,13 +294,9 @@
       updateBtn.setAttribute("aria-label", label);
       updateBtn.onclick = () => { if (!busy) post({ type: has ? "apply_update" : "check_update" }); };
     }
-    // Update results ride the Settings status line so they stay visible
-    // even when idle; the transient Checking… never paints (the spinning
-    // icon is the feedback). The tooltip stays action-focused.
-    if (settingsStatus) {
-      if (/^checking/i.test(ustatus)) setStatus(settingsStatus, "");
-      else if (ustatus) setStatus(settingsStatus, ustatus);
-    }
+    // Update states never paint text: the icon (spin/glow) plus the
+    // action-focused tooltip are the only visible feedback. `ustatus`
+    // still drives `busy` above, and every outcome is in the console log.
   }
 
   // Rust -> web: full state render. Inputs are owned by key()/typing:
