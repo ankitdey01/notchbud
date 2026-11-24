@@ -56,6 +56,7 @@ const TIMER_IDLE_RGN: usize = 3;
 // one-shot: reveal the web page once the open spring has settled, so DWM
 // composites the live Chromium surface only after the shell stops moving
 const TIMER_WEB_SHOW: usize = 4;
+const TIMER_WEB_SUSPEND: usize = 5;
 
 // Chat pane backend: Groq API key (https://console.groq.com/keys), sealed
 // with DPAPI. External URLs always open in the system browser, never in the
@@ -175,6 +176,18 @@ unsafe fn schedule_web_show(hwnd: HWND) {
     KillTimer(Some(hwnd), TIMER_WEB_SHOW).ok();
     let delay = web_show_delay_secs();
     SetTimer(Some(hwnd), TIMER_WEB_SHOW, (delay * 1000.0).ceil() as u32, None);
+}
+
+unsafe fn schedule_web_suspend(hwnd: HWND) {
+    if island_web::mark_idle() && !hwnd.is_invalid() {
+        SetTimer(Some(hwnd), TIMER_WEB_SUSPEND, island_web::IDLE_TIMEOUT_MS, None);
+    }
+}
+
+unsafe fn resume_web(hwnd: HWND) {
+    KillTimer(Some(hwnd), TIMER_WEB_SUSPEND).ok();
+    KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
+    island_web::resume();
 }
 
 // Reveal the page the moment the open spring settles, so the compositor
@@ -366,7 +379,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // however it is (hidden, or faded mid-close) and is
                     // reshown + faded in after the settle.
                     unsafe {
-                        KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
+                        resume_web(hwnd);
                     }
                     render::animate(true);
                     render::draw_now(app);
@@ -400,14 +413,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Post-settle teardown: the spring is done, so destroying
                     // the Chromium surface (and swapping the region) is
                     // invisible. Never hide mid-spring.
-                    island_web::set_visible(false);
-                    after_state_change(app);
+                    if !app.expanded {
+                        island_web::set_visible(false);
+                        after_state_change(app);
+                    }
                 }
                 TIMER_WEB_SHOW => {
                     KillTimer(Some(hwnd), TIMER_WEB_SHOW).ok();
                     // Late leave wins: only reveal if still expanded.
                     if app.expanded {
                         show_web_now(app);
+                    }
+                }
+                TIMER_WEB_SUSPEND => {
+                    if app.expanded || (!app.chat.streaming && island_web::try_suspend()) {
+                        KillTimer(Some(hwnd), TIMER_WEB_SUSPEND).ok();
                     }
                 }
                 _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -460,12 +480,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 {
                     app.expanded = !app.expanded;
                     ISLAND_ACTIVE.store(app.expanded, Ordering::Release);
+                    if app.expanded {
+                        resume_web(hwnd);
+                    }
                     render::animate(app.expanded);
                     render::draw_now(app);
                     if app.expanded {
-                        unsafe {
-                            KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
-                        }
                         after_state_change(app);
                         island_web::layout(app.scale);
                         push_web(app); // paint while hidden so reveal shows content, not a flash
@@ -538,7 +558,8 @@ fn collapse(app: &mut state::App) {
         schedule_idle_region(
             app.hwnd,
             state::CLOSE_SETTLE + state::CLOSE_DELAY + 0.12,
-        )
+        );
+        schedule_web_suspend(app.hwnd);
     };
 }
 
@@ -559,6 +580,7 @@ fn handle_tray_menu(app: &mut state::App) {
                 // island so the sign-in page shows.
                 app.expanded = true;
                 ISLAND_ACTIVE.store(true, Ordering::Release);
+                resume_web(app.hwnd);
                 render::animate(true);
                 render::draw_now(app);
                 after_state_change(app);
@@ -1853,6 +1875,9 @@ fn main() -> Result<()> {
             render::draw_now(app);
             after_state_change(app);
             verify_saved_key(app);
+            if !app.expanded {
+                schedule_web_suspend(hwnd);
+            }
         }
         spawn_update_loop(hwnd);
 

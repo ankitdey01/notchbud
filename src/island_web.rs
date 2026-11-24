@@ -8,11 +8,12 @@
 // The low-level keyboard hook never calls in directly — it posts WM_KEY
 // like before, and the wndproc forwards into `forward_key`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT, WPARAM, LPARAM};
@@ -23,7 +24,7 @@ use webview2_com::{
     Microsoft::Web::WebView2::Win32::*,
     CoTaskMemPWSTR, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, ExecuteScriptCompletedHandler,
-    NavigationCompletedEventHandler, WebMessageReceivedEventHandler, take_pwstr,
+    NavigationCompletedEventHandler, TrySuspendCompletedHandler, WebMessageReceivedEventHandler, take_pwstr,
 };
 
 use crate::state::{ISLAND_H, ISLAND_W, ISLAND_X};
@@ -40,6 +41,114 @@ thread_local! {
     static CONTROLLER: RefCell<Option<ICoreWebView2Controller>> = const { RefCell::new(None) };
     static WEBVIEW: RefCell<Option<ICoreWebView2>> = const { RefCell::new(None) };
     static PENDING: RefCell<Option<String>> = const { RefCell::new(None) };
+    static PAGE_LOADED: Cell<bool> = const { Cell::new(false) };
+    static IDLE: RefCell<IdleState> = RefCell::new(IdleState::default());
+}
+
+pub const IDLE_TIMEOUT_MS: u32 = 5_000;
+
+#[derive(Default)]
+struct IdleState {
+    since: Option<Instant>,
+    request: Option<Instant>,
+    suspended: bool,
+}
+
+impl IdleState {
+    fn can_suspend(&self, now: Instant) -> bool {
+        self.request.is_none()
+            && !self.suspended
+            && self.since.is_some_and(|since| {
+                now.duration_since(since) >= Duration::from_millis(IDLE_TIMEOUT_MS.into())
+            })
+    }
+
+    fn resume(&mut self) {
+        self.since = None;
+        self.suspended = false;
+        // Keep the outstanding request until its callback: never overlap requests.
+    }
+
+    fn complete(&mut self, success: bool) -> bool {
+        let current = self
+            .request
+            .take()
+            .is_some_and(|since| Some(since) == self.since);
+        self.suspended = success && current;
+        success && !current // a hover invalidated this request: resume again
+    }
+
+    fn blocks_scripts(&self) -> bool {
+        self.suspended || (self.request.is_some() && self.request == self.since)
+    }
+}
+
+/// Start one idle period; duplicate leave messages must not extend it.
+pub fn mark_idle() -> bool {
+    IDLE.with_borrow_mut(|idle| {
+        let start_timer = idle.since.is_none();
+        idle.since.get_or_insert_with(Instant::now);
+        start_timer
+    })
+}
+
+/// Warm the renderer during the native opening animation, before it is visible.
+pub fn resume() {
+    IDLE.with_borrow_mut(IdleState::resume);
+    with_webview(|wv| {
+        if let Ok(wv3) = wv.cast::<ICoreWebView2_3>() {
+            if let Err(e) = unsafe { wv3.Resume() } {
+                log_webview_event(&format!("webview resume failed: {e:#}"));
+            }
+        }
+    });
+}
+
+/// Returns true when the idle timer can stop (attempted or unsupported).
+/// A queued timer, slow initial navigation or an older request must wait.
+pub fn try_suspend() -> bool {
+    if !READY.load(Ordering::Acquire) {
+        return true; // startup failed: no WebView to suspend
+    }
+    if !PAGE_LOADED.get() || !IDLE.with_borrow(|idle| idle.can_suspend(Instant::now())) {
+        return false;
+    }
+    let hidden = CONTROLLER.with_borrow(|c| {
+        c.as_ref().is_some_and(|c| unsafe {
+            let mut visible = windows::core::BOOL(1);
+            c.IsVisible(&mut visible).is_ok() && !visible.as_bool()
+        })
+    });
+    if !hidden {
+        return false;
+    }
+    with_webview(|wv| {
+        let Ok(wv3) = wv.cast::<ICoreWebView2_3>() else {
+            return;
+        };
+        IDLE.with_borrow_mut(|idle| idle.request = idle.since);
+        let resume_view = wv3.clone();
+        let handler = TrySuspendCompletedHandler::create(Box::new(move |result, success| {
+            let success = result.is_ok() && success;
+            let stale = IDLE.with_borrow_mut(|idle| idle.complete(success));
+            if stale {
+                // Resume may have run before TrySuspend actually completed.
+                if let Err(e) = unsafe { resume_view.Resume() } {
+                    log_webview_event(&format!("webview resume after suspension failed: {e:#}"));
+                }
+            } else if !success {
+                log_webview_event(&format!("webview suspension declined: {result:?}"));
+            }
+            Ok(())
+        }));
+        if let Err(e) = unsafe { wv3.TrySuspend(&handler) } {
+            IDLE.with_borrow_mut(|idle| {
+                idle.complete(false);
+            });
+            log_webview_event(&format!("webview suspend failed: {e:#}"));
+        }
+    });
+    true
 }
 
 fn with_controller(f: impl FnOnce(&ICoreWebView2Controller)) {
@@ -428,6 +537,7 @@ pub fn init(parent: HWND, scale: f32) {
         let _ = wv.add_NavigationCompleted(
             &NavigationCompletedEventHandler::create(Box::new(
                 move |_wv: Option<ICoreWebView2>, _args: Option<ICoreWebView2NavigationCompletedEventArgs>| {
+                    PAGE_LOADED.set(true);
                     flush_pending();
                     Ok(())
                 },
@@ -484,6 +594,11 @@ pub fn fade_in() {
 }
 
 fn exec(js: &str) {
+    // Rust still receives auth/update/worker results while hidden. Keep their
+    // latest state in PENDING without waking Chromium or queuing stale scripts.
+    if IDLE.with_borrow(IdleState::blocks_scripts) {
+        return;
+    }
     let js_owned = js.to_owned();
     with_webview(|wv| unsafe {
         let pw = CoTaskMemPWSTR::from(js_owned.as_str());
@@ -529,4 +644,103 @@ pub fn forward_shortcut(name: &str) {
         .filter(|c| c.is_ascii_alphabetic())
         .collect();
     exec(&format!("window.notchbud&&window.notchbud.shortcut(\"{safe}\")"));
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    #[test]
+    fn waits_five_seconds_and_does_not_suspend_an_active_view() {
+        let now = Instant::now();
+        let mut idle = IdleState::default();
+        assert!(!idle.can_suspend(now));
+        idle.since = Some(now);
+        assert!(!idle.can_suspend(now + Duration::from_millis(4_999)));
+        assert!(idle.can_suspend(now + Duration::from_secs(5)));
+        idle.resume();
+        assert!(!idle.can_suspend(now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn suspends_once_and_resume_unblocks_scripts() {
+        let now = Instant::now();
+        let mut idle = IdleState {
+            since: Some(now),
+            request: Some(now),
+            suspended: false,
+        };
+        assert!(idle.blocks_scripts());
+        assert!(!idle.can_suspend(now + Duration::from_secs(5)));
+        assert!(!idle.complete(true));
+        assert!(idle.suspended);
+        assert!(idle.blocks_scripts());
+        assert!(!idle.can_suspend(now + Duration::from_secs(60)));
+        idle.resume();
+        assert!(!idle.suspended);
+        assert!(!idle.blocks_scripts());
+    }
+
+    #[test]
+    fn hover_during_suspend_requires_another_resume_on_completion() {
+        let now = Instant::now();
+        let mut idle = IdleState {
+            since: Some(now),
+            request: Some(now),
+            suspended: false,
+        };
+        idle.resume();
+        assert!(!idle.blocks_scripts()); // expansion can paint immediately
+        assert!(idle.complete(true));
+        assert!(!idle.suspended);
+        assert!(idle.request.is_none());
+    }
+
+    #[test]
+    fn reopen_then_close_cannot_reuse_an_old_suspend_request() {
+        let now = Instant::now();
+        let mut idle = IdleState {
+            since: Some(now),
+            request: Some(now),
+            suspended: false,
+        };
+        idle.resume();
+        let closed_again = now + Duration::from_secs(6);
+        idle.since = Some(closed_again);
+        assert!(!idle.blocks_scripts()); // the new close fade must still run
+        assert!(!idle.can_suspend(closed_again + Duration::from_secs(5)));
+        assert!(idle.complete(true));
+        assert!(!idle.can_suspend(closed_again + Duration::from_secs(4)));
+        assert!(idle.can_suspend(closed_again + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn failed_or_declined_suspend_does_not_block_updates() {
+        let now = Instant::now();
+        let mut idle = IdleState {
+            since: Some(now),
+            request: Some(now),
+            suspended: false,
+        };
+        assert!(!idle.complete(false));
+        assert!(!idle.blocks_scripts());
+        assert!(!idle.suspended);
+        assert!(idle.request.is_none());
+    }
+
+    #[test]
+    fn duplicate_leave_keeps_deadline_and_suspended_updates_keep_latest_state() {
+        IDLE.with_borrow_mut(|idle| *idle = IdleState::default());
+        assert!(mark_idle());
+        let since = IDLE.with_borrow(|idle| idle.since);
+        assert!(!mark_idle());
+        assert_eq!(IDLE.with_borrow(|idle| idle.since), since);
+        IDLE.with_borrow_mut(|idle| idle.suspended = true);
+        push_state(r#"{"status":"old"}"#);
+        push_state(r#"{"status":"new"}"#);
+        assert!(PENDING.with_borrow(|pending| pending.as_ref().unwrap().contains("new")));
+        assert!(IDLE.with_borrow(IdleState::blocks_scripts));
+        resume();
+        assert!(!IDLE.with_borrow(IdleState::blocks_scripts));
+    }
 }
