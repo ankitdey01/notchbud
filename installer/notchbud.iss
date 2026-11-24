@@ -8,7 +8,7 @@
 ;   ISCC.exe installer\notchbud.iss
 ; or invoke the compiler by full path:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\notchbud.iss
-; Output: installer\Output\Notchbud-Setup-0.1.6.exe
+; Output: installer\Output\Notchbud-Setup-{version}.exe (gitignored; built by CI)
 ;
 ; What the user sees:
 ;   - Folder picker (default: %LOCALAPPDATA%\Programs\Notchbud)

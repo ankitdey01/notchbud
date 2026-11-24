@@ -62,7 +62,7 @@ It uses your own Groq API key. There is no notchbud server in between.
 ## Download
 
 1. Go to [Releases](https://github.com/ankitdey01/notchbud/releases).
-2. Download `Notchbud-Setup-0.1.6.exe` and run it.
+2. Download the setup exe from the latest release and run it.
 3. Hover the notch and paste your Groq key from [console.groq.com/keys](https://console.groq.com/keys) when asked.
 
 Needs Windows (64 bit), WebView2 Runtime, and a Groq API key.

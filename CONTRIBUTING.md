@@ -61,7 +61,7 @@ cargo build --release
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\notchbud.iss
 ```
 
-The setup exe lands in `installer/Output/`. The install is per user with no admin rights.
+The setup exe lands in `installer/Output/` — gitignored, built by the release workflow, never commit it. The install is per user with no admin rights.
 
 ## Releases
 
