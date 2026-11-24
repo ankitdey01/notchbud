@@ -8,7 +8,7 @@
 ;   ISCC.exe installer\notchbud.iss
 ; or invoke the compiler by full path:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\notchbud.iss
-; Output: installer\Output\Notchbud-Setup-0.1.5.exe
+; Output: installer\Output\Notchbud-Setup-0.1.6.exe
 ;
 ; What the user sees:
 ;   - Folder picker (default: %LOCALAPPDATA%\Programs\Notchbud)
@@ -20,7 +20,7 @@
 ; HKCU (Run key) + %APPDATA%\notchbud\auth.bin at runtime.
 
 #define MyAppName "Notchbud"
-#define MyAppVersion "0.1.5"
+#define MyAppVersion "0.1.6"
 #define MyAppExe "notchbud.exe"
 #define MyAppPublisher "Notchbud"
 
