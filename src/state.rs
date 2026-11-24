@@ -385,6 +385,13 @@ impl Chat {
     }
 }
 
+/// A response belongs to its session, independently of the displayed page.
+pub struct PendingReply {
+    pub session_id: String,
+    pub chat: Chat,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub struct App {
     pub hwnd: windows::Win32::Foundation::HWND,
     pub scale: f32,
@@ -392,10 +399,12 @@ pub struct App {
     pub height: i32,
 
     pub expanded: bool, // false = idle sliver, true = island shown
+    pub web_visible: bool, // content has been revealed after the opening spring
     pub mouse_inside: bool,
 
     // island chat backend (history + tokens); content renders in WebView2
     pub chat: Chat,
+    pub replies: std::collections::HashMap<u32, PendingReply>,
 
     /// Local display name ("What should we call you?"). Plain text on disk,
     /// empty until the user answers. Survives disconnects (it is device
@@ -466,8 +475,10 @@ impl App {
             width,
             height,
             expanded: false,
+            web_visible: false,
             mouse_inside: false,
             chat: Chat::new(),
+            replies: std::collections::HashMap::new(),
             display_name: String::new(),
             rename: false,
             overlay: Overlay::None,
@@ -571,8 +582,7 @@ impl App {
     /// `needsName` owns Home until answered — the page shows the name box
     /// INSTEAD of the chat box, never both (mirrors SignIn owning the
     /// frame when signed out); `email` stays null (an API key carries
-    /// none); notifications reads `notifications` (empty until dynamic
-    /// — the page shows its hardcoded empty state meanwhile); chats reads
+    /// none); notifications reads unread completed responses; chats reads
     /// `sessions` (linear, newest first: id/title/preview) plus
     /// `currentId` for the live session.
     pub fn page_state(&self) -> String {
@@ -592,7 +602,13 @@ impl App {
         );
         v["email"] = serde_json::Value::Null;
         v["keyReady"] = serde_json::json!(self.chat.connected());
-        v["notifications"] = serde_json::json!([] as [serde_json::Value; 0]);
+        v["notifications"] = self.sessions.iter().filter(|s| s.unread).map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "title": if s.error.is_some() { "Response interrupted" } else { "Response ready" },
+                "text": s.display_title(),
+            })
+        }).collect();
         let sessions: Vec<serde_json::Value> = self
             .sessions
             .iter()

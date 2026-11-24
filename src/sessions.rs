@@ -14,7 +14,7 @@ pub struct StoredTurn {
     pub text: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     #[serde(default)]
@@ -23,6 +23,10 @@ pub struct Session {
     pub updated_ms: u64,
     #[serde(default)]
     pub messages: Vec<StoredTurn>,
+    #[serde(default)]
+    pub unread: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl Session {
@@ -164,6 +168,7 @@ pub fn snapshot(id: &str, title: &str, history: &[(Role, String, Option<String>)
                 text: text.clone(),
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -177,6 +182,8 @@ mod tests {
         let v: Vec<Session> = serde_json::from_str(r#"[{"id":"a","messages":[]}]"#).unwrap();
         assert_eq!(v[0].title, "");
         assert_eq!(v[0].display_title(), "New chat");
+        assert!(!v[0].unread);
+        assert!(v[0].error.is_none());
     }
 
     #[test]
@@ -189,6 +196,7 @@ mod tests {
                 role: "user".into(),
                 text: "hello".into(),
             }],
+            ..Default::default()
         };
         assert_eq!(s.display_title(), "Trip Ideas");
         s.title.clear();
@@ -213,6 +221,7 @@ mod tests {
                     text: "hey there".into(),
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(s.preview(), "hey there");
         let long = Session {
@@ -223,6 +232,7 @@ mod tests {
                 role: "user".into(),
                 text: "x".repeat(100),
             }],
+            ..Default::default()
         };
         assert!(long.preview().ends_with('…'));
         assert!(long.preview().chars().count() <= 81);
@@ -239,6 +249,7 @@ mod tests {
                     title: String::new(),
                     updated_ms: i,
                     messages: vec![],
+                    ..Default::default()
                 },
             );
         }
@@ -259,8 +270,20 @@ mod tests {
     #[test]
     fn remove_drops_only_the_named_session() {
         let mut v = vec![
-            Session { id: "a".into(), title: String::new(), updated_ms: 0, messages: vec![] },
-            Session { id: "b".into(), title: "B".into(), updated_ms: 0, messages: vec![] },
+            Session {
+                id: "a".into(),
+                title: String::new(),
+                updated_ms: 0,
+                messages: vec![],
+                ..Default::default()
+            },
+            Session {
+                id: "b".into(),
+                title: "B".into(),
+                updated_ms: 0,
+                messages: vec![],
+                ..Default::default()
+            },
         ];
         assert!(remove(&mut v, "a"));
         assert_eq!(v.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b"]);
