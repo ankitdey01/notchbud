@@ -60,6 +60,7 @@ fn sess(id: &str, title: &str) -> Session {
             role: "user".into(),
             text: "hi".into(),
         }],
+        ..Default::default()
     }
 }
 

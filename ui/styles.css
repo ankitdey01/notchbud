@@ -1095,7 +1095,7 @@ body {
     color: #007AFF;
 }
 
-/* notifications empty state (hardcoded until a dynamic feed lands) */
+/* notifications empty state */
 .empty {
     display: flex;
     flex-direction: column;

@@ -70,7 +70,7 @@
   const navNotifications = el("nav-notifications");
   const navSettings = el("nav-settings");
 
-  // notifications page (hardcoded empty state until a dynamic feed lands)
+  // Unread response completions link back to their saved chat.
   const notifEmpty = el("notif-empty");
   const notifList = el("notif-list");
 
@@ -228,7 +228,6 @@
     const items = Array.isArray(s.notifications) ? s.notifications : [];
     if (!notifEmpty || !notifList) return;
     if (items.length === 0) {
-      // Hardcoded until dynamic: the empty state owns the page.
       notifEmpty.hidden = false;
       notifList.hidden = true;
       notifList.innerHTML = "";
@@ -237,11 +236,22 @@
     notifEmpty.hidden = true;
     notifList.hidden = false;
     notifList.innerHTML = "";
-    for (const n of items.slice(0, 20)) {
-      const d = document.createElement("div");
-      d.className = "notif-item";
-      d.textContent = typeof n === "string" ? n : (n && n.text) || "";
-      notifList.appendChild(d);
+    for (const n of items.slice(0, 50)) {
+      const row = document.createElement("div");
+      row.className = "notif-item chat-row";
+      const open = document.createElement("button");
+      open.className = "chat-open";
+      open.type = "button";
+      const title = document.createElement("span");
+      title.className = "chat-title";
+      title.textContent = n.title || "Response ready";
+      const preview = document.createElement("span");
+      preview.className = "chat-preview";
+      preview.textContent = n.text || "New chat";
+      open.append(title, preview);
+      open.addEventListener("click", () => post({ type: "open_session", id: n.id }));
+      row.appendChild(open);
+      notifList.appendChild(row);
     }
   }
 
@@ -482,6 +492,9 @@
     const known = Object.prototype.hasOwnProperty.call(RENDERERS, page);
     show(known ? page : "home", overlay);
     setTopbarActive(page);
+    const unread = Array.isArray(s.notifications) ? s.notifications.length : 0;
+    el("notif-dot").hidden = unread === 0;
+    navNotifications.setAttribute("aria-label", unread ? `Notifications (${unread} unread)` : "Notifications");
     (RENDERERS[known ? page : "home"] || (() => {}))(s);
     isStreaming = !!s.streaming;
     awaitingAck = false;
