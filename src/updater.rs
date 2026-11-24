@@ -48,8 +48,10 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 }
 
 /// Pick the Inno Setup asset from a `/releases/latest` payload.
-/// shortcut: exact asset-name matching is skipped — any `.exe` with
-/// "setup" in the name wins, first match.
+/// The asset named for this tag (`Notchbud-Setup-{version}.exe`) wins:
+/// a release can carry a stale setup from an older tag (glob upload),
+/// and installing that re-triggers the same update forever. Falls back
+/// to the first setup exe only when nothing is versioned.
 pub fn pick_setup_asset(release: &serde_json::Value) -> Option<(String, String)> {
     let tag = release.get("tag_name")?.as_str()?;
     let version = clean_tag(tag);
@@ -57,17 +59,26 @@ pub fn pick_setup_asset(release: &serde_json::Value) -> Option<(String, String)>
         return None;
     }
     let assets = release.get("assets")?.as_array()?;
+    let wanted = format!("notchbud-setup-{version}.exe");
+    let mut fallback: Option<String> = None;
     for a in assets {
         let name = a.get("name")?.as_str().unwrap_or("");
         let url = a.get("browser_download_url")?.as_str().unwrap_or("");
         if url.is_empty() {
             continue;
         }
-        if name.to_lowercase().contains(SETUP_MARKER) && name.to_lowercase().ends_with(".exe") {
+        let lower = name.to_lowercase();
+        if !(lower.contains(SETUP_MARKER) && lower.ends_with(".exe")) {
+            continue;
+        }
+        if lower == wanted {
             return Some((version, url.to_owned()));
         }
+        if fallback.is_none() {
+            fallback = Some(url.to_owned());
+        }
     }
-    None
+    fallback.map(|url| (version, url))
 }
 
 /// One synchronous check against the GitHub API.
@@ -208,6 +219,23 @@ mod tests {
             "assets": [{"name": "Notchbud-Setup-0.1.4.exe", "browser_download_url": ""}]
         });
         assert!(pick_setup_asset(&empty_url).is_none());
+    }
+
+    #[test]
+    fn ignores_stale_setup_from_an_older_tag() {
+        // The v0.1.6 release carried a leftover 0.1.5 setup (glob
+        // upload): installing it re-offered the same update forever.
+        let v = serde_json::json!({
+            "tag_name": "v0.1.6",
+            "assets": [
+                {"name": "Notchbud-Setup-0.1.5.exe", "browser_download_url": "https://x/stale.exe"},
+                {"name": "notchbud.exe", "browser_download_url": "https://x/e.exe"},
+                {"name": "Notchbud-Setup-0.1.6.exe", "browser_download_url": "https://x/fresh.exe"},
+            ]
+        });
+        let (ver, url) = pick_setup_asset(&v).expect("versioned setup must win");
+        assert_eq!(ver, "0.1.6");
+        assert_eq!(url, "https://x/fresh.exe");
     }
 
     #[test]
