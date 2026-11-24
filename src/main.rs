@@ -1484,8 +1484,9 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                         post_delta(d);
                         true
                     }
-                },
-            );
+                }
+                _ => true,
+            });
             if cancelled() {
                 return;
             }
