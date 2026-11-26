@@ -24,8 +24,7 @@ impl TempDataDir {
         let name = format!("notchbud-sess-{}-{n}", std::process::id());
         // Prefer the OS temp dir; fall back to the repo target dir when
         // writes outside the workspace are denied (sandboxed runs).
-        let ws_fallback =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let ws_fallback = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
         let dir = [std::env::temp_dir(), ws_fallback]
             .into_iter()
             .map(|b| b.join(&name))
@@ -33,7 +32,11 @@ impl TempDataDir {
             .expect("no writable temp dir for tests");
         let prev = std::env::var_os("NOTCHBUD_DATA_DIR");
         std::env::set_var("NOTCHBUD_DATA_DIR", &dir);
-        TempDataDir { _lock: lock, dir, prev }
+        TempDataDir {
+            _lock: lock,
+            dir,
+            prev,
+        }
     }
 
     fn path(&self) -> std::path::PathBuf {

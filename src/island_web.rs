@@ -16,15 +16,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{HWND, RECT, WPARAM, LPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use webview2_com::{
-    Microsoft::Web::WebView2::Win32::*,
-    CoTaskMemPWSTR, CreateCoreWebView2ControllerCompletedHandler,
+    take_pwstr, CoTaskMemPWSTR, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, ExecuteScriptCompletedHandler,
-    NavigationCompletedEventHandler, TrySuspendCompletedHandler, WebMessageReceivedEventHandler, take_pwstr,
+    Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
+    TrySuspendCompletedHandler, WebMessageReceivedEventHandler,
 };
 
 use crate::state::{ISLAND_H, ISLAND_W, ISLAND_X};
@@ -213,7 +213,10 @@ pub fn pick_user_data_dir(base: Option<&OsStr>) -> Option<PathBuf> {
     pick_user_data_dir_with(base, &default_write_probe)
 }
 
-pub fn pick_user_data_dir_with(base: Option<&OsStr>, probe: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+pub fn pick_user_data_dir_with(
+    base: Option<&OsStr>,
+    probe: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let base = base?;
     // Explicit user data folder under LOCALAPPDATA so WebView2 never
     // depends on the executable-relative default. The installer default
@@ -241,7 +244,11 @@ pub fn pick_user_data_dir_with(base: Option<&OsStr>, probe: &dyn Fn(&Path) -> bo
 /// synchronous, and the exact capability WebView2 needs from the profile.
 pub fn default_write_probe(dir: &Path) -> bool {
     let probe = dir.join(".notchbud-write-probe");
-    match std::fs::OpenOptions::new().write(true).create(true).open(&probe) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&probe)
+    {
         Ok(_) => std::fs::remove_file(&probe).is_ok(),
         Err(_) => false,
     }
@@ -252,8 +259,7 @@ pub fn default_write_probe(dir: &Path) -> bool {
 /// live WebView2 (stale notchbud/msedgewebview2 after a kill). The plain
 /// write probe still passes in that state, so only this classification
 /// tells init to retry on a fresh profile instead of leaving a black island.
-pub const HRESULT_BUSY: windows::core::HRESULT =
-    windows::core::HRESULT(0x800700AAu32 as i32);
+pub const HRESULT_BUSY: windows::core::HRESULT = windows::core::HRESULT(0x800700AAu32 as i32);
 
 /// True when a controller/env error is the retryable profile-locked case.
 pub fn is_busy_hresult(hr: windows::core::HRESULT) -> bool {
@@ -315,7 +321,11 @@ fn log_webview_event(line: &str) {
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 512 * 1024 {
         let _ = std::fs::remove_file(&path);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         use std::io::Write;
         let _ = writeln!(f, "[notchbud] {line}");
     }
@@ -373,7 +383,9 @@ fn create_environment(attempt: &EnvDir) -> Option<ICoreWebView2Environment> {
                 }
             },
             Err(e) => {
-                log_webview_event(&format!("CreateCoreWebView2Environment ({attempt:?}): {e:#}"));
+                log_webview_event(&format!(
+                    "CreateCoreWebView2Environment ({attempt:?}): {e:#}"
+                ));
                 None
             }
         }
@@ -417,9 +429,7 @@ fn create_controller(
                     None
                 }
                 _ => {
-                    log_webview_event(&format!(
-                        "webview controller failed ({attempt:?}): none"
-                    ));
+                    log_webview_event(&format!("webview controller failed ({attempt:?}): none"));
                     None
                 }
             },
@@ -446,7 +456,9 @@ pub fn init(parent: HWND, scale: f32) {
     if already {
         return;
     }
-    unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); }
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
 
     PARENT_HWND.store(parent.0 as isize, Ordering::Relaxed);
 
@@ -536,7 +548,8 @@ pub fn init(parent: HWND, scale: f32) {
         let mut nav_token = 0i64;
         let _ = wv.add_NavigationCompleted(
             &NavigationCompletedEventHandler::create(Box::new(
-                move |_wv: Option<ICoreWebView2>, _args: Option<ICoreWebView2NavigationCompletedEventArgs>| {
+                move |_wv: Option<ICoreWebView2>,
+                      _args: Option<ICoreWebView2NavigationCompletedEventArgs>| {
                     PAGE_LOADED.set(true);
                     flush_pending();
                     Ok(())
@@ -602,8 +615,7 @@ fn exec(js: &str) {
     let js_owned = js.to_owned();
     with_webview(|wv| unsafe {
         let pw = CoTaskMemPWSTR::from(js_owned.as_str());
-        let handler =
-            ExecuteScriptCompletedHandler::create(Box::new(|_code, _result| Ok(())));
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_code, _result| Ok(())));
         let _ = wv.ExecuteScript(*pw.as_ref().as_pcwstr(), &handler);
     });
 }
@@ -639,11 +651,10 @@ pub fn forward_shortcut(name: &str) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
-    let safe: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphabetic())
-        .collect();
-    exec(&format!("window.notchbud&&window.notchbud.shortcut(\"{safe}\")"));
+    let safe: String = name.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    exec(&format!(
+        "window.notchbud&&window.notchbud.shortcut(\"{safe}\")"
+    ));
 }
 
 #[cfg(test)]

@@ -35,6 +35,21 @@
   const keyEntry = el("key-entry");
   const keySend = el("key-send");
   const groqKey = el("groq-key");
+  const customBtn = el("custom-btn");
+  const customFlow = el("custom-flow");
+  const customProgress = el("custom-progress");
+  const customStepLabel = el("custom-step-label");
+  const customBaseUrl = el("custom-base-url");
+  const customApiKey = el("custom-api-key");
+  const customKeyStatus = el("custom-key-status");
+  const customModel = el("custom-model");
+  const customModelToggle = el("custom-model-toggle");
+  const customModelList = el("custom-model-list");
+  const customCatalogStatus = el("custom-catalog-status");
+  const navBack = el("nav-back");
+  const customBack = el("custom-back");
+  const signinCancel = el("signin-cancel");
+  const customSteps = [el("custom-url-step"), el("custom-key-step"), el("custom-model-step")];
   const topbar = document.querySelector(".topbar");
   const greeting = el("greeting");
   const homeGreet = el("home-greet");
@@ -88,7 +103,6 @@
   const settingsName = el("settings-name");
   const settingsEmail = el("settings-email");
   const settingsPlan = el("settings-plan");
-  const settingsDot = el("settings-dot");
   const settingsStatus = el("settings-status");
   const settingsSignin = el("settings-signin");
   const settingsDisconnect = el("settings-disconnect");
@@ -130,16 +144,126 @@
       if (p.send) p.send.disabled = isStreaming || awaitingAck || !(p.input && p.input.value.trim());
     }
   }
-  // Local-only step: landing (two buttons) -> key entry (input + up arrow).
-  // Rust never sees this; submitKey posts save_key and Rust owns verify.
+  // Local provider steps retain their drafts across native state pushes.
   let keyEntering = false;
+  let customStep = 0;
+  let latestState = {};
+  let modelSignature = "";
+  let customKeyPending = false;
+
+  function setCustomKeyPending(on) {
+    customKeyPending = on;
+    customApiKey.readOnly = on;
+  }
+
+  function syncSigninBack() {
+    if (customBack) customBack.hidden = customStep === 0;
+    if (signinCancel) signinCancel.hidden = customStep > 0 || !(keyEntering || latestState.editingConnection);
+  }
 
   function setKeyEntering(on) {
+    setCustomKeyPending(false);
     keyEntering = on;
+    customStep = 0;
+    setModelOpen(false);
+    syncSigninBack();
+    if (customFlow) customFlow.hidden = true;
     if (signinLanding) signinLanding.hidden = on;
     if (keyEntry) keyEntry.hidden = !on;
     if (on && groqKey) groqKey.focus();
     else if (!on && groqKey) groqKey.value = "";
+  }
+
+  function setCustomStep(step) {
+    setCustomKeyPending(false);
+    setStatus(customKeyStatus, "");
+    customApiKey.removeAttribute("aria-describedby");
+    keyEntering = false;
+    customStep = step;
+    if (step !== 3) setModelOpen(false);
+    syncSigninBack();
+    if (signinLanding) signinLanding.hidden = step > 0;
+    if (keyEntry) keyEntry.hidden = true;
+    if (customFlow) customFlow.hidden = step === 0;
+    customSteps.forEach((form, i) => { if (form) form.hidden = i !== step - 1; });
+    if (step > 0) {
+      if (customProgress) customProgress.value = step;
+      if (customStepLabel) customStepLabel.textContent = `Step ${step} of 3`;
+      syncModelToggle();
+      const input = [customBaseUrl, customApiKey, customModel][step - 1];
+      if (input) input.focus();
+    }
+  }
+
+  function startCustomConnection() {
+    setStatus(signinStatus, "");
+    setStatus(customCatalogStatus, "");
+    const editing = latestState.provider === "custom";
+    if (customBaseUrl) customBaseUrl.value = editing ? (latestState.baseUrl || "") : "";
+    if (customApiKey) customApiKey.value = "";
+    if (customModel) customModel.value = editing ? (latestState.customModel || "") : "";
+    modelSignature = "";
+    setModelOpen(false);
+    setCustomStep(1);
+  }
+
+  // Model picker (Pikaicons chevron-down / chevron-up, stroke): an
+  // island-styled listbox under the askbox. The input stays free text —
+  // the list only offers what the endpoint catalog returned.
+  const CHEVRON_DOWN = '<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10.14a20.4 20.4 0 0 0 3.702 3.893c.175.141.42.141.596 0A20.4 20.4 0 0 0 16 10.14" fill="none" /></svg>';
+  const CHEVRON_UP = '<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 14a20.4 20.4 0 0 1 3.702-3.894.47.47 0 0 1 .596 0A20.4 20.4 0 0 1 16 14" fill="none" /></svg>';
+  let modelOptions = [];
+  let modelOpen = false;
+  let modelHighlight = -1;
+
+  function setModelOpen(open) {
+    modelOpen = open && modelOptions.length > 0 && customStep === 3;
+    if (customModelList) customModelList.hidden = !modelOpen;
+    if (customModel) customModel.setAttribute("aria-expanded", modelOpen ? "true" : "false");
+    if (customModelToggle) {
+      customModelToggle.setAttribute("aria-expanded", modelOpen ? "true" : "false");
+      customModelToggle.innerHTML = modelOpen ? CHEVRON_UP : CHEVRON_DOWN;
+    }
+  }
+
+  function syncModelToggle() {
+    // Visibility, never display: the chevron's slot stays put so the pill
+    // never jumps when the catalog lands.
+    const ready = modelOptions.length > 0 && customStep === 3;
+    if (customModelToggle) {
+      customModelToggle.hidden = false;
+      customModelToggle.style.visibility = ready ? "" : "hidden";
+    }
+    if (!ready) setModelOpen(false);
+    else if (customModel) customModel.setAttribute("aria-expanded", modelOpen ? "true" : "false");
+  }
+
+  function renderModelList() {
+    if (!customModelList || !customModel) return;
+    const q = customModel.value.trim().toLowerCase();
+    const shown = q ? modelOptions.filter((m) => m.toLowerCase().includes(q)) : modelOptions;
+    customModelList.replaceChildren();
+    modelHighlight = shown.findIndex((m) => m === customModel.value);
+    shown.slice(0, 50).forEach((m) => {
+      const b = document.createElement("button");
+      b.className = "model-option" + (m === customModel.value ? " active" : "");
+      b.type = "button";
+      b.setAttribute("role", "option");
+      b.setAttribute("aria-selected", m === customModel.value ? "true" : "false");
+      b.textContent = m;
+      b.title = m;
+      b.addEventListener("mousedown", (e) => {
+        // Mousedown, not click: the input's blur must not close the list first.
+        e.preventDefault();
+        customModel.value = m;
+        customModel.setAttribute("aria-invalid", "false");
+        setModelOpen(false);
+        customModel.focus();
+        renderModelList();
+      });
+      customModelList.appendChild(b);
+    });
+    if (modelHighlight < 0) modelHighlight = -1;
   }
 
   function show(name, overlay) {
@@ -147,12 +271,14 @@
       if (screens[k]) screens[k].hidden = (k !== name);
     }
     lastScreen = name;
+    if (navBack) navBack.hidden = !isOverlayPage(name);
+    if (navMenu) navMenu.hidden = isOverlayPage(name);
     // Minimal signin: no navbar on either step; nothing competes with the key.
     // Chat is chrome-free too (prompt + chats + back only), unless an
     // overlay page rides on top of it. Confirm is a blank island: the
     // question + Yes/No own the whole frame, no navbar.
     if (topbar) topbar.hidden = (name === "signin") || (name === "confirm") || (name === "chat" && overlay === "none");
-    if (name !== "signin" && keyEntering) setKeyEntering(false);
+    if (name !== "signin" && (keyEntering || customStep)) setKeyEntering(false);
   }
 
   function setStatus(node, text) {
@@ -213,9 +339,13 @@
     // owned input always wins (lets the user click between the Home chat
     // and name boxes). Otherwise the Home name box owns keys while shown.
     const ae = document.activeElement;
-    if (ae === homeName || ae === homeInput || ae === chatInput
-        || ae === groqKey) return ae;
+    if (ae === homeName || ae === homeInput || ae === chatInput || ae === groqKey
+        || ae === customBaseUrl || ae === customApiKey || ae === customModel) return ae;
     if (lastScreen === "home" && nameEntry && !nameEntry.hidden && homeName) return homeName;
+    if (lastScreen === "signin" && customStep > 0) {
+      return [customBaseUrl, customApiKey, customModel][customStep - 1];
+    }
+    if (lastScreen === "signin" && !keyEntering) return null;
     const id = PAGE_INPUTS[lastScreen];
     return id ? el(id) : null;
   }
@@ -265,23 +395,25 @@
       const initial = name ? [...name][0].toUpperCase() : null;
       settingsAvatar.textContent = initial || (connected ? "G" : "?");
     }
-    if (settingsName) settingsName.textContent = name || (connected ? "Groq API key" : "Not set yet");
+    const custom = s.provider === "custom";
+    const providerName = custom ? "Custom" : "Groq";
+    if (settingsName) settingsName.textContent = name || (connected ? `${providerName} connection` : "Not set yet");
     if (settingsEmail) {
-      if (connected) settingsEmail.textContent = "Key sealed on this device";
+      if (connected) settingsEmail.textContent = custom ? (s.baseUrl || "Custom endpoint") : "Key sealed on this device";
       else settingsEmail.textContent = "Not signed in";
     }
     if (settingsPlan) {
-      if (!connected) settingsPlan.textContent = "Groq: enter key to check";
+      if (!connected) settingsPlan.textContent = "Choose Groq or a custom endpoint";
+      else if (custom) settingsPlan.textContent = `Custom: ${s.customModel || "configured"}`;
       else if (keyReady) settingsPlan.innerHTML = "Groq: Ready " + READY_ICON;
       else settingsPlan.textContent = "Groq: checking…";
     }
-    if (settingsDot) {
-      settingsDot.classList.toggle("on", connected);
-      settingsDot.classList.toggle("off", !connected);
-    }
     // Transient Rust notice/error (e.g. "Checking key…").
     setStatus(settingsStatus, s.status);
-    if (settingsSignin) settingsSignin.style.display = (!connected && !signingIn) ? "" : "none";
+    if (settingsSignin) {
+      settingsSignin.style.display = !signingIn ? "" : "none";
+      settingsSignin.textContent = connected ? "Edit connection" : "Connect";
+    }
     if (settingsNameEdit) settingsNameEdit.style.display = connected ? "" : "none";
     if (settingsDisconnect) settingsDisconnect.style.display = connected && !signingIn ? "" : "none";
     if (signingIn && settingsStatus) {
@@ -315,21 +447,52 @@
   // after submission. Page bodies are a lookup, not a branch chain:
   // unknown pages fall back to home visuals rather than a blank island.
   function renderSignin(s) {
-    // Landing or key entry owns the frame; verification state rides the
-    // same box so nothing swaps mid-flight.
     const signingIn = !!s.signingIn;
     const t = (s.status && String(s.status).trim()) ? s.status : "";
+    syncSigninBack();
+    if (customStep > 0) {
+      setStatus(signinStatus, customStep === 2 ? "" : t);
+      // The key check resolves here on step 2: rejection (or a key error)
+      // stays with the error on this step; anything else advances once the
+      // worker answers. Any settled render resolves — no intermediate state
+      // to lose, so Next can never wedge.
+      if (customStep === 2 && customKeyPending && !s.customCatalogLoading) {
+        setCustomKeyPending(false);
+        if (s.customCatalogRejected || t) {
+          customApiKey.setAttribute("aria-invalid", s.customCatalogRejected ? "true" : "false");
+          customApiKey.setAttribute("aria-describedby", "custom-key-status");
+          setStatus(customKeyStatus, s.customCatalogStatus || t || "Couldn't check the key. Try again.");
+          customApiKey.focus();
+        } else {
+          customApiKey.setAttribute("aria-invalid", "false");
+          customApiKey.removeAttribute("aria-describedby");
+          setCustomStep(3);
+        }
+      }
+      if (customCatalogStatus) {
+        customCatalogStatus.hidden = false;
+        customCatalogStatus.textContent = s.customCatalogLoading
+          ? "Finding models…"
+          : (s.customCatalogStatus || "");
+      }
+      const models = Array.isArray(s.customModels) ? s.customModels.map(String) : [];
+      const signature = JSON.stringify(models);
+      if (signature !== modelSignature) {
+        modelSignature = signature;
+        modelOptions = models;
+        renderModelList();
+      }
+      syncModelToggle();
+      return;
+    }
     if (signingIn) {
       if (!keyEntering) setKeyEntering(true);
       setStatus(signinStatus, t || "Checking key…");
     } else if (t) {
-      // Error after verify: stay in entry so the fix is one paste away.
       if (!keyEntering) setKeyEntering(true);
       setStatus(signinStatus, t);
     } else {
       setStatus(signinStatus, "");
-      // Fresh landing only when no error is showing; keep entry open
-      // across unrelated pushes while the user types.
       if (keyEntering && document.activeElement !== groqKey && !groqKey.value) setKeyEntering(false);
     }
     if (groqKey) groqKey.disabled = signingIn;
@@ -487,6 +650,7 @@
   };
 
   function render(s) {
+    latestState = s || {};
     const page = (s.page && String(s.page)) || (s.screen && String(s.screen)) || "home";
     const overlay = (s.overlay && String(s.overlay)) || "none";
     const known = Object.prototype.hasOwnProperty.call(RENDERERS, page);
@@ -611,16 +775,36 @@
     const input = activeInput();
     if (!input) return;
     // Arrows first: editText would mistype them as printable characters.
-    if (isArrow(code)) { moveCaret(input, code); return; }
+    if (isArrow(code)) {
+      if (input === customModel && (code === KEY_UP || code === KEY_DOWN)) cycleCustomModel(code);
+      else moveCaret(input, code);
+      return;
+    }
     if (input === homeName) {
       if (code === 13) { submitHomeName(); return; }  // Return
       if (code === 27) { input.value = ""; return; }  // Escape
       editText(input, code, 30);
       return;
     }
+    if (lastScreen === "signin" && customStep > 0) {
+      if (code === 13) { submitCustomStep(); return; }
+      if (code === 27) {
+        if (customStep === 3 && modelOpen) { setModelOpen(false); return; }
+        goCustomBack();
+        return;
+      }
+      if (customKeyPending) return;
+      editText(input, code, input === customBaseUrl ? 2048 : (input === customApiKey ? 512 : 128));
+      input.setAttribute("aria-invalid", "false");
+      if (input === customModel) {
+        renderModelList();
+        if (modelOptions.length) setModelOpen(true);
+      }
+      return;
+    }
     if (code === 13) { submitInput(); return; }       // Return
     if (code === 27) { input.value = ""; refreshSend(); return; }    // Escape
-    editText(input, code, 400);
+    editText(input, code, lastScreen === "signin" ? 200 : 400);
     refreshSend();
   }
 
@@ -725,6 +909,62 @@
     if (!k.trim()) return;
     post({ type: "save_key", key: k });
   }
+  function submitCustomStep() {
+    if (customStep === 1) {
+      if (!customBaseUrl.checkValidity()) {
+        customBaseUrl.setAttribute("aria-invalid", "true");
+        customBaseUrl.reportValidity();
+        return;
+      }
+      setCustomStep(2);
+    } else if (customStep === 2) {
+      if (customKeyPending) return;
+      setCustomKeyPending(true);
+      customApiKey.setAttribute("aria-invalid", "false");
+      setStatus(customKeyStatus, "Checking key…");
+      post({ type: "discover_custom", baseUrl: customBaseUrl.value.trim(), key: customApiKey.value });
+    } else if (customStep === 3) {
+      if (!customModel.checkValidity()) {
+        customModel.setAttribute("aria-invalid", "true");
+        customModel.reportValidity();
+        return;
+      }
+      setModelOpen(false);
+      post({
+        type: "save_custom",
+        baseUrl: customBaseUrl.value.trim(),
+        key: customApiKey.value,
+        model: customModel.value.trim(),
+      });
+    }
+  }
+  function cycleCustomModel(code) {
+    if (!modelOptions.length) { moveCaret(customModel, code); return; }
+    const delta = code === KEY_DOWN ? 1 : -1;
+    const current = modelOptions.indexOf(customModel.value);
+    const next = current < 0
+      ? (delta > 0 ? 0 : modelOptions.length - 1)
+      : (current + delta + modelOptions.length) % modelOptions.length;
+    customModel.value = modelOptions[next];
+    customModel.setAttribute("aria-invalid", "false");
+    setModelOpen(true);
+    renderModelList();
+    const active = customModelList && customModelList.querySelector(".model-option.active");
+    if (active && active.scrollIntoView) {
+      try { active.scrollIntoView({ block: "nearest" }); } catch (e) {}
+    }
+    customModel.focus();
+  }
+  function goCustomBack() {
+    if (customStep > 1) {
+      setCustomStep(customStep - 1);
+    } else if (latestState.editingConnection) {
+      setKeyEntering(false);
+      post({ type: "cancel_signin" });
+    } else {
+      setKeyEntering(false);
+    }
+  }
   function submitNameText(v) {
     const t = (v || "").trim();
     if (!t) return;
@@ -742,6 +982,50 @@
   if (signinBtn) signinBtn.addEventListener("click", () => setKeyEntering(true));
   if (keySend) keySend.addEventListener("click", submitKey);
   if (keysBtn) keysBtn.addEventListener("click", () => post({ type: "open_keys" }));
+  if (customBtn) customBtn.addEventListener("click", startCustomConnection);
+  if (customBack) customBack.addEventListener("click", goCustomBack);
+  if (customModelToggle) {
+    // Mousedown guard: keeping focus on the input stops its blur from
+    // closing the list before the toggle click lands.
+    customModelToggle.addEventListener("mousedown", (e) => e.preventDefault());
+    customModelToggle.addEventListener("click", () => {
+      if (!modelOptions.length) return;
+      if (modelOpen) setModelOpen(false);
+      else { renderModelList(); setModelOpen(true); customModel.focus(); }
+    });
+  }
+  if (customModel) {
+    customModel.addEventListener("input", () => { renderModelList(); if (modelOptions.length) setModelOpen(true); });
+    customModel.addEventListener("focus", () => { if (modelOptions.length && customStep === 3) setModelOpen(true); });
+    customModel.addEventListener("blur", () => { setModelOpen(false); });
+  }
+  customSteps.forEach((form) => {
+    if (form) form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      submitCustomStep();
+    });
+  });
+  for (const input of [customBaseUrl, customApiKey, customModel]) {
+    if (!input) continue;
+    input.addEventListener("invalid", () => input.setAttribute("aria-invalid", "true"));
+    input.addEventListener("input", () => input.setAttribute("aria-invalid", "false"));
+    input.addEventListener("keydown", (e) => {
+      if (input === customModel && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+        e.preventDefault();
+        cycleCustomModel(e.key === "ArrowDown" ? KEY_DOWN : KEY_UP);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (input === customModel && modelOpen) setModelOpen(false);
+        else goCustomBack();
+      }
+    });
+  }
+  if (signinCancel) signinCancel.addEventListener("click", () => {
+    setKeyEntering(false);
+    post({ type: "cancel_signin" });
+  });
   if (homeName) homeName.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); submitHomeName(); }
     if (e.key === "Escape") { homeName.value = ""; }
@@ -760,7 +1044,15 @@
       post({ type: "nav", target });
     });
   });
-  if (settingsSignin) settingsSignin.addEventListener("click", () => post({ type: "nav", target: "auth" }));
+  if (settingsSignin) settingsSignin.addEventListener("click", () => {
+    if (latestState.connected) {
+      if (latestState.provider === "custom") startCustomConnection();
+      else setKeyEntering(true);
+      post({ type: "edit_connection" });
+    } else {
+      post({ type: "nav", target: "auth" });
+    }
+  });
   if (settingsDisconnect) settingsDisconnect.addEventListener("click", () => post({ type: "disconnect" }));
   refreshSend();
 

@@ -11,6 +11,8 @@
     <main id="island">
         <!-- Top chrome: launcher, brand (cat logo), notifications, settings -->
         <header class="topbar">
+            <button id="nav-back" class="back-button iconbtn btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Back" data-nav="back" hidden><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.83 6a30.2 30.2 0 0 0-5.62 5.406A.95.95 0 0 0 4 12m5.83 6a30.2 30.2 0 0 1-5.62-5.406A.95.95 0 0 1 4 12m0 0h16" fill="none" /></svg></button>
             <button id="nav-menu" class="iconbtn btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Menu" data-nav="menu" aria-pressed="false">
                 <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
                     <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 6.2c0-1.12 0-1.68.218-2.108a2 2 0 0 1 .874-.874C4.52 3 5.08 3 6.2 3h.6c1.12 0 1.68 0 2.108.218a2 2 0 0 1 .874.874C10 4.52 10 5.08 10 6.2v.6c0 1.12 0 1.68-.218 2.108a2 2 0 0 1-.874.874C8.48 10 7.92 10 6.8 10h-.6c-1.12 0-1.68 0-2.108-.218a2 2 0 0 1-.874-.874C3 8.48 3 7.92 3 6.8z" fill="none" />
@@ -39,19 +41,65 @@
             </div>
         </header>
 
-        <!-- SignIn: two-step minimal — landing owns the frame, key entry owns it next -->
+        <!-- SignIn: Groq or a three-step OpenAI-compatible connection. -->
         <section id="screen-signin" class="screen" hidden>
-            <p id="signin-status" class="status" hidden></p>
+            <button id="custom-back" class="back-button auth-back btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Back to previous step" hidden><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.83 6a30.2 30.2 0 0 0-5.62 5.406A.95.95 0 0 0 4 12m5.83 6a30.2 30.2 0 0 1-5.62-5.406A.95.95 0 0 1 4 12m0 0h16" fill="none" /></svg></button>
+            <button id="signin-cancel" class="back-button auth-back btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Back" hidden><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.83 6a30.2 30.2 0 0 0-5.62 5.406A.95.95 0 0 0 4 12m5.83 6a30.2 30.2 0 0 1-5.62-5.406A.95.95 0 0 1 4 12m0 0h16" fill="none" /></svg></button>
+            <p id="signin-status" class="status" role="status" aria-live="polite" hidden></p>
             <div id="signin-landing" class="signin-landing">
-                <button id="signin-btn" class="btn btn-secondary btn-lg btn-pill" type="button">Enter Groq API Key</button>
-                <button id="keys-btn" class="btn btn-link keyhint" type="button">Get a key at console.groq.com</button>
+                <div class="provider-actions">
+                    <button id="signin-btn" class="btn btn-secondary btn-lg btn-pill" type="button">Groq API key</button>
+                    <button id="custom-btn" class="btn btn-secondary btn-lg btn-pill" type="button">Custom endpoint</button>
+                </div>
+                <button id="keys-btn" class="btn btn-link keyhint" type="button">Get a Groq key at console.groq.com</button>
             </div>
             <div id="key-entry" class="askbox" hidden>
-                <input id="groq-key" class="askinput" type="password" maxlength="200" placeholder="Paste key…" autocomplete="off" spellcheck="false" />
-                <button id="key-send" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Save key">
+                <input id="groq-key" class="askinput" type="password" maxlength="200" placeholder="Paste Groq key…" autocomplete="off" spellcheck="false" />
+                <button id="key-send" class="send btn btn-primary btn-icon-sm btn-circle" type="button" aria-label="Save Groq key">
                     <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24">
                         <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
                 </button>
+            </div>
+            <div id="custom-flow" class="custom-flow" hidden>
+                <div class="custom-progress-row">
+                    <span id="custom-step-label">Step 1 of 3</span>
+                    <progress id="custom-progress" max="3" value="1" aria-labelledby="custom-step-label"></progress>
+                </div>
+                <form id="custom-url-step" class="custom-step" method="post" action="">
+                    <label for="custom-base-url">Base URL</label>
+                    <div class="askbox">
+                        <input id="custom-base-url" class="askinput" name="baseUrl" type="url" maxlength="2048" placeholder="https://api.example.com/v1" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" enterkeyhint="next" aria-invalid="false" required />
+                        <button class="send btn btn-primary btn-icon-sm btn-circle" type="submit" aria-label="Continue to API key">
+                            <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
+                        </button>
+                    </div>
+                </form>
+                <form id="custom-key-step" class="custom-step" method="post" action="" hidden>
+                    <label for="custom-api-key">API key <span class="field-hint">(optional)</span></label>
+                    <div class="askbox">
+                        <input id="custom-api-key" class="askinput" name="key" type="password" maxlength="512" placeholder="Leave blank for no auth" autocomplete="current-password" autocorrect="off" autocapitalize="none" spellcheck="false" enterkeyhint="next" aria-invalid="false" />
+                        <button class="send btn btn-primary btn-icon-sm btn-circle" type="submit" aria-label="Check key and continue">
+                            <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
+                        </button>
+                    </div>
+                    <p id="custom-key-status" class="field-status" role="status" aria-live="polite" hidden></p>
+                </form>
+                <form id="custom-model-step" class="custom-step" method="post" action="" hidden>
+                    <label for="custom-model">Model ID</label>
+                    <div class="askbox model-pick">
+                        <input id="custom-model" class="askinput" name="model" type="text" maxlength="128" placeholder="Enter or choose a model" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" enterkeyhint="done" aria-invalid="false" role="combobox" aria-expanded="false" aria-controls="custom-model-list" aria-autocomplete="list" required />
+                        <button id="custom-model-toggle" class="btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Show fetched models" aria-expanded="false" aria-controls="custom-model-list" hidden>
+                            <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10.14a20.4 20.4 0 0 0 3.702 3.893c.175.141.42.141.596 0A20.4 20.4 0 0 0 16 10.14" fill="none" /></svg>
+                        </button>
+                        <button class="send btn btn-primary btn-icon-sm btn-circle" type="submit" aria-label="Save custom connection">
+                            <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9.83a30.2 30.2 0 0 1 5.406-5.62A.95.95 0 0 1 12 4m6 5.83a30.2 30.2 0 0 0-5.406-5.62A.95.95 0 0 0 12 4m0 0v16" fill="none" /></svg>
+                        </button>
+                        <div id="custom-model-list" class="model-list" role="listbox" aria-label="Fetched models" hidden></div>
+                    </div>
+                    <p id="custom-catalog-status" class="field-status" role="status" aria-live="polite" hidden></p>
+                </form>
             </div>
         </section>
 
@@ -116,7 +164,7 @@
         <!-- Chat: history / live stream + pinned prompt -->
         <section id="screen-chat" class="screen" hidden>
             <div class="chatnav">
-                <button id="chat-back" class="btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Back to home">
+                <button id="chat-back" class="back-button btn btn-ghost btn-icon-sm btn-circle" type="button" aria-label="Back to home">
                     <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">
                         <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.83 6a30.2 30.2 0 0 0-5.62 5.406A.95.95 0 0 0 4 12m5.83 6a30.2 30.2 0 0 1-5.62-5.406A.95.95 0 0 1 4 12m0 0h16" fill="none" /></svg>
                 </button>
@@ -267,7 +315,6 @@
                     <p id="settings-email" class="profile-sub">Not signed in</p>
                     <p id="settings-plan" class="profile-plan">Groq: —</p>
                 </div>
-                <span id="settings-dot" class="presence" aria-hidden="true"></span>
                 <button id="update-btn" class="iconbtn btn btn-ghost btn-icon-sm btn-circle" type="button" title="Check for updates" aria-label="Check for updates">
                     <span id="update-icon-check" aria-hidden="true">
                         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24">

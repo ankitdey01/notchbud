@@ -20,7 +20,7 @@
 ; HKCU (Run key) + %APPDATA%\notchbud\auth.bin at runtime.
 
 #define MyAppName "Notchbud"
-#define MyAppVersion "0.1.6"
+#define MyAppVersion "0.1.7"
 #define MyAppExe "notchbud.exe"
 #define MyAppPublisher "Notchbud"
 

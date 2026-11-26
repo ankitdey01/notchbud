@@ -19,10 +19,7 @@ pub struct UpdateInfo {
 
 /// Strip leading `v`/`V` + whitespace: `v0.1.4` -> `0.1.4`.
 pub fn clean_tag(tag: &str) -> String {
-    tag.trim()
-        .trim_start_matches(['v', 'V'])
-        .trim()
-        .to_owned()
+    tag.trim().trim_start_matches(['v', 'V']).trim().to_owned()
 }
 
 /// True when `latest` is newer than `current` (numeric dot comparison,

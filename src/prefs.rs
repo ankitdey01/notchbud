@@ -190,7 +190,10 @@ mod tests {
     #[test]
     fn run_cmd_is_quoted_absolute_exe() {
         let cmd = current_run_cmd();
-        assert!(cmd.starts_with('"') && cmd.ends_with('"'), "must be quoted: {cmd}");
+        assert!(
+            cmd.starts_with('"') && cmd.ends_with('"'),
+            "must be quoted: {cmd}"
+        );
         let inner = &cmd[1..cmd.len() - 1];
         assert!(inner.ends_with(".exe"), "must point at an exe: {cmd}");
         assert!(

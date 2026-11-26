@@ -27,7 +27,10 @@ fn api_key_trims() {
 
 #[test]
 fn identity_consts() {
-    assert_eq!(GROQ_CHAT_URL, "https://api.groq.com/openai/v1/chat/completions");
+    assert_eq!(
+        GROQ_CHAT_URL,
+        "https://api.groq.com/openai/v1/chat/completions"
+    );
     assert!(
         USER_AGENT.starts_with("notchbud/"),
         "server-side originator tag rides on this"
@@ -79,7 +82,10 @@ fn model_pick_skips_non_chat_slugs() {
         "qwen/qwen3.8-27b",
     ];
     // Act + assert: first chat-capable entry, never whisper/guard/orpheus.
-    assert_eq!(pick_model_from(catalog), Some("qwen/qwen3.8-27b".to_owned()));
+    assert_eq!(
+        pick_model_from(catalog),
+        Some("qwen/qwen3.8-27b".to_owned())
+    );
 }
 
 #[test]
@@ -90,4 +96,65 @@ fn model_pick_is_none_without_any_chat_model() {
     );
     let empty: [&str; 0] = [];
     assert_eq!(pick_model_from(empty), None);
+}
+
+#[test]
+fn custom_connection_uses_exact_root_key_and_model() {
+    let c = ApiKey::custom(
+        "  https://opencode.ai/inference/go/openai/v1/  ",
+        "  oc_sK_TeSt  ",
+        "  kimi-k3  ",
+    )
+    .unwrap();
+    assert!(c.is_custom());
+    assert_eq!(c.key, "oc_sK_TeSt");
+    assert_eq!(c.fixed_model(), Some("kimi-k3"));
+    assert_eq!(
+        c.models_url(),
+        "https://opencode.ai/inference/go/openai/v1/models"
+    );
+    assert_eq!(
+        c.chat_url(),
+        "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    );
+}
+
+#[test]
+fn custom_connection_allows_keyless_loopback_only_for_http() {
+    for root in [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://[::1]:11434/v1",
+    ] {
+        let c = ApiKey::custom(root, "", "local-model").unwrap();
+        assert!(c.key.is_empty());
+        assert!(c.models_url().starts_with(root));
+    }
+    assert!(ApiKey::custom("http://example.com/v1", "key", "model").is_err());
+    assert!(ApiKey::custom("https://example.com/v1", "", "model").is_ok());
+}
+
+#[test]
+fn custom_connection_rejects_ambiguous_or_credential_leaking_urls() {
+    for root in [
+        "not a url",
+        "ftp://example.com/v1",
+        "https://user:secret@example.com/v1",
+        "https://example.com/v1?key=secret",
+        "https://example.com/v1#fragment",
+        "https://example.com/v1/chat/completions",
+        "https://example.com/v1/models",
+    ] {
+        assert!(
+            ApiKey::custom(root, "key", "model").is_err(),
+            "accepted {root}"
+        );
+    }
+}
+
+#[test]
+fn custom_connection_rejects_bad_key_and_model_shapes() {
+    assert!(ApiKey::custom("https://example.com/v1", "has space", "model").is_err());
+    assert!(ApiKey::custom("https://example.com/v1", "key", "").is_err());
+    assert!(ApiKey::custom("https://example.com/v1", "key", "two words").is_err());
 }

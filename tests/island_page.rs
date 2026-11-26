@@ -43,7 +43,10 @@ fn no_duplicated_header_lines() {
     for (n, line) in js().lines().enumerate() {
         let t = line.trim();
         if !t.is_empty() && t == prev && t.chars().any(|c| c.is_alphanumeric()) {
-            panic!("ui/app.js:{}: duplicated line nests the IIFE body: {t}", n + 1);
+            panic!(
+                "ui/app.js:{}: duplicated line nests the IIFE body: {t}",
+                n + 1
+            );
         }
         prev = t.to_string();
     }
@@ -73,6 +76,63 @@ fn js_element_ids_exist_in_html() {
             "ui/app.js looks up #{id}, but ui/index.html has no such id"
         );
     }
+}
+
+#[test]
+fn custom_provider_has_accessible_stepped_flow() {
+    let h = html();
+    for id in [
+        "custom-btn",
+        "custom-progress",
+        "custom-base-url",
+        "custom-api-key",
+        "custom-model",
+        "custom-model-toggle",
+        "custom-model-list",
+        "custom-back",
+    ] {
+        assert!(
+            h.contains(&format!("id=\"{id}\"")),
+            "missing custom flow element {id}"
+        );
+    }
+    for field in ["custom-base-url", "custom-api-key", "custom-model"] {
+        assert!(
+            h.contains(&format!("for=\"{field}\"")),
+            "{field} needs a visible label"
+        );
+    }
+    assert!(
+        h.contains("<progress"),
+        "step position must be programmatically available"
+    );
+    assert!(
+        !h.contains("<datalist"),
+        "model picker must be island-styled, not a native datalist popup"
+    );
+    assert!(
+        h.contains("role=\"combobox\"") && h.contains("role=\"listbox\""),
+        "model picker must expose the combobox/listbox pattern"
+    );
+    let source = js();
+    for intent in ["discover_custom", "save_custom", "edit_connection"] {
+        assert!(
+            source.contains(&format!("type: \"{intent}\"")),
+            "missing {intent} post"
+        );
+    }
+    assert!(source.contains("function submitCustomStep"));
+    assert!(source.contains("ae === customBaseUrl"));
+    assert!(source.contains("ae === customApiKey"));
+    assert!(source.contains("ae === customModel"));
+    assert!(
+        source.contains("customCatalogRejected"),
+        "a rejected key must hold step 2 with the error instead of advancing to models"
+    );
+    assert!(
+        source.contains("customKeyPending"),
+        "step 2 waits for the check result — but must resolve on any settled render, never on a losable intermediate state"
+    );
 }
 
 /// No external navigation inside the embedded page: one click on a raw
@@ -114,11 +174,7 @@ fn posted_intents_have_rust_handlers() {
     let main = src_file("main.rs");
     let span = main
         .find("fn handle_webmsg")
-        .and_then(|s| {
-            main[s..]
-                .find("\nfn ")
-                .map(|e| main[s..s + e].to_string())
-        })
+        .and_then(|s| main[s..].find("\nfn ").map(|e| main[s..s + e].to_string()))
         .expect("handle_webmsg not found");
     for intent in &posted {
         assert!(
@@ -277,10 +333,7 @@ fn chat_thinking_shimmers_without_bubble() {
         f.contains("turn-thinking") && f.contains("\"Thinking\""),
         "streaming with no text yet must render shimmer Thinking text"
     );
-    assert!(
-        !span.contains('…'),
-        "the … placeholder bubble must be gone"
-    );
+    assert!(!span.contains('…'), "the … placeholder bubble must be gone");
     let css = ui_file("styles.css");
     let c: String = css.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
@@ -341,7 +394,11 @@ fn chats_rows_offer_delete_with_confirm_page() {
         confirm.contains("Are you sure you want to delete this chat?"),
         "confirm page must ask the big question in plain words"
     );
-    for id in ["id=\"confirm-name\"", "id=\"confirm-yes\"", "id=\"confirm-no\""] {
+    for id in [
+        "id=\"confirm-name\"",
+        "id=\"confirm-yes\"",
+        "id=\"confirm-no\"",
+    ] {
         assert!(confirm.contains(id), "confirm page must own {id}");
     }
     assert!(
@@ -383,10 +440,7 @@ fn chats_rows_offer_delete_with_confirm_page() {
         c.contains(".chat-del{") && c.contains(".chat-del:hover{"),
         "trash needs its own rest/hover rule — white normally, red on hover"
     );
-    assert!(
-        c.contains("color:#ff5a52"),
-        "trash hover must turn red"
-    );
+    assert!(c.contains("color:#ff5a52"), "trash hover must turn red");
     assert!(
         !confirm.contains("data-nav"),
         "confirm page is a blank island — no nav links, just Yes/No"
@@ -426,7 +480,9 @@ fn prompt_arrows_move_caret_and_wiring_is_shared() {
         "both prompts must pair through one PROMPTS table (input + send + camera + preview)"
     );
     assert!(
-        f.contains("functionmoveCaret(input,code)") && f.contains("KEY_LEFT") && f.contains("isArrow(code)"),
+        f.contains("functionmoveCaret(input,code)")
+            && f.contains("KEY_LEFT")
+            && f.contains("isArrow(code)"),
         "page must own a moveCaret helper fed by the distinct arrow codes"
     );
     assert!(

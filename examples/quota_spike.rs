@@ -32,8 +32,7 @@ fn main() {
     // model inventory: what this key's catalog offers
     match auth::list_models(&key) {
         Ok(models) if !models.is_empty() => {
-            let names: Vec<String> =
-                models.iter().map(|m| m.slug.clone()).collect();
+            let names: Vec<String> = models.iter().map(|m| m.slug.clone()).collect();
             println!("models: {}", names.join(", "));
         }
         _ => println!("models: listing unreadable"),
@@ -48,14 +47,26 @@ fn main() {
         }
     };
     println!("trying model {model} …");
-    let history = [Msg { role: Role::User, text: "Reply with the single word: OK".into() }];
-    let res = chat::stream_chat(&key, &model, "", &history, None, |ev| match ev {
-        chat::StreamEvent::Delta(d) => {
-            print!("{d}");
-            true
-        }
-        _ => true,
-    });
+    let history = [Msg {
+        role: Role::User,
+        text: "Reply with the single word: OK".into(),
+    }];
+    let connection = auth::ApiKey::new(&key).expect("valid Groq API key");
+    let res = chat::stream_chat(
+        &connection,
+        &model,
+        "quota-spike",
+        "",
+        &history,
+        None,
+        |ev| match ev {
+            chat::StreamEvent::Delta(d) => {
+                print!("{d}");
+                true
+            }
+            _ => true,
+        },
+    );
     println!();
     match res {
         Ok(()) => println!("request: OK (streamed above)"),

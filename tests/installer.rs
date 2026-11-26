@@ -67,7 +67,10 @@ fn iss_stays_per_user() {
         "installs into the user profile, not Program Files"
     );
     assert!(s.contains("Root: HKCU"), "autostart must be current-user");
-    assert!(s.contains("uninsdeletevalue"), "uninstall must clean the Run value");
+    assert!(
+        s.contains("uninsdeletevalue"),
+        "uninstall must clean the Run value"
+    );
     assert!(s.contains("AppId="), "stable upgrade identity required");
 }
 
@@ -76,11 +79,17 @@ fn iss_stays_per_user() {
 #[test]
 fn output_setup_is_fresh() {
     if !target_exe().exists() {
-        println!("SKIP: target/release/notchbud.exe not built yet — run cargo build --release first");
+        println!(
+            "SKIP: target/release/notchbud.exe not built yet — run cargo build --release first"
+        );
         return;
     }
     let setup = setup_path();
-    assert!(setup.exists(), "missing {} — build it: ISCC installer\\notchbud.iss", setup.display());
+    assert!(
+        setup.exists(),
+        "missing {} — build it: ISCC installer\\notchbud.iss",
+        setup.display()
+    );
     let sm = fs::metadata(&setup).unwrap().modified().unwrap();
     for src in [root().join("installer/notchbud.iss"), target_exe()] {
         let tm = fs::metadata(&src).unwrap().modified().unwrap();
@@ -146,8 +155,8 @@ fn release_binary_has_no_console() {
 // WARNING: CloseApplications may close YOUR running notchbud during install.
 
 fn run_value_present() -> bool {
-    use windows::Win32::System::Registry::*;
     use windows::core::w;
+    use windows::Win32::System::Registry::*;
     unsafe {
         let mut hk = HKEY::default();
         if RegOpenKeyExW(
@@ -192,11 +201,18 @@ fn e2e_silent_install_uninstall() {
         ])
         .status()
         .expect("launch setup");
-    assert!(st.success(), "silent install failed — see {}", log.display());
+    assert!(
+        st.success(),
+        "silent install failed — see {}",
+        log.display()
+    );
     assert!(scratch.join("notchbud.exe").exists());
     assert!(scratch.join("unins000.exe").exists());
     // default silent tasks leave autostart off
-    assert!(!run_value_present(), "default install must not set autostart");
+    assert!(
+        !run_value_present(),
+        "default install must not set autostart"
+    );
 
     // The uninstaller asks about saved login data when auth.bin exists, and a
     // modal box would hang headless runs — tear down manually in that case.
@@ -216,8 +232,7 @@ fn e2e_silent_install_uninstall() {
 }
 
 fn dirs_appdata_notchbud_authbin() -> PathBuf {
-    PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
-        .join("notchbud/auth.bin")
+    PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("notchbud/auth.bin")
 }
 
 fn teardown_manual(scratch: &Path) {

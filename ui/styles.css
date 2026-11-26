@@ -34,6 +34,7 @@
     --cb-secondary-fg: #000000;
     --cb-accent: rgba(255, 255, 255, 0.08);
     --cb-foreground: #ececf1;
+    --cb-muted-foreground: #8e8e93;
     --cb-destructive: #ff5a52;
     --cb-ring: #007AFF;
     --cb-radius: 10px;
@@ -291,21 +292,170 @@ body {
 /* True island middle: #island carries 6px top / 12px bottom padding, so a
    6px top pad here puts the centered stack at the geometric middle. */
 #screen-signin {
+    position: relative;
     padding-top: 6px;
     align-items: center;
 }
 
-/* Sign-in landing: one pill + one quiet link, nothing else. */
+/* Sign-in landing: the button row owns the vertical center alone — the
+   quiet link floats below it so it can't push the buttons off-center. */
 .signin-landing {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 6px;
 }
 
+.signin-landing .keyhint {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    white-space: nowrap;
+}
+
 /* Key entry reuses .askbox (same pill as the prompt input): input + up arrow. */
 #key-entry {
     max-width: 340px;
+}
+
+.provider-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.custom-flow {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: min(340px, 100%);
+}
+
+.custom-progress-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--cb-muted-foreground);
+    font-size: 10px;
+    line-height: 1.4;
+}
+
+#custom-progress {
+    width: 72px;
+    height: 4px;
+    accent-color: var(--cb-primary);
+}
+
+.custom-step {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+}
+
+.custom-step label {
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.field-hint,
+.field-status {
+    color: var(--cb-muted-foreground);
+}
+
+.field-status {
+    /* Floats below the form, out of flow: status swaps can neither resize
+       the step nor push it above its siblings. Empty text paints nothing. */
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    right: 0;
+    margin: 0;
+    overflow: hidden;
+    font-size: 10px;
+    line-height: 1.4;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Model picker: the askbox owns a small island-styled dropdown — same
+   dark fill and rounding as the assistant bubble, never the native
+   datalist popup. */
+.model-pick {
+    position: relative;
+}
+
+.model-list {
+    position: absolute;
+    bottom: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    /* Two 24px rows + 2px gap + 8px padding + 2px border. */
+    max-height: 60px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scroll-snap-type: y mandatory;
+    scroll-padding-block: 4px;
+    padding: 4px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(28, 28, 30, 0.98);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+}
+
+.model-list::-webkit-scrollbar {
+    width: 4px;
+}
+
+.model-list::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 2px;
+}
+
+.model-option {
+    display: block;
+    /* Never compress options to fit the capped list height. */
+    flex: 0 0 24px;
+    min-height: 24px;
+    scroll-snap-align: start;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--cb-foreground);
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.4;
+    text-align: left;
+    padding: 3px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.model-option:hover,
+.model-option.active {
+    background: rgba(0, 122, 255, 0.22);
+    color: #fff;
+}
+
+/* Shared top-left control, matching the chat page. */
+.auth-back {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 2;
+    margin: 0;
 }
 
 #screen-signin> :first-child,
@@ -360,7 +510,13 @@ body {
     justify-content: flex-start;
 }
 
-#chat-back {
+.back-button {
+    background: rgba(28, 28, 30, 0.85);
+}
+
+/* No hover flash on back buttons anywhere: keep the resting fill instead
+   of the ghost hover tint. */
+.back-button.btn-ghost:hover {
     background: rgba(28, 28, 30, 0.85);
 }
 
@@ -1245,22 +1401,6 @@ body {
     color: #30d158;
 }
 
-.presence {
-    flex: none;
-    width: 9px;
-    height: 9px;
-    border-radius: 999px;
-    background: #636366;
-}
-
-.presence.on {
-    background: #30d158;
-}
-
-.presence.off {
-    background: #636366;
-}
-
 /* sign-out is .btn .btn-destructive .btn-sm .btn-pill — no local rules */
 
 /* back links are .btn .btn-link — gray, never underlined (island density) */
@@ -1278,7 +1418,8 @@ body {
 }
 
 .backlink:hover {
-    color: #fff;
+    /* No hover flash on back links either: keep the resting gray. */
+    color: #a1a1aa;
     text-decoration: none;
 }
 /* ---------- auto-update (free for all): one settings icon ---------- */

@@ -23,8 +23,7 @@ fn find_rc_exe() -> Option<PathBuf> {
 }
 
 fn main() {
-    let manifest =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let rc_file = manifest.join("assets").join("app.rc");
     let ico_file = manifest.join("assets").join("notchbud.ico");
     println!("cargo:rerun-if-changed={}", rc_file.display());

@@ -108,7 +108,9 @@ fn close_segment(t: f32) -> Option<(f32, f32, f32, f32)> {
 
 pub fn close_progress(t: f32) -> f32 {
     let t = t.max(0.0);
-    close_segment(t).map_or(0.0, |(t0, v0, t1, v1)| v0 + (v1 - v0) * (t - t0) / (t1 - t0))
+    close_segment(t).map_or(0.0, |(t0, v0, t1, v1)| {
+        v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+    })
 }
 
 pub fn close_velocity(t: f32) -> f32 {
@@ -135,8 +137,7 @@ pub fn close_bounce_factor(t: f32) -> f32 {
             / (CLOSE_DIP_T - CLOSE_COLLAPSE_END)
     } else {
         CLOSE_DIP_FACTOR
-            + (1.0 - CLOSE_DIP_FACTOR) * (t - CLOSE_DIP_T)
-                / (CLOSE_RECOVER_T - CLOSE_DIP_T)
+            + (1.0 - CLOSE_DIP_FACTOR) * (t - CLOSE_DIP_T) / (CLOSE_RECOVER_T - CLOSE_DIP_T)
     }
 }
 
@@ -279,9 +280,9 @@ impl Overlay {
 }
 
 pub struct Chat {
-    /// The saved Groq API key; None = not connected.
+    /// The active Groq or custom connection; None = not connected.
     pub tokens: Option<crate::connector::auth::ApiKey>,
-    /// Resolved Groq model from the key's catalog, cached per key.
+    /// Resolved Groq model or the explicit custom model.
     pub model: Option<String>,
     /// Assistant text currently arriving.
     pub stream: String,
@@ -295,6 +296,13 @@ pub struct Chat {
     pub notice: Option<String>,
     /// One-line error/status for the slot.
     pub error: Option<String>,
+    /// Best-effort custom model catalog; never contains credentials.
+    pub catalog_models: Vec<String>,
+    pub catalog_status: Option<String>,
+    pub catalog_loading: bool,
+    pub catalog_checked: bool,
+    pub catalog_rejected: bool,
+    pub catalog_base_url: String,
 }
 
 impl Chat {
@@ -308,6 +316,12 @@ impl Chat {
             signing_in: false,
             notice: None,
             error: None,
+            catalog_models: Vec::new(),
+            catalog_status: None,
+            catalog_loading: false,
+            catalog_checked: false,
+            catalog_rejected: false,
+            catalog_base_url: String::new(),
         }
     }
 
@@ -373,6 +387,19 @@ impl Chat {
                 })
             })
             .collect();
+        let (provider, base_url, custom_model) = match &self.tokens {
+            Some(connection) => match &connection.provider {
+                crate::connector::auth::Provider::Groq => {
+                    ("groq", serde_json::Value::Null, serde_json::Value::Null)
+                }
+                crate::connector::auth::Provider::Custom { base_url, model } => (
+                    "custom",
+                    serde_json::json!(base_url),
+                    serde_json::json!(model),
+                ),
+            },
+            None => ("none", serde_json::Value::Null, serde_json::Value::Null),
+        };
         serde_json::json!({
             "greeting": greeting,
             "status": self.status_text(),
@@ -381,6 +408,14 @@ impl Chat {
             "streaming": self.streaming,
             "signingIn": self.signing_in,
             "connected": self.connected(),
+            "provider": provider,
+            "baseUrl": base_url,
+            "customModel": custom_model,
+            "customModels": self.catalog_models,
+            "customCatalogStatus": self.catalog_status,
+            "customCatalogLoading": self.catalog_loading,
+            "customCatalogChecked": self.catalog_checked,
+            "customCatalogRejected": self.catalog_rejected,
         })
     }
 }
@@ -389,6 +424,8 @@ impl Chat {
 pub struct PendingReply {
     pub session_id: String,
     pub chat: Chat,
+    /// Provider captured by this turn; late errors must not affect a replacement.
+    pub connection: Option<crate::connector::auth::ApiKey>,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -398,7 +435,7 @@ pub struct App {
     pub width: i32,
     pub height: i32,
 
-    pub expanded: bool, // false = idle sliver, true = island shown
+    pub expanded: bool,    // false = idle sliver, true = island shown
     pub web_visible: bool, // content has been revealed after the opening spring
     pub mouse_inside: bool,
 
@@ -414,6 +451,10 @@ pub struct App {
     /// Settings pencil reopen of the shared name step. Forces `needsName`
     /// even with a saved name; cleared on save or on leaving the island.
     pub rename: bool,
+
+    /// Settings edit of the shared provider flow. The saved connection stays
+    /// active until a replacement is saved successfully.
+    pub connection_editing: bool,
 
     /// Topbar overlay page (menu / chats / notifications / settings).
     /// `None` means the base [`Screen`] owns the frame. Set via the "nav"
@@ -481,6 +522,7 @@ impl App {
             replies: std::collections::HashMap::new(),
             display_name: String::new(),
             rename: false,
+            connection_editing: false,
             overlay: Overlay::None,
             sessions: Vec::new(),
             session_id: String::new(),
@@ -518,7 +560,7 @@ impl App {
     /// field wait behind the sign-in: a signed-out island shows only the
     /// sign-in prompt.
     pub fn screen(&self) -> Screen {
-        if !self.chat.connected() {
+        if self.connection_editing || !self.chat.connected() {
             Screen::SignIn
         } else if self.chat.has_chatted() {
             Screen::Chat
@@ -553,11 +595,7 @@ impl App {
         let prev = self.overlay;
         match Overlay::from_target(target) {
             Some(next) => {
-                self.overlay = if prev == next {
-                    Overlay::None
-                } else {
-                    next
-                };
+                self.overlay = if prev == next { Overlay::None } else { next };
             }
             None => {
                 // "auth" / "home" / "chat" / "back" all resolve to the base
@@ -602,13 +640,23 @@ impl App {
         );
         v["email"] = serde_json::Value::Null;
         v["keyReady"] = serde_json::json!(self.chat.connected());
-        v["notifications"] = self.sessions.iter().filter(|s| s.unread).map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "title": if s.error.is_some() { "Response interrupted" } else { "Response ready" },
-                "text": s.display_title(),
+        v["editingConnection"] = serde_json::json!(self.connection_editing);
+        v["notifications"] = self
+            .sessions
+            .iter()
+            .filter(|s| s.unread)
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "title": s.display_title(),
+                    "text": if s.messages.last().is_some_and(|m| m.role == "assistant") {
+                        s.preview()
+                    } else {
+                        s.error.clone().unwrap_or_else(|| "Response interrupted".into())
+                    },
+                })
             })
-        }).collect();
+            .collect();
         let sessions: Vec<serde_json::Value> = self
             .sessions
             .iter()
@@ -629,13 +677,12 @@ impl App {
             serde_json::json!(self.pending_thumb)
         };
         // Confirm page: which stored chat the Yes button would delete.
-        v["deleteTitle"] = serde_json::json!(
-            self.sessions
-                .iter()
-                .find(|s| s.id == self.pending_delete)
-                .map(|s| s.display_title())
-                .unwrap_or_default()
-        );
+        v["deleteTitle"] = serde_json::json!(self
+            .sessions
+            .iter()
+            .find(|s| s.id == self.pending_delete)
+            .map(|s| s.display_title())
+            .unwrap_or_default());
         v["update"] = serde_json::json!({"available": self.update_version.is_some(),"version": self.update_version,"status": self.update_status});
         v.to_string()
     }
@@ -734,9 +781,8 @@ mod tests {
 
     /// Test-only sign-in: a saved Groq key is all `connected()` needs.
     fn sign_in(app: &mut App) {
-        app.chat.tokens = Some(crate::connector::auth::ApiKey {
-            key: "gsk_test1234567890abcdef".into(),
-        });
+        app.chat.tokens =
+            Some(crate::connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
     }
 
     #[test]
@@ -745,8 +791,11 @@ mod tests {
         // bubble; plain turns carry null so the page renders text only.
         let mut app = blank_app();
         app.chat.push_history(Role::User, "plain".into());
-        app.chat
-            .push_history_image(Role::User, "look".into(), "data:image/png;base64,AAA".into());
+        app.chat.push_history_image(
+            Role::User,
+            "look".into(),
+            "data:image/png;base64,AAA".into(),
+        );
         let v = app.chat.ui_state("Hi");
         assert!(v["history"][0]["image"].is_null());
         assert_eq!(v["history"][1]["image"], "data:image/png;base64,AAA");
@@ -772,7 +821,8 @@ mod tests {
         let mut app = blank_app();
         sign_in(&mut app);
         assert_eq!(app.screen(), Screen::Home);
-        app.chat.push_history(Role::User, "hello who are you".into());
+        app.chat
+            .push_history(Role::User, "hello who are you".into());
         assert!(app.chat.has_chatted());
         assert!(!app.shows_greeting());
         assert_eq!(app.screen(), Screen::Chat);
@@ -804,15 +854,13 @@ mod tests {
     fn page_state_matches_screen() {
         let mut app = blank_app();
         sign_in(&mut app);
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["screen"], "home");
         assert_eq!(v["page"], "home");
         assert_eq!(v["overlay"], "none");
         assert!(!v["greeting"].as_str().unwrap().is_empty());
         app.chat.push_history(Role::User, "hi".into());
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["screen"], "chat");
         assert_eq!(v["page"], "chat");
     }
@@ -821,22 +869,19 @@ mod tests {
     fn update_state_flows_into_page_state() {
         // Up to date: the island shows no glow, no version, no status.
         let mut app = blank_app();
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["update"]["available"], false);
         assert!(v["update"]["version"].is_null());
         assert!(v["update"]["status"].is_null());
         // New release known: the button glows with the version.
         app.update_version = Some("0.9.9".into());
         app.update_url = Some("https://x/setup.exe".into());
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["update"]["available"], true);
         assert_eq!(v["update"]["version"], "0.9.9");
         // Transient worker line (Checking…/Downloading…/error) rides along.
         app.update_status = Some("Downloading v0.9.9…".into());
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["update"]["status"], "Downloading v0.9.9…");
     }
 
@@ -850,11 +895,13 @@ mod tests {
         assert!(app.navigate("settings"));
         assert_eq!(app.overlay, Overlay::Settings);
         assert_eq!(app.page(), "settings");
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["overlay"], "settings");
         assert_eq!(v["page"], "settings");
-        assert_eq!(v["screen"], "home", "base screen survives under the overlay");
+        assert_eq!(
+            v["screen"], "home",
+            "base screen survives under the overlay"
+        );
         assert!(v["userName"].is_null());
         assert_eq!(v["email"], serde_json::Value::Null);
 
@@ -919,8 +966,7 @@ mod tests {
             &mut app.sessions,
             crate::sessions::snapshot(&app.session_id, &app.session_title, &app.chat.history),
         );
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["sessions"][0]["id"], "s1");
         assert_eq!(v["sessions"][0]["title"], "Trip Ideas");
         assert_eq!(v["sessions"][0]["preview"], "plan a trip");
@@ -934,8 +980,7 @@ mod tests {
             &mut bare.sessions,
             crate::sessions::snapshot(&bare.session_id, &bare.session_title, &bare.chat.history),
         );
-        let v: serde_json::Value =
-            serde_json::from_str(&bare.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&bare.page_state()).unwrap();
         assert_eq!(v["sessions"][0]["title"], "hello there");
     }
 
@@ -946,11 +991,13 @@ mod tests {
         assert!(app.navigate("chats"));
         assert_eq!(app.overlay, Overlay::Chats);
         assert_eq!(app.page(), "chats");
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["overlay"], "chats");
         assert_eq!(v["page"], "chats");
-        assert_eq!(v["screen"], "home", "base screen survives under the overlay");
+        assert_eq!(
+            v["screen"], "home",
+            "base screen survives under the overlay"
+        );
         // Tapping the active Chats tile closes it back.
         assert!(app.navigate("chats"));
         assert_eq!(app.overlay, Overlay::None);
@@ -960,8 +1007,7 @@ mod tests {
     fn page_state_carries_settings_fields() {
         let mut app = blank_app();
         sign_in(&mut app);
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert!(v["userName"].is_null());
         assert!(v["email"].is_null());
         assert_eq!(v["keyReady"], true);
@@ -975,8 +1021,7 @@ mod tests {
         app.display_name = "Alex".into();
         assert_eq!(app.display_name(), "Alex");
         assert!(app.greeting().contains("Alex"));
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["userName"], "Alex");
     }
 
@@ -987,29 +1032,24 @@ mod tests {
         let mut app = blank_app();
         sign_in(&mut app);
         app.display_name = "Alex".into();
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], false);
         app.rename = true;
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], true);
         app.rename = false; // answered (the save_name arm clears it)
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], false);
         // A live chat still never loses its box to the prompt.
         app.rename = true;
         app.chat.push_history(Role::User, "hi".into());
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], false);
         assert_eq!(v["screen"], "chat");
         // Signed out: no prompt even when forced (the pencil hides there).
         let mut app = blank_app();
         app.rename = true;
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], false);
     }
 
@@ -1020,25 +1060,21 @@ mod tests {
         // (mirrors SignIn owning the frame when signed out).
         let mut app = blank_app();
         sign_in(&mut app);
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], true);
         // Answered: the chat box owns Home again.
         app.display_name = "Alex".into();
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], false);
         // A live chat never loses its box to the prompt (no trap).
         let mut app = blank_app();
         sign_in(&mut app);
         app.chat.push_history(Role::User, "hi".into());
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["needsName"], false);
         // Signed out: the sign-in screen owns the frame, no name prompt.
         let app = blank_app();
-        let v: serde_json::Value =
-            serde_json::from_str(&app.page_state()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(v["screen"], "signin");
         assert_eq!(v["needsName"], false);
     }

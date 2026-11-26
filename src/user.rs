@@ -73,10 +73,12 @@ pub fn format_local_time(
     minute: u16,
 ) -> String {
     let weekday = WEEKDAYS.get(day_of_week as usize).unwrap_or(&"?");
-    let month = MONTHS
-        .get(month.wrapping_sub(1) as usize)
-        .unwrap_or(&"?");
-    format!("{weekday}, {day} {month} {year}, {:02}:{:02}", hour % 24, minute % 60)
+    let month = MONTHS.get(month.wrapping_sub(1) as usize).unwrap_or(&"?");
+    format!(
+        "{weekday}, {day} {month} {year}, {:02}:{:02}",
+        hour % 24,
+        minute % 60
+    )
 }
 
 /// Current local date-time as plain text for the model prompt.
@@ -110,14 +112,20 @@ mod tests {
     #[test]
     fn greeting_keeps_name_as_is() {
         // No title-casing: names pass through untouched.
-        assert_eq!(greeting_for_hour(19, "alex kumar"), "Good Evening, alex kumar");
+        assert_eq!(
+            greeting_for_hour(19, "alex kumar"),
+            "Good Evening, alex kumar"
+        );
         assert_eq!(greeting_for_hour(9, ""), "Good Morning");
         assert_eq!(
             greeting_for_hour(19, "José-O'Brien Jr."),
             "Good Evening, José-O'Brien Jr."
         );
         assert_eq!(greeting_for_hour(19, "McDonald"), "Good Evening, McDonald");
-        assert_eq!(greeting_for_hour(19, "anne-marie"), "Good Evening, anne-marie");
+        assert_eq!(
+            greeting_for_hour(19, "anne-marie"),
+            "Good Evening, anne-marie"
+        );
         assert_eq!(greeting_for_hour(19, "o'brien"), "Good Evening, o'brien");
     }
 

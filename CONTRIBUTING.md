@@ -8,7 +8,7 @@ Thanks for helping. A few things are specific to this repo, so read this first.
 - Rust stable toolchain. CI uses stable on `windows-latest` (see `.github/workflows/ci.yml`).
 - Microsoft Edge WebView2 Runtime to run the app.
 - Inno Setup 6 only if you build the installer.
-- A Groq API key (`gsk_...`) only if you test live chat.
+- A Groq API key (`gsk_...`) or OpenAI-compatible custom endpoint only if you test live chat.
 
 ```powershell
 git clone https://github.com/ankitdey01/notchbud.git
@@ -30,7 +30,7 @@ Debug builds keep a console window for log output. Release builds hide it (see `
 cargo build --release
 ```
 
-Live chat needs a key. Either set `GROQ_API_KEY` or save a key in the island first. `examples/quota_spike.rs` shows the exact fallback order and is a good smoke test:
+Live Groq chat needs a key. Either set `GROQ_API_KEY` or save a key in the island first. `examples/quota_spike.rs` shows the Groq fallback order and is a good Groq smoke test. To exercise the Custom flow without spending anything, run a local server with a blank key, then pick or type a pulled model ID: Ollama (`ollama serve`) serves `http://localhost:11434/v1`, LM Studio serves `http://localhost:1234/v1` by default:
 
 ```powershell
 $env:GROQ_API_KEY="gsk_..."
@@ -51,6 +51,8 @@ cargo test
 - The island viewport is small. Always verify visual changes at real content size, never in a tall desktop viewport. Anchoring bugs only show at true height.
 - The island sizing constants live in `src/state.rs`. Read them before touching `ui/`.
 - Keep chat bubbles hugging their text and single line text roomy enough that descenders are not clipped.
+- Page contracts are enforced by tests: every `{type: "..."}` intent the page posts needs a Rust arm in `handle_webmsg` (`posted_intents_have_rust_handlers`), and every `el("...")` lookup needs a matching `id` in `index.html` (`js_element_ids_exist_in_html`). Layout invariants (overlay fills, centered screens, stable step sizes) live in `tests/island_layout.rs` — extend them when you add a page or step.
+- Never expose secrets to the page: `page_state`/`ui_state` must carry config, never keys (see `custom_ui_state_exposes_config_but_never_key`).
 
 ## Installer
 

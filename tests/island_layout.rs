@@ -63,7 +63,7 @@ fn base_screens_center_via_auto_margins() {
 }
 
 /// All four overlay pages are headless: the Menu / Chats / Notifications /
- // Settings heads stay in the DOM but must never paint — the active topbar
+// Settings heads stay in the DOM but must never paint — the active topbar
 // icon already says where you are.
 #[test]
 fn overlay_pages_are_headless() {
@@ -226,6 +226,61 @@ fn home_name_prompt_has_question_above_input() {
     assert!(
         rule_has(&css, "#name-entry", "max-width:340px;"),
         "name box must not span the island — capped like the signin key entry"
+    );
+}
+
+/// Custom model step holds its size and place: the status line floats
+/// below the form (never in flow) so "Finding models…" swaps can't push
+/// step 3 above steps 1-2, the menu opens upward over the label instead
+/// of spilling past the shell's bottom edge where rows cut off, and the
+/// chevron hides via visibility so its slot keeps the pill steady.
+#[test]
+fn custom_model_step_holds_its_size() {
+    let css = css();
+    assert!(
+        rule_has(&css, ".model-option", "flex:0024px;"),
+        "catalog rows must not shrink into overlapping text as models arrive"
+    );
+    assert!(
+        rule_has(&css, ".model-list", "max-height:60px;"),
+        "two complete rows need room for the gap, padding, and border"
+    );
+    assert!(
+        rule_has(&css, ".field-status", "position:absolute;"),
+        "status must float — in-flow swaps push step 3 above steps 1-2"
+    );
+    assert!(
+        rule_has(&css, ".model-list", "position:absolute;"),
+        "model menu must overlay, never push the step taller"
+    );
+    assert!(
+        rule_has(&css, ".model-list", "bottom:"),
+        "menu must open upward — downward spills past the shell and cuts rows"
+    );
+    let js = flat(&ui_file("app.js"));
+    assert!(
+        js.contains("style.visibility"),
+        "chevron must hide via visibility so its slot holds the pill steady"
+    );
+}
+
+/// Back controls never flash on hover: the round top-left button keeps its
+/// dark fill and the text links keep their resting gray instead of flashing
+/// the ghost tint / white.
+#[test]
+fn back_controls_have_no_hover_flash() {
+    let css = css();
+    assert!(
+        rule_has(
+            &css,
+            ".back-button.btn-ghost:hover",
+            "background:rgba(28,28,30,0.85);"
+        ),
+        "back buttons must keep their fill on hover, not take the ghost tint"
+    );
+    assert!(
+        rule_has(&css, ".backlink:hover", "color:#a1a1aa;"),
+        "back links must keep their gray on hover, not brighten"
     );
 }
 

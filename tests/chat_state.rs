@@ -84,6 +84,24 @@ fn ui_state_carries_history_and_stream() {
     assert_eq!(v["history"][1]["text"], "hey");
 }
 
+#[test]
+fn custom_ui_state_exposes_config_but_never_key() {
+    let mut c = Chat::new();
+    c.tokens = Some(ApiKey::custom("https://example.com/v1", "secret-key", "model-x").unwrap());
+    c.catalog_models = vec!["model-x".into(), "model-y".into()];
+    c.catalog_status = Some("Choose a model or enter another ID.".into());
+    let v = c.ui_state("Hi");
+    assert_eq!(v["provider"], "custom");
+    assert_eq!(v["baseUrl"], "https://example.com/v1");
+    assert_eq!(v["customModel"], "model-x");
+    assert_eq!(v["customModels"][1], "model-y");
+    assert_eq!(
+        v["customCatalogStatus"],
+        "Choose a model or enter another ID."
+    );
+    assert!(!v.to_string().contains("secret-key"));
+}
+
 // --- LPARAM packing: low word x, high word y, both signed 16-bit ---
 
 fn pack(x: i32, y: i32) -> LPARAM {

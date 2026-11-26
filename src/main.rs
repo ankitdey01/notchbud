@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, MonitorFromPoint, SetWindowRgn, ValidateRect, MONITOR_DEFAULTTOPRIMARY,
@@ -34,19 +34,19 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardState, ToUnicode, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN,
+    GetAsyncKeyState, GetKeyboardState, ToUnicode, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_BACK, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetSystemMetrics, GetWindowRect, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SetTimer, SetWindowsHookExW, SetWindowLongPtrW, SetWindowPos,
-    GetWindowLongPtrW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, GWLP_USERDATA, HHOOK,
-    HICON, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IMAGE_ICON, KBDLLHOOKSTRUCT, LoadImageW, LR_DEFAULTCOLOR,
-    MSG, SM_CXSCREEN, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_SHOWNOACTIVATE, WNDCLASSEXW, WH_KEYBOARD_LL, WM_DESTROY, WM_DPICHANGED,
-    WM_KEYDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadImageW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+    UnhookWindowsHookEx, GWLP_USERDATA, HHOOK, HICON, HTCLIENT, HTTRANSPARENT, IDC_ARROW,
+    IMAGE_ICON, KBDLLHOOKSTRUCT, LR_DEFAULTCOLOR, MSG, SM_CXSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_MOUSEMOVE,
+    WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 // "TaskbarCreated" message id; re-adds the tray icon when explorer restarts
@@ -67,7 +67,7 @@ pub const GROQ_KEYS_URL: &str = "https://console.groq.com/keys";
 // chat wiring: connector thread(s) post into this pump via PostMessage.
 const WM_CHAT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10; // connector events
 const WM_KEY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 11; // keyboard hook chars
-// WM_KEY codes for island shortcuts (past the Unicode range).
+                                                                          // WM_KEY codes for island shortcuts (past the Unicode range).
 const KEY_COPY: usize = 0x110000;
 const KEY_SELECT_ALL: usize = 0x110001;
 const KEY_CUT: usize = 0x110002;
@@ -86,16 +86,24 @@ const CHAT_ERROR: usize = 2; // *Box<(u32, String)> (turn gen, error)
 const CHAT_CONNECTED: usize = 3; // *ApiKey
 const CHAT_MODEL: usize = 5; // *(u32, String) (response id, resolved model)
 const CHAT_SIGNED_OUT: usize = 6; // *(u32, String) (response id, terminal auth failure)
-// Startup verification results (carry the verify generation so a stale
-// check can't resurrect creds or clobber a disconnect).
+                                  // Startup verification results (carry the verify generation so a stale
+                                  // check can't resurrect creds or clobber a disconnect).
 const CHAT_VERIFY_OK: usize = 7; // *(u32, ApiKey)
 const CHAT_VERIFY_OUT: usize = 8; // *(u32, String) (terminal: key revoked)
 const CHAT_VERIFY_ERR: usize = 9; // *(u32, String) (transient: keep any live stream)
-// Groq-titled label for a session (session_id, title); stale ids are ignored.
+                                  // Groq-titled label for a session (session_id, title); stale ids are ignored.
 const CHAT_TITLE: usize = 10; // *Box<(String, String)>
-// Screenshot captured for the prompt (data URL); attaches as pendingImage.
+                              // Screenshot captured for the prompt (data URL); attaches as pendingImage.
 const CHAT_SHOT: usize = 11; // *Box<String>
 const CHAT_KEY_ERROR: usize = 12; // *(u32, String), API-key validation only
+const CHAT_CATALOG: usize = 13; // *CatalogReply, below
+/// A catalog worker's reply: its generation tag plus the fetched models or
+/// the failure that blocked listing them. The tag drops stale results that
+/// arrive after the user moved on.
+type CatalogReply = (
+    u32,
+    std::result::Result<Vec<connector::auth::ModelInfo>, connector::auth::AuthError>,
+);
 
 // updater wiring: worker thread(s) post into this pump via PostMessage.
 const WM_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12;
@@ -107,6 +115,7 @@ static ISLAND_ACTIVE: AtomicBool = AtomicBool::new(false); // hook gate: island 
 static VERIFY_GEN: AtomicU32 = AtomicU32::new(0); // startup key-check generation
 static TURN_GEN: AtomicU32 = AtomicU32::new(0); // unique response id (not a global cancellation gate)
 static UPDATE_GEN: AtomicU32 = AtomicU32::new(0); // manual update-check generation
+static CATALOG_GEN: AtomicU32 = AtomicU32::new(0); // custom model-catalog generation
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0); // where the hook posts
 static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on quit)
 
@@ -116,7 +125,11 @@ static KEYHOOK: AtomicIsize = AtomicIsize::new(0); // hook handle (unhook on qui
 
 unsafe fn app_from(hwnd: HWND) -> Option<&'static mut state::App> {
     let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut state::App;
-    if p.is_null() { None } else { Some(&mut *p) }
+    if p.is_null() {
+        None
+    } else {
+        Some(&mut *p)
+    }
 }
 
 unsafe fn apply_window_region(app: &state::App) {
@@ -170,7 +183,12 @@ fn push_web_throttled(app: &mut state::App) {
 // timer fires after the settle and swaps regions to the idle hit strip.
 unsafe fn schedule_idle_region(hwnd: HWND, settle: f32) {
     KillTimer(Some(hwnd), TIMER_IDLE_RGN).ok();
-    SetTimer(Some(hwnd), TIMER_IDLE_RGN, (settle * 1000.0).ceil() as u32, None);
+    SetTimer(
+        Some(hwnd),
+        TIMER_IDLE_RGN,
+        (settle * 1000.0).ceil() as u32,
+        None,
+    );
 }
 
 // Reveal the page after the open spring settles (matched to the original
@@ -178,12 +196,22 @@ unsafe fn schedule_idle_region(hwnd: HWND, settle: f32) {
 unsafe fn schedule_web_show(hwnd: HWND) {
     KillTimer(Some(hwnd), TIMER_WEB_SHOW).ok();
     let delay = web_show_delay_secs();
-    SetTimer(Some(hwnd), TIMER_WEB_SHOW, (delay * 1000.0).ceil() as u32, None);
+    SetTimer(
+        Some(hwnd),
+        TIMER_WEB_SHOW,
+        (delay * 1000.0).ceil() as u32,
+        None,
+    );
 }
 
 unsafe fn schedule_web_suspend(hwnd: HWND) {
     if island_web::mark_idle() && !hwnd.is_invalid() {
-        SetTimer(Some(hwnd), TIMER_WEB_SUSPEND, island_web::IDLE_TIMEOUT_MS, None);
+        SetTimer(
+            Some(hwnd),
+            TIMER_WEB_SUSPEND,
+            island_web::IDLE_TIMEOUT_MS,
+            None,
+        );
     }
 }
 
@@ -218,10 +246,7 @@ fn cursor_client_px(app: &state::App) -> Option<(f32, f32)> {
     unsafe {
         let mut cpos = POINT { x: 0, y: 0 };
         GetCursorPos(&mut cpos).ok()?;
-        Some((
-            (cpos.x - app.win_x) as f32,
-            (cpos.y - app.win_y) as f32,
-        ))
+        Some(((cpos.x - app.win_x) as f32, (cpos.y - app.win_y) as f32))
     }
 }
 // ---------------------------------------------------------------------------
@@ -230,6 +255,24 @@ fn cursor_client_px(app: &state::App) -> Option<(f32, f32)> {
 // (via island_web) while the island is expanded, and eats them so they
 // don't type into the app behind it too.
 // ---------------------------------------------------------------------------
+
+/// True when the keystroke belongs to the system, not the island: any Win
+/// chord passes (Win+V clipboard history, Win+D, Win+arrows…), as do Alt
+/// chords (Alt+Tab…). Ctrl alone never reroutes — it stays an island
+/// shortcut — so only Alt and Win matter here.
+fn is_system_chord(alt_down: bool, win_down: bool) -> bool {
+    win_down || alt_down
+}
+
+/// GetKeyboardState reflects this thread's message queue and can lag the
+/// physical modifiers inside a low-level hook (Shift held while typing
+/// produced the unshifted character). Pin the modifier bytes to the
+/// real-time async state before ToUnicode reads the map.
+fn pin_physical_modifiers(st: &mut [u8; 256], shift_down: bool, ctrl_down: bool, alt_down: bool) {
+    st[VK_SHIFT.0 as usize] = if shift_down { 0x80 } else { 0 };
+    st[VK_CONTROL.0 as usize] = if ctrl_down { 0x80 } else { 0 };
+    st[VK_MENU.0 as usize] = if alt_down { 0x80 } else { 0 };
+}
 
 unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let is_down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
@@ -245,12 +288,19 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         };
         let ctrl_down = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
         let alt_down = GetAsyncKeyState(VK_MENU.0 as i32) < 0;
-        // Island shortcuts work inside the page and never reach the app
-        // behind it. Every other Ctrl-only chord is swallowed too: the
-        // window never activates, so it would otherwise type into the app
-        // behind the island. (Alt chords still pass so Alt+Tab etc. work;
-        // Ctrl+Shift+Esc needs a mouse-leave first.)
-        if ctrl_down && !alt_down {
+        let win_down =
+            GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0;
+        if is_system_chord(alt_down, win_down) {
+            // Win chords (Win+V clipboard history, Win+D, Win+arrows…)
+            // and Alt chords (Alt+Tab…) belong to the system: pass them
+            // through untouched instead of eating or retyping them.
+        } else if ctrl_down {
+            // Island shortcuts work inside the page and never reach the
+            // app behind it. Every other Ctrl-only chord is swallowed
+            // too: the window never activates, so it would otherwise
+            // type into the app behind the island. (Ctrl+Shift+Esc needs
+            // a mouse-leave first.)
+            // (alt_down is false here — is_system_chord took Alt chords.)
             match kb.vkCode {
                 0x43 => {
                     post(KEY_COPY);
@@ -272,9 +322,9 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     return LRESULT(1);
                 }
             }
-        }
-        // only plain typing: no Ctrl/Alt chords (shortcuts pass through)
-        if !ctrl_down && !alt_down {
+        } else {
+            // Plain typing only: system chords and Ctrl chords are handled
+            // above, so reaching here means no modifier that reroutes.
             let vk = kb.vkCode as u32;
             // Arrows yield no text (ToUnicode finds nothing), so without an
             // explicit code they fall through to the app behind the island
@@ -304,9 +354,14 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     return LRESULT(1);
                 }
                 _ => {
-                    // VK -> character via the active keyboard layout
+                    // VK -> character via the active keyboard layout.
+                    // The queue snapshot can lag the physical Shift key,
+                    // so the modifier bytes are pinned to real-time state
+                    // first (see pin_physical_modifiers).
                     let mut st = [0u8; 256];
                     let _ = GetKeyboardState(&mut st);
+                    let shift_down = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
+                    pin_physical_modifiers(&mut st, shift_down, ctrl_down, alt_down);
                     let mut buf = [0u16; 4];
                     let n = ToUnicode(vk, kb.scanCode, Some(&st), &mut buf, 0);
                     // n > 0: produced text; n < 0: dead key — never eaten
@@ -318,9 +373,7 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                             && (0xD800..=0xDBFF).contains(&buf[0])
                             && (0xDC00..=0xDFFF).contains(&buf[1])
                         {
-                            0x10000
-                                + ((buf[0] as u32 - 0xD800) << 10)
-                                + (buf[1] as u32 - 0xDC00)
+                            0x10000 + ((buf[0] as u32 - 0xD800) << 10) + (buf[1] as u32 - 0xDC00)
                         } else {
                             buf[0] as u32
                         };
@@ -369,7 +422,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => {
             if !app.mouse_inside {
                 app.mouse_inside = true;
-                unsafe { arm_leave_tracking(hwnd); }
+                unsafe {
+                    arm_leave_tracking(hwnd);
+                }
                 // Choreography runs on closed->open transitions only (see
                 // state::expand_on_mousemove). Moves while already expanded
                 // (e.g. the parent strips around the WebView child) must not
@@ -479,8 +534,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let lowword = (lparam.0 & 0xFFFF) as u16 as i32;
                 if lowword == WM_RBUTTONUP as i32 {
                     handle_tray_menu(app);
-                } else if lowword == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP as i32
-                {
+                } else if lowword == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP as i32 {
                     app.expanded = !app.expanded;
                     ISLAND_ACTIVE.store(app.expanded, Ordering::Release);
                     if app.expanded {
@@ -542,10 +596,7 @@ fn collapse(app: &mut state::App) {
     // the region swaps only after the shrink settles, so the collapse
     // isn't clipped by the idle strip
     unsafe {
-        schedule_idle_region(
-            app.hwnd,
-            state::CLOSE_SETTLE + state::CLOSE_DELAY + 0.12,
-        );
+        schedule_idle_region(app.hwnd, state::CLOSE_SETTLE + state::CLOSE_DELAY + 0.12);
         schedule_web_suspend(app.hwnd);
     };
 }
@@ -639,6 +690,7 @@ fn start_reply(app: &mut state::App) -> (u32, Arc<AtomicBool>) {
         state::PendingReply {
             session_id: app.session_id.clone(),
             chat,
+            connection: app.chat.tokens.clone(),
             cancel: cancel.clone(),
         },
     );
@@ -719,6 +771,8 @@ fn disconnect(app: &mut state::App) {
     VERIFY_GEN.fetch_add(1, Ordering::Relaxed);
     app.chat.signing_in = false;
     app.chat.notice = None;
+    app.connection_editing = false;
+    reset_catalog(app);
     app.chat.tokens = None;
     app.chat.model = None;
     app.chat.streaming = false;
@@ -727,7 +781,7 @@ fn disconnect(app: &mut state::App) {
     app.session_id.clear();
     app.session_title.clear();
     clear_shot(app);
-    app.chat.error = Some("Disconnected.".into());
+    app.chat.error = None;
     // Back to the base auth step (signin), never a stale settings page.
     app.close_overlay();
     push_web(app);
@@ -736,12 +790,13 @@ fn disconnect(app: &mut state::App) {
 /// Island "Enter Groq API Key": validate the key against Groq's model
 /// catalog on a worker thread, then persist it sealed with DPAPI.
 fn save_api_key(app: &mut state::App, raw_key: &str) {
-    if app.chat.signing_in || app.chat.streaming {
+    if app.chat.signing_in {
         return;
     }
     let key = raw_key.trim().to_owned();
     let Some(api_key) = connector::auth::ApiKey::new(&key) else {
-        app.chat.error = Some("That doesn't look like a Groq API key (it starts with gsk_).".into());
+        app.chat.error =
+            Some("That doesn't look like a Groq API key (it starts with gsk_).".into());
         app.chat.notice = None;
         push_web(app);
         return;
@@ -769,14 +824,8 @@ fn save_api_key(app: &mut state::App, raw_key: &str) {
             return;
         }
         if let Err(e) = connector::auth::save_api_key(&api_key) {
-            eprintln!("[notchbud] API key could not be saved ({e}); session continues without persistence");
-            let _ = PostMessageW(
-                Some(hwnd_raw),
-                WM_CHAT,
-                WPARAM(CHAT_CONNECTED),
-                LPARAM(Box::into_raw(Box::new(api_key)) as isize),
-            );
-            fail("Signed in for now, but the key could not be saved — it won't survive a restart.".into());
+            eprintln!("[notchbud] API key could not be saved ({e})");
+            fail("The key could not be saved. Try again.".into());
             return;
         }
         let _ = PostMessageW(
@@ -786,6 +835,110 @@ fn save_api_key(app: &mut state::App, raw_key: &str) {
             LPARAM(Box::into_raw(Box::new(api_key)) as isize),
         );
     });
+}
+
+fn reset_catalog(app: &mut state::App) {
+    CATALOG_GEN.fetch_add(1, Ordering::Relaxed);
+    app.chat.catalog_models.clear();
+    app.chat.catalog_status = None;
+    app.chat.catalog_loading = false;
+    app.chat.catalog_checked = false;
+    app.chat.catalog_rejected = false;
+    app.chat.catalog_base_url.clear();
+}
+
+fn custom_connection(
+    app: &state::App,
+    base_url: &str,
+    raw_key: &str,
+    model: &str,
+) -> std::result::Result<connector::auth::ApiKey, String> {
+    let mut draft = connector::auth::ApiKey::custom(base_url, raw_key, model)?;
+    if raw_key.trim().is_empty() {
+        if let Some(saved) = app.chat.tokens.as_ref().filter(|c| c.is_custom()) {
+            if saved.custom_base_url() == draft.custom_base_url() {
+                draft.key = saved.key.clone();
+            }
+        }
+    }
+    Ok(draft)
+}
+
+/// A Groq key check is already running: its worker owns the island's status
+/// line, so a custom intent must not start its own — say so instead of
+/// silently doing nothing, which would wedge the page in its waiting state.
+fn groq_check_busy(app: &mut state::App) -> bool {
+    if app.chat.signing_in {
+        app.chat.error = Some("Still checking your Groq key — wait a moment and retry.".into());
+        push_web(app);
+        return true;
+    }
+    false
+}
+
+fn discover_custom_models(app: &mut state::App, base_url: &str, raw_key: &str) {
+    if groq_check_busy(app) {
+        return;
+    }
+    reset_catalog(app);
+    let draft = match custom_connection(app, base_url, raw_key, "discovery") {
+        Ok(draft) => draft,
+        Err(error) => {
+            app.chat.error = Some(error);
+            push_web(app);
+            return;
+        }
+    };
+    let gen = CATALOG_GEN.load(Ordering::Relaxed);
+    app.chat.catalog_base_url = draft.base_url().to_owned();
+    app.chat.catalog_loading = true;
+    app.chat.error = None;
+    push_web(app);
+    let hwnd = app.hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let result = connector::auth::discover_custom_models(draft.base_url(), &draft.key);
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_CHAT,
+            WPARAM(CHAT_CATALOG),
+            LPARAM(Box::into_raw(Box::new((gen, result))) as isize),
+        );
+    });
+}
+
+fn save_custom_connection(app: &mut state::App, base_url: &str, raw_key: &str, model: &str) {
+    if groq_check_busy(app) {
+        return;
+    }
+    let connection = match custom_connection(app, base_url, raw_key, model) {
+        Ok(connection) => connection,
+        Err(error) => {
+            app.chat.error = Some(error);
+            push_web(app);
+            return;
+        }
+    };
+    if app.chat.catalog_rejected && app.chat.catalog_base_url == connection.base_url() {
+        app.chat.error =
+            Some("The custom endpoint rejected this API key. Check it and try again.".into());
+        push_web(app);
+        return;
+    }
+    if let Err(error) = connector::auth::save_api_key(&connection) {
+        app.chat.error = Some(format!(
+            "The connection could not be saved ({error}). Try again."
+        ));
+        push_web(app);
+        return;
+    }
+    VERIFY_GEN.fetch_add(1, Ordering::Relaxed);
+    app.chat.model = connection.fixed_model().map(str::to_owned);
+    app.chat.tokens = Some(connection);
+    app.chat.notice = None;
+    app.chat.error = None;
+    app.connection_editing = false;
+    reset_catalog(app);
+    push_web(app);
 }
 
 /// Boot check: a saved key may have been revoked since last run.
@@ -798,6 +951,11 @@ fn verify_saved_key(app: &mut state::App) {
     let Some(api_key) = app.chat.tokens.clone() else {
         return; // nothing saved — already on the key entry.
     };
+    // A custom model is explicit and its catalog is optional: saving the
+    // complete configuration is enough; the first real prompt verifies it.
+    if api_key.is_custom() {
+        return;
+    }
     if app.chat.signing_in || app.chat.streaming {
         return;
     }
@@ -855,7 +1013,10 @@ fn spawn_update_loop(hwnd: HWND) {
             let current = env!("CARGO_PKG_VERSION");
             match updater::check_for_update(current) {
                 Ok(Some(info)) => {
-                    eprintln!("[notchbud] update: background check found v{}", info.version);
+                    eprintln!(
+                        "[notchbud] update: background check found v{}",
+                        info.version
+                    );
                     unsafe {
                         let _ = PostMessageW(
                             Some(HWND(raw as *mut _)),
@@ -868,9 +1029,7 @@ fn spawn_update_loop(hwnd: HWND) {
                 Ok(None) => {}
                 Err(e) => eprintln!("[notchbud] update: background check failed ({e})"),
             }
-            std::thread::sleep(std::time::Duration::from_secs(
-                updater::CHECK_INTERVAL_SECS,
-            ));
+            std::thread::sleep(std::time::Duration::from_secs(updater::CHECK_INTERVAL_SECS));
         }
     });
 }
@@ -938,7 +1097,9 @@ fn request_manual_check(app: &mut state::App) {
                     Some(hwnd_raw),
                     WM_UPDATE,
                     WPARAM(UPDATE_STATUS),
-                    LPARAM(Box::into_raw(Box::new((gen, "Update check failed.".to_owned()))) as isize),
+                    LPARAM(
+                        Box::into_raw(Box::new((gen, "Update check failed.".to_owned()))) as isize,
+                    ),
                 );
             }
         }
@@ -1045,8 +1206,7 @@ fn handle_update_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             } else {
                 eprintln!("[notchbud] update: installer launch failed");
                 app.update_inflight = false;
-                app.update_status =
-                    Some("Couldn't start the installer — try again.".into());
+                app.update_status = Some("Couldn't start the installer — try again.".into());
                 push_web(app);
             }
         }
@@ -1120,12 +1280,12 @@ fn handle_chat_key(code: usize) {
 }
 
 /// Paste without focus: read the clipboard in Rust and inject it through
-/// the same key path as physical typing (respects the page's 400-char cap).
+/// the same key path as physical typing (each page field applies its own cap).
 fn paste_into_page() {
     if let Some(clip) = get_clipboard_text() {
         // Filtered chars are always printable Unicode scalars, so every
         // value fits the page's key range — forward directly.
-        for ch in clip.chars().filter(|c| !c.is_control()).take(400) {
+        for ch in clip.chars().filter(|c| !c.is_control()).take(2048) {
             island_web::forward_key(ch as u32 as usize);
         }
     } else {
@@ -1158,12 +1318,33 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
                 save_api_key(app, &key);
             }
         }
+        Some("edit_connection") => {
+            app.connection_editing = true;
+            app.chat.error = None;
+            app.chat.notice = None;
+            app.close_overlay();
+            push_web(app);
+        }
+        Some("discover_custom") => {
+            discover_custom_models(app, &web_str(&v, "baseUrl"), &web_str(&v, "key"));
+        }
+        Some("save_custom") => {
+            save_custom_connection(
+                app,
+                &web_str(&v, "baseUrl"),
+                &web_str(&v, "key"),
+                &web_str(&v, "model"),
+            );
+        }
         Some("cancel_signin") => {
             // Cancel must also swallow the worker's late result: the
             // CONNECTED/ERROR it already posted is ignored (signing_in
             // gate) instead of signing in anyway.
             app.chat.signing_in = false;
             app.chat.notice = None;
+            app.chat.error = None;
+            app.connection_editing = false;
+            reset_catalog(app);
             push_web(app);
         }
         Some("save_name") => {
@@ -1195,7 +1376,7 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
             begin_session(app);
             app.close_overlay();
             push_web(app);
-        },
+        }
         Some("open_session") => {
             // Chats page: jump back into a saved session. The live turns
             // are archived first so nothing is lost. An unknown id is a
@@ -1233,7 +1414,7 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
             clear_shot(app);
             app.close_overlay();
             push_web(app);
-        },
+        }
         Some("take_shot") => {
             // Camera button: capture the screen on a worker thread (GDI +
             // WIC take ~100ms — never stall the window pump). The result
@@ -1251,12 +1432,12 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
                     LPARAM(Box::into_raw(Box::new(urls)) as isize),
                 );
             });
-        },
+        }
         Some("clear_shot") => {
             // Preview remove: drop the attachment, hide the preview.
             clear_shot(app);
             push_web(app);
-        },
+        }
         Some("ask_delete") => {
             // Chats row trash: pop the confirm page for a stored session.
             // Unknown ids are ignored — the confirm page is unreachable then.
@@ -1266,7 +1447,7 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
                 app.overlay = state::Overlay::ConfirmDelete;
                 push_web(app);
             }
-        },
+        }
         Some("confirm_delete") => {
             // Confirm Yes: drop the stored session for good, back to the
             // list. When the deleted row is the live session, its working
@@ -1290,13 +1471,13 @@ fn handle_webmsg(app: &mut state::App, lparam: LPARAM) {
             }
             app.overlay = state::Overlay::Chats;
             push_web(app);
-        },
+        }
         Some("cancel_delete") => {
             // Confirm No (or Esc): keep the session, back to the list.
             app.pending_delete.clear();
             app.overlay = state::Overlay::Chats;
             push_web(app);
-        },
+        }
         Some("nav") => {
             let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("back");
             app.navigate(target);
@@ -1348,7 +1529,9 @@ fn submit_chat(app: &mut state::App, raw: &str) {
     if text.is_empty() {
         return;
     }
-    let Some(api_key) = app.chat.tokens.clone() else { return };
+    let Some(api_key) = app.chat.tokens.clone() else {
+        return;
+    };
     if app.chat.streaming {
         return;
     }
@@ -1398,7 +1581,10 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         .chat
         .history
         .iter()
-        .map(|(role, text, _)| state::Msg { role: *role, text: text.clone() })
+        .map(|(role, text, _)| state::Msg {
+            role: *role,
+            text: text.clone(),
+        })
         .collect();
     let model = app.chat.model.clone();
     let user_name = app.display_name.clone(); // frozen per turn, like history
@@ -1413,7 +1599,9 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         // persisted (no CHAT_MODEL post): the next text turn resolves its
         // model as usual. Resolved before the catalog so a catalog error
         // can't block a screenshot turn that needs no catalog pick.
-        let mut current = if shot.is_some() {
+        let mut current = if let Some(model) = api_key.fixed_model() {
+            model.to_owned()
+        } else if shot.is_some() {
             connector::auth::SCREENSHOT_MODEL.to_owned()
         } else {
             match model {
@@ -1474,32 +1662,45 @@ fn submit_chat(app: &mut state::App, raw: &str) {
         // next catalog model instead of failing the turn.
         let mut retried = false;
         loop {
-            let result = connector::chat::stream_chat(&api_key.key, &current, &user_name, &history, shot_ref, |ev| match ev {
-                connector::chat::StreamEvent::Delta(d) => {
-                    if cancelled() {
-                        false
-                    } else {
-                        let d = connector::chat::strip_citation_markers(&d);
-                        reply.push_str(&d);
-                        post_delta(d);
-                        true
+            let result = connector::chat::stream_chat(
+                &api_key,
+                &current,
+                &session_id,
+                &user_name,
+                &history,
+                shot_ref,
+                |ev| match ev {
+                    connector::chat::StreamEvent::Delta(d) => {
+                        if cancelled() {
+                            false
+                        } else {
+                            let d = connector::chat::strip_citation_markers(&d);
+                            reply.push_str(&d);
+                            post_delta(d);
+                            true
+                        }
                     }
-                }
-                _ => true,
-            });
+                    _ => true,
+                },
+            );
             if cancelled() {
                 return;
             }
             match result {
                 Ok(()) => {
-                    let _ = PostMessageW(Some(hwnd), WM_CHAT, WPARAM(CHAT_DONE), LPARAM(turn as isize));
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_CHAT,
+                        WPARAM(CHAT_DONE),
+                        LPARAM(turn as isize),
+                    );
                     // Separate title prompt, once per session, after the
                     // reply lands: a short Groq label from BOTH sides of
                     // the first exchange for the Chats list. Best-effort —
                     // a failure just leaves the snippet fallback. A
                     // cancelled turn never titles: its partial reply would
                     // label the session from a cut-off answer.
-                    if needs_title && !cancelled() {
+                    if needs_title && !api_key.is_custom() && !cancelled() {
                         // Re-strip the assembled reply: a citation split
                         // across two deltas only completes here.
                         let clean = connector::chat::strip_citation_markers(&reply);
@@ -1517,8 +1718,7 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                                 WM_CHAT,
                                 WPARAM(CHAT_TITLE),
                                 LPARAM(
-                                    Box::into_raw(Box::new((session_id.clone(), title)))
-                                        as isize,
+                                    Box::into_raw(Box::new((session_id.clone(), title))) as isize
                                 ),
                             );
                         }
@@ -1536,7 +1736,11 @@ fn submit_chat(app: &mut state::App, raw: &str) {
                     );
                     break;
                 }
-                Err(m) if m == connector::chat::MODEL_UNAVAILABLE_MSG && !retried => {
+                Err(m)
+                    if !api_key.is_custom()
+                        && m == connector::chat::MODEL_UNAVAILABLE_MSG
+                        && !retried =>
+                {
                     // Image turns stay on the vision model: retrying with a
                     // catalog text model would resend image_url to a model
                     // that rejects it. Fail the turn instead.
@@ -1651,16 +1855,40 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             if !app.replies.contains_key(&turn) {
                 return;
             }
-            if error == connector::chat::MODEL_UNAVAILABLE_MSG {
+            let same_connection = app.replies.get(&turn).and_then(|r| r.connection.as_ref())
+                == app.chat.tokens.as_ref();
+            if same_connection && error == connector::chat::MODEL_UNAVAILABLE_MSG {
                 app.chat.model = None;
             }
             finish_reply(app, turn, Some(error));
         }
+        CHAT_CATALOG => {
+            let (gen, result) = unsafe { *Box::from_raw(lparam.0 as *mut CatalogReply) };
+            if gen != CATALOG_GEN.load(Ordering::Relaxed) {
+                return;
+            }
+            app.chat.catalog_loading = false;
+            match result {
+                Ok(models) => {
+                    app.chat.catalog_checked = true;
+                    app.chat.catalog_models = models.into_iter().map(|m| m.slug).collect();
+                    app.chat.catalog_status = if app.chat.catalog_models.is_empty() {
+                        Some("No chat models were listed. Enter the model ID manually.".into())
+                    } else {
+                        None
+                    };
+                }
+                Err(error) => {
+                    app.chat.catalog_checked = false;
+                    app.chat.catalog_rejected = error.expired;
+                    app.chat.catalog_status = Some(error.msg);
+                }
+            }
+            push_web(app);
+        }
         CHAT_KEY_ERROR => {
             let (gen, error) = unsafe { *Box::from_raw(lparam.0 as *mut (u32, String)) };
-            if gen != TURN_GEN.load(Ordering::Relaxed)
-                || (!app.chat.signing_in && !app.chat.connected())
-            {
+            if gen != TURN_GEN.load(Ordering::Relaxed) || !app.chat.signing_in {
                 return;
             }
             app.chat.error = Some(error);
@@ -1673,15 +1901,24 @@ fn handle_chat_msg(app: &mut state::App, wparam: WPARAM, lparam: LPARAM) {
             if !app.chat.signing_in {
                 return; // stale (cancelled sign-in, later disconnect) — never resurrect
             }
+            app.chat.model = t.fixed_model().map(str::to_owned);
             app.chat.tokens = Some(*t);
             app.chat.signing_in = false;
             app.chat.notice = None;
             app.chat.error = None;
+            app.connection_editing = false;
+            reset_catalog(app);
             push_web(app);
         }
         CHAT_SIGNED_OUT => {
             let (turn, error) = unsafe { *Box::from_raw(lparam.0 as *mut (u32, String)) };
             if !app.replies.contains_key(&turn) {
+                return;
+            }
+            let same_connection = app.replies.get(&turn).and_then(|r| r.connection.as_ref())
+                == app.chat.tokens.as_ref();
+            if !same_connection {
+                finish_reply(app, turn, Some(error));
                 return;
             }
             VERIFY_GEN.fetch_add(1, Ordering::Relaxed);
@@ -1807,9 +2044,7 @@ fn main() -> Result<()> {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             // Tell instead of vanishing: without a tray icon there is no
             // other way to know an older instance is still holding the app.
-            use windows::Win32::UI::WindowsAndMessaging::{
-                MessageBoxW, MB_ICONINFORMATION, MB_OK,
-            };
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
             let _ = MessageBoxW(
                 None,
                 w!("Notchbud is already running (check Task Manager if you cannot see it)."),
@@ -1961,16 +2196,13 @@ mod tests {
         fn set() -> Self {
             // Tolerate a poisoned lock (a panicked test): dirs are unique
             // per test, and set() always re-points the override.
-            let lock = TEST_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name = format!("notchbud-test-{}-{n}", std::process::id());
             // Prefer the OS temp dir; fall back to the repo target dir when
             // writes outside the workspace are denied (sandboxed runs).
-            let ws_fallback =
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+            let ws_fallback = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
             let dir = [std::env::temp_dir(), ws_fallback]
                 .into_iter()
                 .map(|b| b.join(&name))
@@ -1978,7 +2210,11 @@ mod tests {
                 .expect("no writable temp dir for tests");
             let prev = std::env::var_os("NOTCHBUD_DATA_DIR");
             std::env::set_var("NOTCHBUD_DATA_DIR", &dir);
-            TempDataDir { _lock: lock, dir, prev }
+            TempDataDir {
+                _lock: lock,
+                dir,
+                prev,
+            }
         }
     }
 
@@ -2009,8 +2245,7 @@ mod tests {
         // to home. The response continues in its original session.
         let _data = TempDataDir::set();
         let mut app = blank_app();
-        app.chat.tokens =
-            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
         app.chat.push_history(state::Role::User, "hi".into());
         app.chat.streaming = true;
         app.chat.stream = "half…".into();
@@ -2029,8 +2264,7 @@ mod tests {
         // copy; the live turns archive first so nothing is lost.
         let _data = TempDataDir::set();
         let mut app = blank_app();
-        app.chat.tokens =
-            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
         app.session_id = "live".into();
         app.chat.push_history(state::Role::User, "live q".into());
         app.sessions.push(sessions::Session {
@@ -2089,7 +2323,10 @@ mod tests {
         assert_eq!(app.overlay, state::Overlay::Chats);
         assert!(app.pending_delete.is_empty());
         assert_eq!(
-            app.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            app.sessions
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
             ["s2"],
             "Yes must drop exactly the confirmed session"
         );
@@ -2160,6 +2397,170 @@ mod tests {
     }
 
     #[test]
+    fn custom_save_replaces_connection_and_preserves_local_history() {
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat
+            .push_history(state::Role::User, "keep this context".into());
+        app.overlay = state::Overlay::Settings;
+        handle_webmsg(&mut app, webmsg(r#"{"type":"edit_connection"}"#));
+        assert_eq!(app.screen(), state::Screen::SignIn);
+        assert!(
+            app.chat.tokens.is_some(),
+            "editing must not drop the working connection"
+        );
+        handle_webmsg(
+            &mut app,
+            webmsg(
+                r#"{"type":"save_custom","baseUrl":"https://example.com/v1/","key":"secret-key","model":"model-x"}"#,
+            ),
+        );
+        let connection = app.chat.tokens.as_ref().unwrap();
+        assert!(connection.is_custom());
+        assert_eq!(connection.fixed_model(), Some("model-x"));
+        assert_eq!(connection.custom_base_url(), Some("https://example.com/v1"));
+        assert_eq!(app.chat.history[0].1, "keep this context");
+        assert!(!app.connection_editing);
+        let loaded = connector::auth::load_api_key().unwrap();
+        assert_eq!(loaded, *connection);
+        let state: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
+        assert!(!state.to_string().contains("secret-key"));
+    }
+
+    #[test]
+    fn custom_blank_key_retains_only_for_same_url() {
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.chat.tokens = Some(
+            connector::auth::ApiKey::custom("https://example.com/v1", "secret-key", "old-model")
+                .unwrap(),
+        );
+        handle_webmsg(
+            &mut app,
+            webmsg(
+                r#"{"type":"save_custom","baseUrl":"https://example.com/v1","key":"","model":"new-model"}"#,
+            ),
+        );
+        assert_eq!(app.chat.tokens.as_ref().unwrap().key, "secret-key");
+        assert_eq!(
+            app.chat.tokens.as_ref().unwrap().fixed_model(),
+            Some("new-model")
+        );
+        handle_webmsg(
+            &mut app,
+            webmsg(
+                r#"{"type":"save_custom","baseUrl":"http://127.0.0.1:11434/v1","key":"","model":"gemma4:e2b"}"#,
+            ),
+        );
+        let connection = app.chat.tokens.as_ref().unwrap();
+        assert_eq!(
+            connection.custom_base_url(),
+            Some("http://127.0.0.1:11434/v1")
+        );
+        assert!(connection.key.is_empty());
+        assert_eq!(connection.fixed_model(), Some("gemma4:e2b"));
+        assert!(app.chat.error.is_none());
+        let saved = connector::auth::load_api_key().unwrap();
+        assert_eq!(&saved, connection);
+    }
+
+    #[test]
+    fn custom_key_check_exposes_success_and_failure_before_activation() {
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        for (result, checked, rejected) in [
+            (Ok(Vec::<connector::auth::ModelInfo>::new()), true, false),
+            (
+                Err(connector::auth::AuthError::new("Key rejected", true)),
+                false,
+                true,
+            ),
+            (
+                Err(connector::auth::AuthError::new(
+                    "Couldn't reach endpoint",
+                    false,
+                )),
+                false,
+                false,
+            ),
+        ] {
+            reset_catalog(&mut app);
+            app.chat.catalog_loading = true;
+            let gen = CATALOG_GEN.load(Ordering::Relaxed);
+            let payload = Box::into_raw(Box::new((gen, result)));
+            handle_chat_msg(&mut app, WPARAM(CHAT_CATALOG), LPARAM(payload as isize));
+            let state: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
+            assert_eq!(state["customCatalogLoading"], false);
+            assert_eq!(state["customCatalogChecked"], checked);
+            assert_eq!(state["customCatalogRejected"], rejected);
+            assert!(!app.chat.connected());
+        }
+    }
+
+    #[test]
+    fn custom_actions_wait_for_groq_check_instead_of_stalling() {
+        // A Groq save in flight must not swallow custom intents: the page
+        // already flipped into its waiting state before posting, so a
+        // silent return would wedge Next disabled on "Checking key…" until
+        // the user happens to press Back.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.chat.signing_in = true;
+        handle_webmsg(
+            &mut app,
+            webmsg(r#"{"type":"discover_custom","baseUrl":"https://example.com/v1","key":"k"}"#),
+        );
+        assert!(!app.chat.catalog_loading);
+        assert!(app
+            .chat
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Groq key"));
+        handle_webmsg(
+            &mut app,
+            webmsg(
+                r#"{"type":"save_custom","baseUrl":"https://example.com/v1","key":"k","model":"m"}"#,
+            ),
+        );
+        assert!(app.chat.tokens.is_none());
+        assert!(app
+            .chat
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Groq key"));
+    }
+
+    #[test]
+    fn rejected_custom_catalog_blocks_replacement() {
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.catalog_base_url = "https://example.com/v1".into();
+        let gen = CATALOG_GEN.load(Ordering::Relaxed);
+        let result: Box<CatalogReply> =
+            Box::new((gen, Err(connector::auth::AuthError::new("rejected", true))));
+        let result = Box::into_raw(result);
+        handle_chat_msg(&mut app, WPARAM(CHAT_CATALOG), LPARAM(result as isize));
+        assert!(app.chat.catalog_rejected);
+        handle_webmsg(
+            &mut app,
+            webmsg(
+                r#"{"type":"save_custom","baseUrl":"https://example.com/v1","key":"bad","model":"model-x"}"#,
+            ),
+        );
+        assert!(!app.chat.tokens.as_ref().unwrap().is_custom());
+        assert!(app
+            .chat
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rejected"));
+    }
+
+    #[test]
     fn open_keys_points_at_groq_console() {
         assert_eq!(GROQ_KEYS_URL, "https://console.groq.com/keys");
     }
@@ -2169,7 +2570,10 @@ mod tests {
         // save_name persists the display-name file: isolate it in a temp dir.
         let _data = TempDataDir::set();
         let mut app = blank_app();
-        handle_webmsg(&mut app, webmsg(r#"{"type":"save_name","name":"  Alex  "}"#));
+        handle_webmsg(
+            &mut app,
+            webmsg(r#"{"type":"save_name","name":"  Alex  "}"#),
+        );
         assert_eq!(app.display_name, "Alex");
         assert!(app.greeting().contains("Alex"));
         // Blank never clears an existing name.
@@ -2184,8 +2588,7 @@ mod tests {
         assert_eq!(app.display_name.len(), crate::prefs::DISPLAY_NAME_MAX);
         // edit_name (settings pencil) reopens the shared step: overlay
         // drops, the prompt owns Home until save (or leave).
-        app.chat.tokens =
-            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
         app.display_name = "Alex".into();
         app.overlay = state::Overlay::Settings;
         handle_webmsg(&mut app, webmsg(r#"{"type":"edit_name"}"#));
@@ -2214,7 +2617,8 @@ mod tests {
             7u32,
             updater::UpdateInfo {
                 version: newer.clone(),
-                url: "https://x/setup.exe".into(),            },
+                url: "https://x/setup.exe".into(),
+            },
         )));
         handle_update_msg(&mut app, WPARAM(UPDATE_AVAILABLE), LPARAM(info as isize));
         assert!(!app.update_inflight, "a reply must free the button");
@@ -2230,7 +2634,8 @@ mod tests {
             6u32,
             updater::UpdateInfo {
                 version: "9.9.9".into(),
-                url: "https://x/old.exe".into(),            },
+                url: "https://x/old.exe".into(),
+            },
         )));
         handle_update_msg(&mut stale, WPARAM(UPDATE_AVAILABLE), LPARAM(info as isize));
         assert!(stale.update_version.is_none());
@@ -2244,7 +2649,8 @@ mod tests {
             0u32,
             updater::UpdateInfo {
                 version: newer.clone(),
-                url: "https://x/setup.exe".into(),            },
+                url: "https://x/setup.exe".into(),
+            },
         )));
         handle_update_msg(&mut dl, WPARAM(UPDATE_AVAILABLE), LPARAM(info as isize));
         assert_eq!(dl.update_version.as_deref(), Some(newer.as_str()));
@@ -2334,11 +2740,13 @@ mod tests {
         // error, creds kept, still on Home. The next real attempt reports
         // its own failure if still failing.
         let mut app = blank_app();
-        app.chat.tokens =
-            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
         app.chat.signing_in = true;
         let gen = VERIFY_GEN.load(Ordering::Relaxed);
-        let msg = Box::into_raw(Box::new((gen, "Couldn't reach Groq. Try again.".to_owned())));
+        let msg = Box::into_raw(Box::new((
+            gen,
+            "Couldn't reach Groq. Try again.".to_owned(),
+        )));
         handle_chat_msg(&mut app, WPARAM(CHAT_VERIFY_ERR), LPARAM(msg as isize));
         assert!(!app.chat.signing_in);
         assert!(app.chat.notice.is_none());
@@ -2353,8 +2761,7 @@ mod tests {
         // credential and cached model go, the island lands on key entry.
         let _data = TempDataDir::set();
         let mut app = blank_app();
-        app.chat.tokens =
-            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
         app.chat.model = Some("openai/gpt-oss-20b".into());
         let (turn, _) = start_reply(&mut app);
         let msg = Box::into_raw(Box::new((
@@ -2374,8 +2781,7 @@ mod tests {
         // and leave credentials cleared, never resurrect them.
         let _data = TempDataDir::set();
         let mut app = blank_app();
-        app.chat.tokens =
-            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
         let gen = VERIFY_GEN.load(Ordering::Relaxed);
         let (turn, _) = start_reply(&mut app);
         let msg = Box::into_raw(Box::new((
@@ -2400,8 +2806,7 @@ mod tests {
         // parallel test can bump TURN_GEN mid-assert.
         let _data = TempDataDir::set();
         let mut app = blank_app();
-        app.chat.tokens =
-            Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
+        app.chat.tokens = Some(connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap());
         app.chat.streaming = true;
         app.chat.stream = "new".into();
         app.session_id = "current".into();
@@ -2428,6 +2833,10 @@ mod tests {
     fn cancelled_signin_ignores_late_connected() {
         // Cancel is real: a worker CONNECTED posted before the cancel lands
         // while signing_in=false is dropped, never resurrecting creds.
+        // Serialized with the TempDataDir tests: CHAT_CONNECTED bumps the
+        // process-wide CATALOG_GEN, which would flake their stale-generation
+        // reads if it landed mid-assertion.
+        let _gen_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut app = blank_app();
         let msg = Box::into_raw(Box::new(
             connector::auth::ApiKey::new("gsk_test1234567890abcdef").unwrap(),
@@ -2442,6 +2851,46 @@ mod tests {
         handle_chat_msg(&mut app, WPARAM(CHAT_CONNECTED), LPARAM(msg as isize));
         assert!(app.chat.tokens.is_some());
         assert!(!app.chat.signing_in);
+    }
+
+    #[test]
+    fn cancel_signin_clears_error_and_leaves_key_entry() {
+        // A failed save paints the key entry. Backing out must land on the
+        // landing, not reopen key entry with the stale error.
+        let _data = TempDataDir::set();
+        let mut app = blank_app();
+        handle_webmsg(&mut app, webmsg(r#"{"type":"save_key","key":"junk"}"#));
+        assert!(app.chat.error.is_some());
+        handle_webmsg(&mut app, webmsg(r#"{"type":"cancel_signin"}"#));
+        assert!(app.chat.error.is_none());
+        assert_eq!(app.screen(), state::Screen::SignIn);
+    }
+
+    #[test]
+    fn win_chords_pass_through_to_system() {
+        // Win+V (clipboard history), Win+D, Win+arrows: the hook must not
+        // eat them — eating V would both type "v" and kill the chord.
+        // Alt chords (Alt+Tab…) pass as before; Ctrl-only chords and plain
+        // typing stay with the island.
+        assert!(is_system_chord(false, true));
+        assert!(is_system_chord(true, false));
+        assert!(!is_system_chord(false, false));
+    }
+
+    #[test]
+    fn hook_keyboard_state_pins_physical_modifiers() {
+        // GetKeyboardState can lag the physical Shift key inside the
+        // low-level hook (Shift+' typed as plain "'"), so the hook pins
+        // the modifier bytes to the real-time state before ToUnicode.
+        let mut st = [0u8; 256];
+        pin_physical_modifiers(&mut st, true, false, false);
+        assert_eq!(st[VK_SHIFT.0 as usize], 0x80);
+        assert_eq!(st[VK_CONTROL.0 as usize], 0);
+        assert_eq!(st[VK_MENU.0 as usize], 0);
+        pin_physical_modifiers(&mut st, false, true, true);
+        assert_eq!(st[VK_SHIFT.0 as usize], 0);
+        assert_eq!(st[VK_CONTROL.0 as usize], 0x80);
+        assert_eq!(st[VK_MENU.0 as usize], 0x80);
     }
 
     #[test]
@@ -2485,8 +2934,12 @@ mod tests {
         let saved = sessions::load_sessions();
         assert!(saved[0].unread);
         assert_eq!(saved[0].messages.last().unwrap().text, "hello world");
+        let title = Box::into_raw(Box::new(("a".to_owned(), "Greeting".to_owned())));
+        handle_chat_msg(&mut app, WPARAM(CHAT_TITLE), LPARAM(title as isize));
         let state: serde_json::Value = serde_json::from_str(&app.page_state()).unwrap();
         assert_eq!(state["notifications"][0]["id"], "a");
+        assert_eq!(state["notifications"][0]["title"], "Greeting");
+        assert_eq!(state["notifications"][0]["text"], "hello world");
     }
 
     #[test]
@@ -2594,11 +3047,17 @@ mod tests {
         reply_text(&mut app, CHAT_DELTA, a, "kept a");
         let (b, cancel_b) = test_reply(&mut app, "b");
         reply_text(&mut app, CHAT_DELTA, b, "kept b");
+        app.navigate("settings");
+        app.chat.error = Some("Previous connection error".into());
         disconnect(&mut app);
         assert!(cancel_a.load(Ordering::Relaxed));
         assert!(cancel_b.load(Ordering::Relaxed));
         assert!(app.replies.is_empty());
         assert!(!app.chat.connected());
+        assert_eq!(app.page(), "signin");
+        assert!(app.chat.error.is_none());
+        assert!(app.chat.notice.is_none());
+        assert!(!app.connection_editing);
         for id in ["a", "b"] {
             let saved = app.sessions.iter().find(|s| s.id == id).unwrap();
             assert_eq!(saved.messages.last().unwrap().text, format!("kept {id}"));

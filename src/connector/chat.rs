@@ -1,5 +1,5 @@
-// chat.rs — the island chat: a chat-completions request to Groq's
-// OpenAI-compatible API with the user's own API key, and the SSE stream
+// chat.rs — the island chat: an OpenAI-compatible chat-completions request
+// to Groq or the configured custom endpoint, with the SSE stream
 // decoded into StreamEvents. A turn counts only after the stream ends with
 // `data: [DONE]`; errors surface as-is.
 
@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use ureq::Agent;
 
-use super::auth::USER_AGENT;
+use super::auth::{ApiKey, USER_AGENT};
 
 pub const GROQ_CHAT_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
@@ -87,24 +87,36 @@ pub fn fetch_title(
     if resp.status() != 200 {
         return None;
     }
-    let v: Value = resp.into_string().ok().and_then(|s| serde_json::from_str(&s).ok())?;
+    let v: Value = resp
+        .into_string()
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
     let raw = v["choices"][0]["message"]["content"].as_str()?.trim();
     if raw.is_empty() {
         return None;
     }
     // First line only, strip wrapping quotes, clamp to 8 words / 60 chars.
     let line = raw.lines().next().unwrap_or("").trim();
-    let line = line.trim_matches(|c| c == '"' || c == '\'' || c == '`').trim();
+    let line = line
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .trim();
     if line.is_empty() {
         return None;
     }
     let words: Vec<&str> = line.split_whitespace().take(8).collect();
     let mut out = words.join(" ");
-    out = out.trim_matches(|c: char| c == '.' || c == '!' || c == '?' || c == '"' || c == '\'').trim().to_owned();
+    out = out
+        .trim_matches(|c: char| c == '.' || c == '!' || c == '?' || c == '"' || c == '\'')
+        .trim()
+        .to_owned();
     if out.chars().count() > 60 {
         out = out.chars().take(60).collect();
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -154,6 +166,7 @@ fn chat_agent() -> Agent {
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(90))
         .user_agent(USER_AGENT)
+        .redirects(0)
         .build()
 }
 
@@ -163,10 +176,7 @@ fn chat_agent() -> Agent {
 /// question needs current/external facts, then the final answer streams
 /// back like a plain turn. Anything else chats exactly as before.
 fn supports_browser_search(model: &str) -> bool {
-    matches!(
-        model.trim(),
-        "openai/gpt-oss-20b" | "openai/gpt-oss-120b"
-    )
+    matches!(model.trim(), "openai/gpt-oss-20b" | "openai/gpt-oss-120b")
 }
 
 /// The Groq chat body: system instructions + short history, streamed.
@@ -175,15 +185,20 @@ fn supports_browser_search(model: &str) -> bool {
 /// context rides every request. `image` (a PNG data URL from the camera
 /// button) attaches to the latest user turn as an image_url part and is
 /// strictly one-shot — history itself stays text-only.
-pub fn chat_body(
+pub fn chat_body(model: &str, user_name: &str, history: &[Msg], image: Option<&str>) -> Value {
+    chat_body_for_provider(model, user_name, history, image, true)
+}
+
+pub fn chat_body_for_provider(
     model: &str,
     user_name: &str,
     history: &[Msg],
     image: Option<&str>,
+    groq: bool,
 ) -> Value {
     let user_name = user_name.trim();
     let mut instructions = INSTRUCTIONS.to_owned();
-    if supports_browser_search(model) {
+    if groq && supports_browser_search(model) {
         instructions.push_str(" You have the browser_search tool; use it when the answer needs current or external facts.");
     }
     instructions.push_str(&format!(
@@ -226,7 +241,7 @@ pub fn chat_body(
         "messages": messages,
         "stream": true,
     });
-    if supports_browser_search(model) {
+    if groq && supports_browser_search(model) {
         body["tools"] = json!([{"type": "browser_search"}]);
         body["tool_choice"] = json!("auto");
     }
@@ -234,10 +249,28 @@ pub fn chat_body(
 }
 
 /// One `data:` line of the OpenAI-compatible SSE stream.
+#[cfg(test)]
 fn decode_event(v: &Value) -> Option<StreamEvent> {
+    decode_event_for(v, false, "")
+}
+
+fn decode_event_for(v: &Value, custom: bool, secret: &str) -> Option<StreamEvent> {
     if let Some(err) = v.get("error") {
-        let msg = err["message"].as_str().filter(|s| !s.is_empty()).unwrap_or("Groq could not complete the request.");
-        return Some(StreamEvent::Error(user_error(msg)));
+        let fallback = if custom {
+            "The custom endpoint could not complete the request."
+        } else {
+            "Groq could not complete the request."
+        };
+        let msg = err["message"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback);
+        let msg = redact_secret(msg, secret);
+        return Some(StreamEvent::Error(if custom {
+            custom_user_error(&msg)
+        } else {
+            user_error(&msg)
+        }));
     }
     let choice = v.get("choices")?.get(0)?;
     if let Some(delta) = choice["delta"]["content"].as_str() {
@@ -316,9 +349,7 @@ fn user_error(raw: &str) -> String {
         "tokens per",
     ]) {
         "Groq limit reached for now. Try again later.".into()
-    } else if low.contains("model")
-        && has_any(&["not", "decommissioned", "not found"])
-    {
+    } else if low.contains("model") && has_any(&["not", "decommissioned", "not found"]) {
         MODEL_UNAVAILABLE_MSG.into()
     } else {
         // Truncate long provider text; ellipsis marks the cut.
@@ -331,35 +362,92 @@ fn user_error(raw: &str) -> String {
     }
 }
 
+// Redact before truncation so even a key crossing the display limit is hidden.
+fn redact_secret(raw: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        raw.to_owned()
+    } else {
+        raw.replace(secret, "[redacted]")
+    }
+}
+
+fn custom_user_error(raw: &str) -> String {
+    let low = raw.to_ascii_lowercase();
+    if [
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "unauthorized",
+        "invalid_token",
+    ]
+    .iter()
+    .any(|needle| low.contains(needle))
+    {
+        return "The custom endpoint rejected the API key. Edit the connection and try again."
+            .into();
+    }
+    if [
+        "usage_limit",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "limit reached",
+    ]
+    .iter()
+    .any(|needle| low.contains(needle))
+    {
+        return "The custom provider's limit was reached. Try again later.".into();
+    }
+    let truncated: String = raw.chars().take(140).collect();
+    if raw.chars().count() > 140 {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 /// Runs the request on the calling thread (a spawned std::thread in main.rs)
 /// and feeds every event to `on`. Returning false from `on` stops reading and
 /// cancels the stream quietly (island collapsed).
 pub fn stream_chat(
-    api_key: &str,
+    connection: &ApiKey,
     model: &str,
+    session_id: &str,
     user_name: &str,
     history: &[Msg],
     image: Option<&str>,
     on: impl FnMut(StreamEvent) -> bool,
 ) -> Result<(), String> {
+    let custom = connection.is_custom();
+    let provider = if custom { "custom endpoint" } else { "Groq" };
     let agent = chat_agent();
-    let req = agent
-        .post(GROQ_CHAT_URL)
-        .set("authorization", &format!("Bearer {}", api_key.trim()))
+    let mut req = agent
+        .post(&connection.chat_url())
         .set("accept", "text/event-stream")
         .set("content-type", "application/json");
-    let resp = match req.send_string(&chat_body(model, user_name, history, image).to_string()) {
+    if !connection.key.trim().is_empty() {
+        req = req.set(
+            "authorization",
+            &format!("Bearer {}", connection.key.trim()),
+        );
+    }
+    if connection.is_opencode_go() && !session_id.trim().is_empty() {
+        req = req.set("x-opencode-session", &format!("ses_{session_id}"));
+    }
+    let body = chat_body_for_provider(model, user_name, history, image, !custom);
+    let resp = match req.send_string(&body.to_string()) {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(_) => return Err("Couldn't reach Groq. Try again.".to_owned()),
+        Err(_) => return Err(format!("Couldn't reach {provider}. Try again.")),
     };
-    if resp.status() == 401 {
-        return Err(AUTH_REJECTED_MSG.to_owned());
+    if resp.status() == 401 || (custom && resp.status() == 403) {
+        return Err(if custom {
+            custom_user_error("unauthorized")
+        } else {
+            AUTH_REJECTED_MSG.to_owned()
+        });
     }
-    // 403 on chat-completions is model/project-scoped (blocked model),
-    // not a dead key: surface it as a retryable model error so the caller
-    // can fall through to the next catalog model. (/models keeps 401/403
-    // as "expired" — a catalog 403 really is a dead key.)
+    // Groq 403 is model/project-scoped and retains its one-model retry.
     if resp.status() == 403 {
         return Err(MODEL_UNAVAILABLE_MSG.to_owned());
     }
@@ -371,28 +459,56 @@ pub fn stream_chat(
             .as_str()
             .filter(|s| !s.is_empty())
             .unwrap_or(&snippet);
-        let msg = match status {
-            404 => MODEL_UNAVAILABLE_MSG.to_owned(),
-            429 => "Groq limit reached for now. Try again later.".to_owned(),
-            503 => "Groq is unavailable right now. Try again later.".to_owned(),
-            _ => user_error(if raw.is_empty() {
-                "Groq could not complete the request."
-            } else {
-                raw
-            }),
+        let redacted = redact_secret(raw, &connection.key);
+        let raw = redacted.as_str();
+        let msg = if custom {
+            match status {
+                404 => {
+                    "The custom model or endpoint was not found. Check the base URL and model ID."
+                        .to_owned()
+                }
+                429 => "The custom provider's limit was reached. Try again later.".to_owned(),
+                503 => "The custom provider is unavailable right now. Try again later.".to_owned(),
+                _ => custom_user_error(if raw.is_empty() {
+                    "The custom endpoint could not complete the request."
+                } else {
+                    raw
+                }),
+            }
+        } else {
+            match status {
+                404 => MODEL_UNAVAILABLE_MSG.to_owned(),
+                429 => "Groq limit reached for now. Try again later.".to_owned(),
+                503 => "Groq is unavailable right now. Try again later.".to_owned(),
+                _ => user_error(if raw.is_empty() {
+                    "Groq could not complete the request."
+                } else {
+                    raw
+                }),
+            }
         };
         return Err(msg);
     }
 
-    let reader = std::io::BufReader::new(resp.into_reader()); // into_reader is a plain Read
-    pump_sse(reader, on)
+    let reader = std::io::BufReader::new(resp.into_reader());
+    pump_sse_for(reader, on, custom, &connection.key)
 }
 
 /// Fold one SSE byte stream into events. Success only after the terminal
 /// `data: [DONE]` marker: EOF after a finish-reason chunk (or anything
 /// else) without [DONE] is a cut-off failure, not a partial answer.
 /// Split out so tests can drive it without the network.
-fn pump_sse<R: BufRead>(mut reader: R, mut on: impl FnMut(StreamEvent) -> bool) -> Result<(), String> {
+#[cfg(test)]
+fn pump_sse<R: BufRead>(reader: R, on: impl FnMut(StreamEvent) -> bool) -> Result<(), String> {
+    pump_sse_for(reader, on, false, "")
+}
+
+fn pump_sse_for<R: BufRead>(
+    mut reader: R,
+    mut on: impl FnMut(StreamEvent) -> bool,
+    custom: bool,
+    secret: &str,
+) -> Result<(), String> {
     let mut line = String::new();
     let mut completed = false;
     loop {
@@ -417,7 +533,7 @@ fn pump_sse<R: BufRead>(mut reader: R, mut on: impl FnMut(StreamEvent) -> bool) 
         let Ok(v) = serde_json::from_str::<Value>(rest) else {
             continue;
         };
-        match decode_event(&v) {
+        match decode_event_for(&v, custom, secret) {
             None => {}
             Some(StreamEvent::Delta(d)) => {
                 if !d.is_empty() && !on(StreamEvent::Delta(d)) {
@@ -444,6 +560,25 @@ fn pump_sse<R: BufRead>(mut reader: R, mut on: impl FnMut(StreamEvent) -> bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_errors_redact_keys_before_display_truncation() {
+        let secret = "test-provider-secret";
+        let raw = format!("{}{}", "x".repeat(130), secret);
+        let safe = custom_user_error(&redact_secret(&raw, secret));
+        assert!(!safe.contains("test-pro"));
+        assert_eq!(redact_secret("ordinary error", ""), "ordinary error");
+        for custom in [false, true] {
+            let stream = format!(
+                "data: {}\n\n",
+                json!({"error": {"message": format!("Rejected header: Bearer {secret}")}})
+            );
+            let err =
+                pump_sse_for(std::io::Cursor::new(stream), |_| true, custom, secret).unwrap_err();
+            assert!(!err.contains(secret));
+            assert!(err.contains("[redacted]"));
+        }
+    }
 
     #[test]
     fn title_messages_pairs_user_and_reply() {
@@ -491,15 +626,18 @@ mod tests {
             None
         );
         assert_eq!(
-            decode_event(&serde_json::from_str::<Value>(
-                r#"{"error":{"message":"Invalid API Key"}}"#
-            ).unwrap()),
+            decode_event(
+                &serde_json::from_str::<Value>(r#"{"error":{"message":"Invalid API Key"}}"#)
+                    .unwrap()
+            ),
             Some(StreamEvent::Error(AUTH_REJECTED_MSG.into()))
         );
         assert_eq!(
             decode_event(
-                &serde_json::from_str::<Value>(r#"{"choices":[{"delta":{},"finish_reason":null}]}"#)
-                    .unwrap()
+                &serde_json::from_str::<Value>(
+                    r#"{"choices":[{"delta":{},"finish_reason":null}]}"#
+                )
+                .unwrap()
             ),
             None
         );
@@ -592,9 +730,18 @@ mod tests {
             "qwen/qwen3.8-27b",
             "",
             &[
-                Msg { role: Role::User, text: "old q".into() },
-                Msg { role: Role::Assistant, text: "old a".into() },
-                Msg { role: Role::User, text: "what is this?".into() },
+                Msg {
+                    role: Role::User,
+                    text: "old q".into(),
+                },
+                Msg {
+                    role: Role::Assistant,
+                    text: "old a".into(),
+                },
+                Msg {
+                    role: Role::User,
+                    text: "what is this?".into(),
+                },
             ],
             Some(url),
         );
@@ -614,7 +761,10 @@ mod tests {
         let body = chat_body(
             "openai/gpt-oss-20b",
             "",
-            &[Msg { role: Role::User, text: "hi".into() }],
+            &[Msg {
+                role: Role::User,
+                text: "hi".into(),
+            }],
             Some("   "),
         );
         assert_eq!(body["messages"][1]["content"], "hi");
@@ -630,9 +780,15 @@ mod tests {
             strip_citation_markers("A【1†L1-L2】 mid【3†L4】 sentence."),
             "A mid sentence."
         );
-        assert_eq!(strip_citation_markers("No markers here."), "No markers here.");
+        assert_eq!(
+            strip_citation_markers("No markers here."),
+            "No markers here."
+        );
         // Ordinary bracketed text is not a citation and survives.
-        assert_eq!(strip_citation_markers("設定【設定】done"), "設定【設定】done");
+        assert_eq!(
+            strip_citation_markers("設定【設定】done"),
+            "設定【設定】done"
+        );
         // Unterminated marker (split stream chunk) survives until closed.
         assert_eq!(strip_citation_markers("Hi 【2†L2"), "Hi 【2†L2");
     }
@@ -647,7 +803,8 @@ mod tests {
     fn stream_fails_on_eof_without_done_marker() {
         // A finish-reason chunk with no trailing `data: [DONE]` is a
         // cut-off stream, not a completed turn.
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\
                     data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n";
         let mut deltas = Vec::new();
         let r = pump_sse(std::io::Cursor::new(body), |ev| match ev {
@@ -663,7 +820,8 @@ mod tests {
 
     #[test]
     fn stream_completes_on_done_marker() {
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\
                     data: [DONE]\n";
         let mut saw_done = false;
         let r = pump_sse(std::io::Cursor::new(body), |ev| {
@@ -674,5 +832,40 @@ mod tests {
         });
         assert_eq!(r, Ok(()));
         assert!(saw_done);
+    }
+
+    #[test]
+    fn custom_body_never_enables_groq_browser_search() {
+        let body = chat_body_for_provider(
+            "openai/gpt-oss-20b",
+            "",
+            &[Msg {
+                role: Role::User,
+                text: "current news".into(),
+            }],
+            None,
+            false,
+        );
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(!body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("browser_search"));
+    }
+
+    #[test]
+    fn custom_stream_ignores_usage_and_does_not_map_errors_to_groq_actions() {
+        let usage: Value =
+            serde_json::from_str(r#"{"choices":[],"usage":{"total_tokens":3}}"#).unwrap();
+        assert_eq!(decode_event_for(&usage, true, ""), None);
+        let auth: Value =
+            serde_json::from_str(r#"{"error":{"message":"Invalid API Key"}}"#).unwrap();
+        let Some(StreamEvent::Error(msg)) = decode_event_for(&auth, true, "") else {
+            panic!("custom auth error was not decoded");
+        };
+        assert!(msg.contains("custom endpoint"));
+        assert_ne!(msg, AUTH_REJECTED_MSG);
+        assert_ne!(msg, MODEL_UNAVAILABLE_MSG);
     }
 }

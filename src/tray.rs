@@ -1,5 +1,5 @@
 // tray.rs — tray icon + context menu: Start with Windows (checkbox) /
-// Enter Groq API Key / Disconnect / (separator) / Exit, opened at the
+// Connect provider / Disconnect / (separator) / Exit, opened at the
 // cursor with RETURNCMD.
 
 use windows::core::PCWSTR;
@@ -10,9 +10,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuItem, CreatePopupMenu, DestroyMenu, EnableMenuItem, GetCursorPos,
-    LoadIconW, LoadImageW, PostMessageW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION,
-    IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MF_BYCOMMAND, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RETURNCMD, WM_NULL,
+    LoadIconW, LoadImageW, PostMessageW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON,
+    LR_DEFAULTCOLOR, LR_SHARED, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, WM_NULL,
 };
 
 pub const TRAY_CALLBACK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 9; // 0x8009
@@ -70,7 +70,12 @@ pub unsafe fn remove_tray(hwnd: HWND) {
     let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-fn append(hmenu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS, text: &str, id: usize) {
+fn append(
+    hmenu: HMENU,
+    flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS,
+    text: &str,
+    id: usize,
+) {
     unsafe {
         let _ = AppendMenuW(hmenu, flags, id, PCWSTR(wide(text).as_ptr()));
     }
@@ -83,7 +88,7 @@ pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool) -> usize {
         Ok(h) => h,
         Err(_) => return 0,
     };
-    append(hmenu, MF_STRING, "Enter Groq API Key", MENU_CONNECT);
+    append(hmenu, MF_STRING, "Connect provider", MENU_CONNECT);
     append(hmenu, MF_STRING, "Disconnect", MENU_DISCONNECT);
     if chat_connected {
         let _ = EnableMenuItem(hmenu, MENU_CONNECT as u32, MF_GRAYED);
@@ -91,9 +96,22 @@ pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool) -> usize {
         let _ = EnableMenuItem(hmenu, MENU_DISCONNECT as u32, MF_GRAYED);
     }
     append(hmenu, MF_SEPARATOR, "", 0);
-    append(hmenu, MF_STRING, "Start with Windows", MENU_START_WITH_WINDOWS);
-    let mode = if crate::prefs::is_start_with_windows() { MF_CHECKED } else { MF_UNCHECKED };
-    CheckMenuItem(hmenu, MENU_START_WITH_WINDOWS as u32, (MF_BYCOMMAND | mode).0);
+    append(
+        hmenu,
+        MF_STRING,
+        "Start with Windows",
+        MENU_START_WITH_WINDOWS,
+    );
+    let mode = if crate::prefs::is_start_with_windows() {
+        MF_CHECKED
+    } else {
+        MF_UNCHECKED
+    };
+    CheckMenuItem(
+        hmenu,
+        MENU_START_WITH_WINDOWS as u32,
+        (MF_BYCOMMAND | mode).0,
+    );
     append(hmenu, MF_SEPARATOR, "", 0);
     append(hmenu, MF_STRING, "Exit", MENU_EXIT);
 
@@ -111,7 +129,12 @@ pub unsafe fn popup_menu(hwnd: HWND, chat_connected: bool) -> usize {
         hwnd,
         None,
     ); // RETURNCMD: loword = command (0 = dismissed)
-    let _ = PostMessageW(Some(hwnd), WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    let _ = PostMessageW(
+        Some(hwnd),
+        WM_NULL,
+        windows::Win32::Foundation::WPARAM(0),
+        windows::Win32::Foundation::LPARAM(0),
+    );
     // the handle is ours to free — without this every right-click leaks an HMENU
     let _ = DestroyMenu(hmenu);
     chosen.0.max(0) as usize

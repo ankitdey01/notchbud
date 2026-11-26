@@ -117,7 +117,9 @@ fn other_hresults_are_not_busy() {
     // Arrange: success + a generic failure.
     // Act + assert.
     assert!(!is_busy_hresult(windows::core::HRESULT(0)));
-    assert!(!is_busy_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
+    assert!(!is_busy_hresult(windows::core::HRESULT(
+        0x80004005u32 as i32
+    )));
 }
 
 #[test]
