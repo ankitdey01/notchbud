@@ -15,7 +15,7 @@
 [![Stars](https://img.shields.io/github/stars/ankitdey01/notchbud?style=for-the-badge)](https://github.com/ankitdey01/notchbud/stargazers)
 [![Windows](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/ankitdey01/notchbud/releases)
 
-[Download](#download) · [How to use](#how-to-use) · [Privacy](#privacy) · [FAQ](#faq)
+[Download](#download) · [How to use](#how-to-use) · [Privacy](#privacy) · [FAQ](#faq) · [Website](https://notchbud.vercel.app)
 
 <img src="assets/notchbud-logo.png" alt="notchbud logo" width="128" style="border-radius:32px" />
 
@@ -103,7 +103,7 @@ Issues and PRs are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, 
 
 ## License
 
-No LICENSE file is included yet, so all rights are reserved for now. Open an issue if you want to reuse this code.
+Licensed under the Apache License 2.0 — see [LICENSE](./LICENSE). Changes per release are tracked in [CHANGELOG.md](./CHANGELOG.md).
 
 ## FAQ
 
